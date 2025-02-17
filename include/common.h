@@ -1,105 +1,126 @@
-#ifndef COPPER_COMMON_H_
-#define COPPER_COMMON_H_
+#ifndef COPPER_COMMON_H
+#define COPPER_COMMON_H
 
-#include <cstdint>
 #include <vector>
 #include <assert.h>
+#include <cstdint>
+#include <cstring>
 
-namespace Copper {
+namespace copper {
 
-struct ReturnStatus {
-    inline bool Is_OK() {
+struct RetStatus {
+    bool OK;
+    const char* message;
 
+    static inline RetStatus Success() {
+        return RetStatus{true, "OK"};
+    }
+
+    static inline RetStatus Fail(const char* msg) {
+        return RetStatus{false, msg};
+    }
+
+    inline bool Is_OK() const {
+        return OK;
+    }
+
+    inline const char* Msg() const {
+        return message;
     }
 };
 
-constexpr uint64_t Invalid_ID = 0;
+constexpr uint64_t INVALID_VECTOR_ID = 0;
 
-typedef uint8_t NodeID;
-
-union VectorID { // can be a centroid
-    uint64_t ID;
+union VectorID {
+    uint64_t _id;
     struct {
-        uint8_t level;
-        uint8_t creator_node_id; // CNs are even and MNs are odd
-        uint16_t i2;
-        uint32_t i3;
+        uint8_t _creator_node_id;
+        uint8_t _level; // == 0 for leaves
+        uint16_t a2;
+        uint32_t a3;
     };
+
+    VectorID(const uint64_t& ID) : _id(ID) {}
+
+    inline VectorID Get_Next_ID() {
+        VectorID new_id(*this);
+        new_id.a3++;
+        if (new_id.a3 == 0) {
+            new_id.a2++;
+        }
+        if (new_id == INVALID_VECTOR_ID) {
+            new_id.a3++;
+        }
+    }
 
     inline bool Is_Centroid() const {
-        assert((level > 0 && creator_node_id % 2 == 1) || (level == 0 && creator_node_id % 2 == 0));
-        return level > 0;
+        return _level > 0;
     }
 
-    inline uint8_t Get_Level() const {
-        return level;
+    inline bool Is_Vector() const {
+        return _level == 0;
     }
-
-    inline NodeID Get_Creator() const {
-        return creator_node_id;
-    }
-
-    inline bool Is_Valid() const {
-        return ID != Invalid_ID;
-    }
-};
-
-union VertexID {
-    uint64_t ID;
-    struct {
-        uint8_t level;
-        uint8_t i1;
-        uint16_t i2;
-        uint32_t i3;
-    };
 
     inline bool Is_Leaf() const {
-        return level == 0;
+        return _level == 1;
     }
 
-    inline uint8_t Get_Level() const {
-        return level;
+    inline void operator=(const VectorID& ID) {
+        _id = ID._id;
     }
 
-    inline bool Is_Valid() const {
-        return ID != Invalid_ID;
+    inline bool operator==(const VectorID& ID) const {
+        return _id == ID._id;
     }
+
+    inline bool operator!=(const VectorID& ID) const {
+        return _id != ID._id;
+    }
+
+    // inline bool operator<=(const VectorID& ID) const {
+    //     return _id <= ID._id;
+    // }
+
+    // inline bool operator>=(const VectorID& ID) const {
+    //     return _id >= ID._id;
+    // }
+
+    // inline bool operator<(const VectorID& ID) const {
+    //     return _id < ID._id;
+    // }
+
+    // inline bool operator>(const VectorID& ID) const {
+    //     return _id > ID._id;
+    // }
+
+    inline void operator=(const uint64_t& ID) {
+        _id = ID;
+    }
+
+    inline bool operator==(const uint64_t& ID) const {
+        return _id == ID;
+    }
+
+    inline bool operator!=(const uint64_t& ID) const {
+        return _id != ID;
+    }
+
+    // inline bool operator<=(const uint64_t& ID) const {
+    //     return _id <= ID;
+    // }
+
+    // inline bool operator>=(const uint64_t& ID) const {
+    //     return _id >= ID;
+    // }
+
+    // inline bool operator<(const uint64_t& ID) const {
+    //     return _id < ID;
+    // }
+
+    // inline bool operator>(const uint64_t& ID) const {
+    //     return _id > ID;
+    // }
 };
-
-enum Distance : uint8_t {
-    L2
-};
-
-enum DataType : uint8_t {
-    Uint8,
-    Uint32,
-    Float32
-};
-
-typedef uint16_t Dimention;
-
-typedef void* Vector;
-
-Vector Invalid_Vector = nullptr;
-// struct Vector {
-//     VectorData _data;
-//     VectorID ID;
-//     VertexID parent;
-//     const Dimention dim;
-//     const DataType type;
-
-//     // TODO define other operators, copy, etc
-// };
-
-
-
-// could contain either children centroids or elements depending on vertex type.
-// if not full, the rest are Invalid_ID
-// template<typename T, uint16_t Dimention, uint64_t CAP> 
-// struct Bucket {
-//     Vector<T, Dimention> elements[CAP]; 
-//     uint64_t IDs[CAP] = {Invalid_ID};
-// };
 
 };
 

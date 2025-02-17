@@ -1,0 +1,7 @@
+[
+{
+  "directory": "/root/adavoodi/copper/build",
+  "command": "/usr/bin/c++  -I/root/adavoodi/copper/include -g -std=gnu++20 -o CMakeFiles/copper.dir/src/single_node/in_memory/copper.cpp.o -c /root/adavoodi/copper/src/single_node/in_memory/copper.cpp",
+  "file": "/root/adavoodi/copper/src/single_node/in_memory/copper.cpp"
+}
+]

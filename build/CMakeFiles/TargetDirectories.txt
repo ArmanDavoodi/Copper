@@ -1,0 +1,2 @@
+/root/adavoodi/copper/build/CMakeFiles/edit_cache.dir
+/root/adavoodi/copper/build/CMakeFiles/rebuild_cache.dir
