@@ -23,13 +23,12 @@ struct VectorSet {
     }
 
     inline VectorID Get_VectorID(uint16_t idx) {
-        assert(idx < _size);
-
+        AssertFatal(idx < _size, LOG_TAG_ANY, "idx(%hu) >= _size(%hu)", idx, _size);
         return _ids[idx]; 
     }
 
     inline uint16_t Get_Index(VectorID id) {
-        assert(_size > 0);
+        AssertFatal(_size > 0, LOG_TAG_ANY, "Bucket is Empty");
 
         uint16_t index = 0;
         for (; index < _size; ++index) {
@@ -38,13 +37,13 @@ struct VectorSet {
             }
         }
 
-        assert(_ids[index] == id);
+        AssertFatal(_ids[index] == id, LOG_TAG_ANY, "_ids[index(%hu)](%lu) != id(%lu)", index, _ids[index]._id, id._id);
         return index;
     }
 
     template<typename T>
     inline Vector Get_Vector(uint16_t idx, uint16_t dim) {
-        assert(idx < _size);
+        AssertFatal(idx < _size, LOG_TAG_ANY, "idx(%hu) >= _size(%hu)", idx, _size);
         
         return ((T*)beg) + (idx * dim);
     }
@@ -86,8 +85,8 @@ template<typename T>
 class L2_Distance : public Distance<T> {
 public:
     double operator()(const Vector& a, const Vector& b, uint16_t _dim) {
-        assert(a != INVALID_VECTOR);
-        assert(b != INVALID_VECTOR);
+        AssertFatal(a != INVALID_VECTOR, LOG_TAG_ANY, "a is invalid");
+        AssertFatal(b != INVALID_VECTOR, LOG_TAG_ANY, "b is invalid");
 
         double dist = 0;
         for (size_t i = 0; i < _dim; ++i) {

@@ -119,9 +119,9 @@ protected:
     uint8_t _levels;
 
     inline Leaf_Node* Find_Leaf(const Vector& query) const {
-        assert(_root != INVALID_VECTOR_ID);
-        assert(_root.Is_Centroid());
-        assert(_levels > 1);
+        AssertFatal(_root != INVALID_VECTOR_ID, LOG_TAG_DEFAULT, "Invalid root ID.");
+        AssertFatal(_root.Is_Centroid(), LOG_TAG_DEFAULT, "Invalid root ID -> root should be a centroid.");
+        AssertFatal(_levels > 1, LOG_TAG_DEFAULT, "Height of the tree should be at least two but is %hhu.", _levels);
 
         if (_root.Is_Leaf()) {
             return _bufmgr.Get_Leaf(_root);
@@ -130,7 +130,7 @@ protected:
 
         while (!next.Is_Leaf()) {
             Internal_Node* node = _bufmgr.Get_Node(next);
-            assert(node != nullptr);
+            AssertFatal(node != nullptr, LOG_TAG_DEFAULT, "Invisible Node with id %lu.", next._id);
             next = node->Find_Nearest(query);
         }
 
@@ -138,8 +138,10 @@ protected:
     }
 
     inline VectorID Next_ID(uint8_t level) {
-        assert(_levels > 1);
-        assert(level < _levels);
+        AssertFatal(_levels > 1, LOG_TAG_DEFAULT, "Height of the tree should be at least two but is %hhu.", _levels);
+        AssertFatal(level < _levels, LOG_TAG_DEFAULT, "Input level(%hhu) should be less than height of the tree(%hhu)."
+                , level, _levels);
+
         _last_id_per_level[level] = _last_id_per_level[level].Get_Next_ID();
         return _last_id_per_level[level];
     }
@@ -149,11 +151,11 @@ public:
         vec_id = Next_ID(0);
         Leaf_Node* leaf = Find_Leaf(vec);
         RetStatus rc = RetStatus::Success();
-        assert(leaf != nullptr);
+        AssertFatal(leaf != nullptr, LOG_TAG_DEFAULT, "Leaf not found.");
 
         if (leaf.Is_Full()) {
             // todo split
-            assert(false);
+            CLOG(LOG_LEVEL_PANIC, LOG_TAG_NOT_IMPLEMENTED, "Split is not implemented.");
         }
 
         rc = leaf->Insert(vec, vec_id);
@@ -165,19 +167,19 @@ public:
     }
 
     inline RetStatus Delete(VectorID vec_id) {
-        assert(_root != INVALID_VECTOR_ID);
-        assert(_root.Is_Centroid());
-        assert(vec_id != INVALID_VECTOR_ID);
-        assert(!vec_id.Is_Centroid());
-        assert(_levels > 1);
+        AssertFatal(_root != INVALID_VECTOR_ID, LOG_TAG_DEFAULT, "Invalid root ID.");
+        AssertFatal(_root.Is_Centroid(), LOG_TAG_DEFAULT, "Invalid root ID -> root should be a centroid.");
+        AssertFatal(vec_id != INVALID_VECTOR_ID, LOG_TAG_DEFAULT, "Invalid input vector id.");
+        AssertFatal(!vec_id.Is_Centroid(), LOG_TAG_DEFAULT, "Invalid input vector id -> vector should not be a centroid.");
+        AssertFatal(_levels > 1, LOG_TAG_DEFAULT, "Height of the tree should be at least two but is %hhu.", _levels);
 
         RetStatus rc = RetStatus::Success();
         Leaf_Node* leaf = _bufmgr->Get_Container_Leaf(vec_id);
-        assert(leaf != nullptr);
+        AssertFatal(leaf != nullptr, LOG_TAG_DEFAULT, "Container leaf not found.");
 
         if (leaf->Is_Almost_Empty()) {
             // todo handle merge
-            assert(false);
+            CLOG(LOG_LEVEL_PANIC, LOG_TAG_NOT_IMPLEMENTED, "Merge is not implemented.");
         }
 
         Vector swapped_vector = INVALID_VECTOR;
@@ -185,18 +187,19 @@ public:
 
         rc = leaf->Delete(vec_id, swapped_vector_id, swapped_vector);
         if (!rc.Is_OK()) {
-            assert(false);
+            CLOG(LOG_LEVEL_PANIC, LOG_TAG_NOT_IMPLEMENTED, "Recovery in case of delete failure not implemented.");
         }
 
         // todo handle the swapped vector
+        CLOG(LOG_LEVEL_ERROR, LOG_TAG_NOT_IMPLEMENTED, "Handling swapped vectors is not implemented.");
     }
 
     inline RetStatus KNearestNeighbours(const Vector& query, size_t k, std::vector<VectorID>& neighbours) const {
-        assert(_root != INVALID_VECTOR_ID);
-        assert(_root.Is_Centroid());
-        assert(query != INVALID_VECTOR);
-        assert(k > 0);
-        assert(_levels > 1);
+        AssertFatal(_root != INVALID_VECTOR_ID, LOG_TAG_DEFAULT, "Invalid root ID.");
+        AssertFatal(_root.Is_Centroid(), LOG_TAG_DEFAULT, "Invalid root ID -> root should be a centroid.");
+        AssertFatal(query != INVALID_VECTOR, LOG_TAG_DEFAULT, "Invalid query vector.");
+        AssertFatal(k > 0, LOG_TAG_DEFAULT, "Number of neighbours cannot be 0.");
+        AssertFatal(_levels > 1, LOG_TAG_DEFAULT, "Height of the tree should be at least two but is %hhu.", _levels);
 
         std::priority_queue<std::pair<double, VectorID>
             , std::vector<std::pair<double, VectorID>>, Similarity<T>> 
@@ -205,16 +208,16 @@ public:
 
         if (_root.Is_Leaf()) {
             Leaf_Node* root = _bufmgr.Get_Leaf(_root);
-            assert(root != nullptr);
+            AssertFatal(root != nullptr, LOG_TAG_DEFAULT, "Root vector is null.");
 
             rc = root->KNearestNeighbours(query, _vector_search, heap_store);
-            assert(rc.Is_OK());
+            AssertFatal(rc.Is_OK(), LOG_TAG_DEFAULT, "ANN search failed at leaf root with err(%s).", rc.Msg());
             goto Neighbour_Extraction;
         }
 
         VectorID node_id = _root;
         Internal_Node* node = _bufmgr.Get_Node(node_id);
-        assert(node != nullptr);
+        AssertFatal(node != nullptr, LOG_TAG_DEFAULT, "Failed to get node with id %lu.", node_id._id);
         heap_stack.push({(*_dist)(query, node, _dimention), node_id});
         uint8_t level = node_id._level;
 
@@ -224,31 +227,48 @@ public:
             while (!heap_stack.empty() && heap_store.size() < search_threshold) {
                 std::pair<double, VectorID> dist_id_pair = heap_stack.top();
                 heap_stack.pop();
-                assert(level == dist_id_pair.second._level);
+                AssertFatal(level == dist_id_pair.second._level, LOG_TAG_DEFAULT, 
+                    "Level mismatch detected: level(%hhu) != dist_id_pair.level(%hhu).",
+                    level, dist_id_pair.second._level);
 
-                assert(dist_id_pair.second != INVALID_VECTOR_ID);
+                AssertFatal(dist_id_pair.second != INVALID_VECTOR_ID, LOG_TAG_DEFAULT,
+                            "Invalid vector id at top of the stack.");
+
                 node = _bufmgr.Get_Node(dist_id_pair.second);
-                assert(node != nullptr);
+                AssertFatal(node != nullptr, LOG_TAG_DEFAULT, "Failed to get node with id %lu.",
+                            dist_id_pair.second);
                 rc = node->KNearestNeighbours(query, search_threshold, heap_store);
-                assert(rc.Is_OK());
+                AssertFatal(rc.Is_OK(), LOG_TAG_DEFAULT, "ANN search failed at node(%lu) with err(%s).", 
+                            dist_id_pair.second, rc.Msg());
             }
 
             std::swap(heap_stack, heap_store);
             --level;
         }
         
-        assert(heap_stack.top().second._level == 1);
-        assert(level == 1);
+        AssertFatal(!heap_stack.empty(), LOG_TAG_DEFAULT, "Heap stack should not be empty.");
+        
+        AssertFatal(heap_stack.top().second._level == 1, LOG_TAG_DEFAULT, 
+                    "node level of the current stack top(%hhu) is not 1", heap_stack.top().second._level);
+        AssertFatal(level == 1, LOG_TAG_DEFAULT, 
+            "level(%hhu) is not 1", level);
+
         while (!heap_stack.empty() && heap_store.size() < _vector_search) {
             std::pair<double, VectorID> dist_id_pair = heap_stack.top();
             heap_stack.pop();
-            assert(level == dist_id_pair.second._level);
+            AssertFatal(level == dist_id_pair.second._level, LOG_TAG_DEFAULT, 
+                    "Level mismatch detected: level(%hhu) != dist_id_pair.level(%hhu).",
+                    level, dist_id_pair.second._level);
 
-            assert(dist_id_pair.second != INVALID_VECTOR_ID);
+            AssertFatal(dist_id_pair.second != INVALID_VECTOR_ID, LOG_TAG_DEFAULT,
+                "Invalid vector id at top of the stack.");
+
             node = _bufmgr.Get_Leaf(dist_id_pair.second);
-            assert(node != nullptr);
+            AssertFatal(node != nullptr, LOG_TAG_DEFAULT, "Failed to get node with id %lu.",
+                            dist_id_pair.second);
             rc = node->KNearestNeighbours(query, _vector_search, heap_store);
-            assert(rc.Is_OK());
+            AssertFatal(rc.Is_OK(), LOG_TAG_DEFAULT, "ANN search failed at node(%lu) with err(%s).", 
+                            dist_id_pair.second, rc.Msg());
         }
         
         Neighbour_Extraction:
@@ -258,11 +278,15 @@ public:
         neighbours.resize(num_neigbours);
 
         while (num_neigbours > 0) {
-            assert(!heap_store.empty());
+            AssertFatal(!heap_store.empty(), LOG_TAG_DEFAULT, "Heap store should not be empty.");
             --num_neigbours;
             neighbours[num_neigbours] = heap_store.top().second;
-            assert(neighbours[num_neigbours] != INVALID_VECTOR_ID);
-            assert(neighbours[num_neigbours].Is_Vector());
+
+            AssertFatal(neighbours[num_neigbours] != INVALID_VECTOR_ID, LOG_TAG_DEFAULT,
+                "Invalid vector id in the heap store.");
+
+            AssertFatal(neighbours[num_neigbours].Is_Vector(), LOG_TAG_DEFAULT, "Centroid vector in the heap_store");
+            
             heap_store.pop();
         }
         return rc;

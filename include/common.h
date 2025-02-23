@@ -2,9 +2,10 @@
 #define COPPER_COMMON_H
 
 #include <vector>
-#include <assert.h>
 #include <cstdint>
 #include <cstring>
+
+#include "debug.h"
 
 namespace copper {
 
