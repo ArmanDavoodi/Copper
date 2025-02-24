@@ -8,6 +8,7 @@ namespace copper {
 
 template <typename T, uint16_t min, uint16_t max> class Copper_Node;
 
+// todo implement buffer
 template <typename T, uint16_t ki_min, uint16_t ki_max, uint16_t kl_min, uint16_t kl_max>
 class Buffer_Manager {
 public:

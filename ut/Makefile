@@ -1,5 +1,8 @@
 # Makefile for compiling unit tests in the ut folder
 
+# todo adding necessary flags for gdb at least when mode is debug
+# todo changing the core location after making gdb work
+
 ROOT = ..
 COPPER_PATH = $(ROOT)/include
 
