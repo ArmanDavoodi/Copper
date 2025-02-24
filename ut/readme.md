@@ -32,11 +32,17 @@ To rebuild the tests without cleaning the build and out directories, use fbuild_
                                             (i.e. They will crash the program if enabled). It is not defined by default.
 ## Locked Arguments:
     -DBUILD=[DEBUG|RELEASE]                 Is always set to DEBUG for Test builds.
+    -DENABLE_TEST_LOGGING                   If defined, will enable all of the logs. It is always defined for Test builds.
     -DENABLE_ASSERTS                        If defined, will enable all of the asserts. It is always defined for Test builds.
 
 # Running Tests:
 To run the tests, you can use the run_ut.sh script and pass it the name of the test that you want to run.
 For example running './run_ut.sh test_debug_utils' will run the tests associated with test_debug_utils.cpp.
+
+## Notes:
+* If ENABLE_TEST_LOGGING is not defined but ENABLE_ASSERTS is, then all asserts will be changed to simple asserts
+    and all tags will be ignored. Moreover, In this case, if ASSERT_ERROR_PANIC is defined, AssertError will 
+    behave similar to AssertFatal. Otherwise, they are also ignored.
 
 ## TODO
 Currently, run_ut.sh only accepts one file per run. Therefore, we can add the option to:
