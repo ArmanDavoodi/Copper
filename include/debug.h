@@ -199,7 +199,7 @@ inline bool Pass_Level(uint8_t level) {
         CLOG(LOG_LEVEL_PANIC, (tag),  _TMP_DEBUG __VA_OPT__(,) __VA_ARGS__);\
     }
 
-#ifdef AssertErrorPanic
+#ifdef ASSERT_ERROR_PANIC
 #define AssertError(cond, tag, msg, ...) AssertFatal((cond), (tag), (msg)__VA_OPT__(,) __VA_ARGS__)
 #else
 #define AssertError(cond, tag, msg, ...) \
@@ -223,7 +223,7 @@ inline bool Pass_Level(uint8_t level) {
 #define AssertFatal(cond, tag, msg, ...)
 #endif
 
-#ifdef AssertErrorPanic
+#ifdef ASSERT_ERROR_PANIC
 #define AssertError(cond, tag, msg, ...) AssertFatal((cond), (tag), (msg)__VA_OPT__(,) __VA_ARGS__)
 #else
 #define AssertError(cond, tag, msg, ...)

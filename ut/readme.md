@@ -27,7 +27,7 @@ To rebuild the tests without cleaning the build and out directories, use fbuild_
     -DLOG_TAG=[LOG_TAG]             Only the logs which have their respective bit set to 1, will be printed.
                                     Default value is LOG_TAG_ANY (i.e. No logs are ignored based on TAG).
     -DOUT=[stdout|stderr]           Sets the output stream for the logs. Default value is stdout.
-    -DAssertErrorPanic              If used, all AssertErrors will act similar to AssertFatals 
+    -DASSERT_ERROR_PANIC            If used, all AssertErrors will act similar to AssertFatals 
                                     (i.e. They will crash the program if enabled). It is not defined by default.
 ## Locked Arguments:
     -DBUILD=[DEBUG|RELEASE]         Is always set to DEBUG for Test builds.
