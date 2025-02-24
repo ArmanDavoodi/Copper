@@ -2,6 +2,11 @@
 #define COPPER_DEBUG_H_
 
 #ifndef BUILD
+#define BUILD RELEASE
+#endif
+
+#ifdef TESTING
+#undef BUILD
 #define BUILD DEBUG
 #endif
 
@@ -23,11 +28,12 @@
 
 #define LOG_TAG_DEFAULT 0b1
 #define LOG_TAG_NOT_IMPLEMENTED 0b10
-#define LOG_TAG_BASIC 0b100
-#define LOG_TAG_COPPER_NODE 0b1000
-#define NUM_TAGS 4
+#define LOG_TAG_TEST 0b100
+#define LOG_TAG_BASIC 0b1000
+#define LOG_TAG_COPPER_NODE 0b10000
+#define NUM_TAGS 5
 
-#define LOG_TAG_ANY 0b1111
+#define LOG_TAG_ANY 0b11111
 
 
 #ifndef LOG_MIN_LEVEL
@@ -39,7 +45,7 @@
 #endif
 
 #ifndef LOG_TAG
-#define LOG_TAG (LOG_TAG_DEFAULT | LOG_TAG_NOT_IMPLEMENTED)
+#define LOG_TAG LOG_TAG_ANY
 #endif
 
 #ifndef OUT
@@ -193,15 +199,20 @@ inline bool Pass_Level(uint8_t level) {
         CLOG(LOG_LEVEL_PANIC, (tag),  _TMP_DEBUG __VA_OPT__(,) __VA_ARGS__);\
     }
 
+#ifdef AssertErrorPanic
+#define AssertError(cond, tag, msg, ...) AssertFatal((cond), (tag), (msg)__VA_OPT__(,) __VA_ARGS__)
+#else
 #define AssertError(cond, tag, msg, ...) \
     if (!(cond)){\
         char _TMP_DEBUG[sizeof((msg))+19] = "Assertion Failed: ";\
         strcat(_TMP_DEBUG+18, (msg));\
         CLOG(LOG_LEVEL_ERROR, (tag),  _TMP_DEBUG __VA_OPT__(,) __VA_ARGS__);\
     }
+#endif
+
 #else
 #define AssertFatal(cond, tag, msg, ...)
-#define AssertFatal(cond, tag, msg, ...)
+#define AssertError(cond, tag, msg, ...)
 #endif
 #else
 
@@ -212,8 +223,11 @@ inline bool Pass_Level(uint8_t level) {
 #define AssertFatal(cond, tag, msg, ...)
 #endif
 
+#ifdef AssertErrorPanic
+#define AssertError(cond, tag, msg, ...) AssertFatal((cond), (tag), (msg)__VA_OPT__(,) __VA_ARGS__)
+#else
 #define AssertError(cond, tag, msg, ...)
-
+#endif
 #endif
 
 

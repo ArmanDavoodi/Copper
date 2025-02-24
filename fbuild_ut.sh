@@ -1,3 +1,3 @@
 #!/bin/bash
 
-make -C ut DEFINES="-DBUILD=DEBUG $@"
+make -C ut DEFINES="-DTESTING $@"

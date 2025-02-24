@@ -3,7 +3,7 @@
 cd ut
 make clean
 rm -r out
-make DEFINES="-DBUILD=DEBUG $*"
+make DEFINES="-DTESTING $*"
 mkdir -p out/cores
 mkdir -p out/logs
 cd ..

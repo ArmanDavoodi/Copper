@@ -14,15 +14,30 @@ class Copper_Node {
 static_assert(min_size > 0);
 static_assert(max_size > min_size);
 public:
+// Distance<T>* _dist;
+// uint16_t _dimention;
+// VectorID _centroid_id;
+// Vector _centroid;
+// VectorSet _bucket;
+// void* parent;
+
+    /* todo to be removed: buffer manager should be the creator of nodes*/
+    // Copper_Node() {
+
+    // }
 
     inline RetStatus Insert(const Vector& vec, VectorID vec_id) {
-        assert(_bucket._size < max_size);
+        AssertFatal(_bucket._size < max_size, LOG_TAG_DEFAULT, 
+                    "Node is full: size=%hu, max_size=%hu", _bucket._size, max_size);
+
         _bucket.Insert<T>(vec, vec_id, _dimention);
         return RetStatus::Success();
     }
 
     inline RetStatus Delete(VectorID vec_id, VectorID& swapped_vec_id, Vector& swapped_vec) {
-        assert(_bucket._size > min_size);
+        AssertFatal(_bucket._size > min_size, LOG_TAG_DEFAULT, 
+                    "Node does not have enough elements: size=%hu, min_size=%hu.", _bucket._size, min_size);
+
         _bucket.Delete<T>(vec_id, _dimention, swapped_vec_id, swapped_vec);
         return RetStatus::Success();
     }
@@ -30,12 +45,16 @@ public:
     inline RetStatus KNearestNeighbours(const Vector& query, size_t k, 
             std::priority_queue<std::pair<double, VectorID>, 
             std::vector<std::pair<double, VectorID>>, 
-            Similarity<T>>& neighbours) const {
+            Similarity<T>>& neighbours) {
 
-        assert(k > 0);
-        assert(_bucket._size >= min_size);
-        assert(_bucket._size <= max_size);
-        assert(neighbours.size() < k);
+        AssertFatal(k > 0, LOG_TAG_DEFAULT, "Number of neighbours should not be 0");
+        AssertFatal(_bucket._size >= min_size, LOG_TAG_DEFAULT, 
+            "Node does not have enough elements: size=%hu, min_size=%hu.", _bucket._size, min_size);
+            AssertFatal(_bucket._size <= max_size, LOG_TAG_DEFAULT, 
+                "Node has too many elements: size=%hu, max_size=%hu.", _bucket._size, max_size);
+
+        AssertFatal(neighbours.size() < k, LOG_TAG_DEFAULT, 
+                "Node cannot give more vectors than it contains. size=%lu, k=%lu", neighbours.size(), k);
 
         for (uint16_t i = 0; i < _bucket._size; ++i) {
             double distance = (*_dist)(query, _bucket.Get_Vector<T>(i, _dimention));
@@ -53,7 +72,7 @@ public:
     }
 
     inline bool Is_Leaf() {
-        return _centroid_id.level == 1;
+        return _centroid_id._level == 1;
     }
 
     inline bool Is_Full() {
@@ -192,9 +211,11 @@ public:
 
         // todo handle the swapped vector
         CLOG(LOG_LEVEL_ERROR, LOG_TAG_NOT_IMPLEMENTED, "Handling swapped vectors is not implemented.");
+        rc = RetStatus::Fail("Not implemented");
+        return rc;
     }
 
-    inline RetStatus KNearestNeighbours(const Vector& query, size_t k, std::vector<VectorID>& neighbours) const {
+    inline RetStatus KNearestNeighbours(const Vector& query, size_t k, std::vector<VectorID>& neighbours) {
         AssertFatal(_root != INVALID_VECTOR_ID, LOG_TAG_DEFAULT, "Invalid root ID.");
         AssertFatal(_root.Is_Centroid(), LOG_TAG_DEFAULT, "Invalid root ID -> root should be a centroid.");
         AssertFatal(query != INVALID_VECTOR, LOG_TAG_DEFAULT, "Invalid query vector.");
@@ -206,6 +227,10 @@ public:
                 heap_stack{_dist}, heap_store{_dist};
         RetStatus rc = RetStatus::Success();
 
+        VectorID node_id;
+        Internal_Node* node;
+        uint8_t level;
+
         if (_root.Is_Leaf()) {
             Leaf_Node* root = _bufmgr.Get_Leaf(_root);
             AssertFatal(root != nullptr, LOG_TAG_DEFAULT, "Root vector is null.");
@@ -215,11 +240,11 @@ public:
             goto Neighbour_Extraction;
         }
 
-        VectorID node_id = _root;
-        Internal_Node* node = _bufmgr.Get_Node(node_id);
+        node_id = _root;
+        node = _bufmgr.Get_Node(node_id);
         AssertFatal(node != nullptr, LOG_TAG_DEFAULT, "Failed to get node with id %lu.", node_id._id);
         heap_stack.push({(*_dist)(query, node, _dimention), node_id});
-        uint8_t level = node_id._level;
+        level = node_id._level;
 
         while (level > 1) {
             uint16_t search_threshold = (level > 2 ? _internal_search : _leaf_search);

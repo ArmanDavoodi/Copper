@@ -10,6 +10,18 @@ typedef void* Vector;
 
 constexpr Vector INVALID_VECTOR = nullptr;
 
+template<typename T>
+std::string to_string(Vector vec, uint16_t dim) {
+    std::string str = "[";
+    for (uint16_t i = 0; i < dim; ++i) {
+        str += std::to_string(((T*)vec)[i]);
+        if (i < dim - 1)
+            str += ", ";
+    }
+    str += "]";
+    return str;
+}
+
 struct VectorSet {
     void* beg;
     VectorID* _ids;
@@ -22,12 +34,12 @@ struct VectorSet {
         ++_size;
     }
 
-    inline VectorID Get_VectorID(uint16_t idx) {
+    inline VectorID Get_VectorID(uint16_t idx) const {
         AssertFatal(idx < _size, LOG_TAG_ANY, "idx(%hu) >= _size(%hu)", idx, _size);
         return _ids[idx]; 
     }
 
-    inline uint16_t Get_Index(VectorID id) {
+    inline uint16_t Get_Index(VectorID id) const {
         AssertFatal(_size > 0, LOG_TAG_ANY, "Bucket is Empty");
 
         uint16_t index = 0;
@@ -50,7 +62,7 @@ struct VectorSet {
 
     template<typename T>
     inline Vector Get_Vector_By_ID(VectorID id, uint16_t dim) {
-        return Get_Vector(Get_Index(id), dim); 
+        return Get_Vector<T>(Get_Index(id), dim); 
     }
 
     template<typename T>
@@ -71,7 +83,24 @@ struct VectorSet {
 
         --_size;
     }
-    
+
+    template<typename T>
+    std::string to_string(uint16_t dim) {
+        std::string str = "<Vectors: [";
+        for (uint16_t i = 0; i < _size; ++i) {
+            str += copper::to_string<T>(Get_Vector<T>(i, dim), dim);
+            if (i != _size - 1)
+                str += ", ";
+        }
+        str += "], IDs: [";
+        for (uint16_t i = 0; i < _size; ++i) {
+            str += std::to_string(_ids[i]._id);
+            if (i != _size - 1)
+                str += ", ";
+        }
+        str += "]>";
+        return str;
+    }
 };
 
 template<typename T>
@@ -90,7 +119,7 @@ public:
 
         double dist = 0;
         for (size_t i = 0; i < _dim; ++i) {
-            dist += (((T*)a)[i] - ((T*)b)[i]) * (((T*)a)[i] - ((T*)b)[i]);
+            dist += (double)(((T*)a)[i] - ((T*)b)[i]) * (double)(((T*)a)[i] - ((T*)b)[i]);
         }
         return dist;
     }

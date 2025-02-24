@@ -42,9 +42,10 @@ union VectorID {
     };
 
     VectorID(const uint64_t& ID) : _id(ID) {}
+    VectorID(const VectorID& ID) : _id(ID._id) {}
 
     inline VectorID Get_Next_ID() {
-        VectorID new_id(*this);
+        VectorID new_id(_id);
         new_id.a3++;
         if (new_id.a3 == 0) {
             new_id.a2++;
@@ -52,6 +53,7 @@ union VectorID {
         if (new_id == INVALID_VECTOR_ID) {
             new_id.a3++;
         }
+        return new_id;
     }
 
     inline bool Is_Centroid() const {

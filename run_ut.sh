@@ -15,3 +15,6 @@ mkdir -p ut/out/logs
 # echo "|/usr/share/apport/apport -p%p -s%s -c%c -d%d -P%P -u%u -g%g -- %E\n" | sudo tee /proc/sys/kernel/core_pattern
 
 # unset CORE_DUMP_DIR
+
+# todo run ut all
+# todo run ut multiple files
