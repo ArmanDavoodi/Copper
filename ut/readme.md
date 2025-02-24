@@ -4,20 +4,20 @@ To rebuild the tests without cleaning the build and out directories, use fbuild_
 
 ## Values
 * LOG_LEVEL:                Provides a hierarchy level for logs
-    LOG_LEVEL_ZERO     0 -> Includes all logs. It is not a log level itself.
-    LOG_LEVEL_PANIC    1 -> Prints the logs and panics.
-    LOG_LEVEL_ERROR    2
-    LOG_LEVEL_WARNING  3
-    LOG_LEVEL_LOG      4
-    LOG_LEVEL_DEBUG    5
+    * LOG_LEVEL_ZERO     0 -> Includes all logs. It is not a log level itself.
+    * LOG_LEVEL_PANIC    1 -> Prints the logs and panics.
+    * LOG_LEVEL_ERROR    2
+    * LOG_LEVEL_WARNING  3
+    * LOG_LEVEL_LOG      4
+    * LOG_LEVEL_DEBUG    5
 
 * LOG_TAG:                  Is a bitmap used to ignore different subsets of logs
-    LOG_TAG_DEFAULT             0b00001
-    LOG_TAG_NOT_IMPLEMENTED     0b00010
-    LOG_TAG_TEST                0b00100
-    LOG_TAG_BASIC               0b01000
-    LOG_TAG_COPPER_NODE         0b10000
-    LOG_TAG_ANY                 0b11111
+    * LOG_TAG_DEFAULT             0b00001
+    * LOG_TAG_NOT_IMPLEMENTED     0b00010
+    * LOG_TAG_TEST                0b00100
+    * LOG_TAG_BASIC               0b01000
+    * LOG_TAG_COPPER_NODE         0b10000
+    * LOG_TAG_ANY                 0b11111
 
 ## Test Arguments:
     -DLOG_MIN_LEVEL=[LOG_LEVEL]     If the log level is equal or below MIN_LEVEL, LOG_TAG is ignored and log is printed. 
