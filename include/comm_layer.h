@@ -392,12 +392,21 @@ struct ClusterRemoteAccessInfo {
     uintptr_t remote_addr;
 };
 
+enum class CommLayerState : uint8_t {
+    INITIALIZATION,
+    RUNNING,
+    SHUTTING_DOWN,
+    SHUTDOWN_COMPLETED
+};
+
 class CommLayer {
 protected:
-    uint16_t dim;
-    uint16_t split_factor;
-    size_t leaf_size_bytes;
-    size_t internal_size_bytes;
+    const uint16_t dim;
+    const uint16_t split_factor;
+    const size_t leaf_size_bytes;
+    const size_t internal_size_bytes;
+    CommLayerState state;
+    SXLock state_lock;
 #ifndef MEMORY_NODE
     /* todo: replace with concurrent hash table? */
     SXSpinLock pending_reads_lock;
@@ -406,8 +415,17 @@ protected:
         std::unordered_map<std::pair<VectorID, Version>, ConnTaskId, VectorIDVersionPairHash> read_requests_map;
     )
 #endif
-    CommLayer() = default;
-    ~CommLayer() = default;
+    /* todo: need to implement destructor in such a way that we wait untill everything is done before shutting down  */
+    ~CommLayer() {
+        state_lock.Lock(SX_EXCLUSIVE);
+        state = CommLayerState::SHUTTING_DOWN;
+        state_lock.Unlock();
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_COMM_LAYER,
+                "Comm Layer is shutting down, waiting for ongoing tasks to finish...");
+        sleep(60); /* wait for a minute to let things finish */
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_COMM_LAYER,
+                "Comm Layer shutdown completed.");
+    }
 public:
     inline uint64_t GetMessageSize(const void* message) const {
         CHECK_NOT_NULLPTR(message, LOG_TAG_COMM_LAYER);
@@ -525,7 +543,7 @@ public:
     }
 
     RetStatus BuildRequestMessage(uint8_t target_node_id, MessageType type, CommLayerMessage& message,
-                                  size_t message_size) {
+                                  size_t message_size, bool need_lock = true) {
 #ifdef MEMORY_NODE
         FatalAssert((type >= MessageType::BASE_MESSAGE_START &&
                     type <= MessageType::BASE_MESSAGE_END) ||
@@ -543,6 +561,21 @@ public:
                     "Compute Node can only send base or CN messages. Invalid message type: %u",
                     static_cast<uint8_t>(type));
 #endif
+        if (need_lock) {
+            state_lock.Lock(SX_SHARED);
+        }
+        threadSelf->SanityCheckLockHeldByMe(&state_lock);
+        if (state != CommLayerState::RUNNING && state != CommLayerState::INITIALIZATION) {
+            message.info.buffer = nullptr;
+            message.info.length = 0;
+            message.info.max_length = 0;
+            message.info.target_node_id = target_node_id;
+            if (need_lock) {
+                state_lock.Unlock();
+            }
+            return RetStatus{.stat = RetStatus::COMM_LAYER_DOWN,
+                                .message = nullptr};
+        }
 
 #ifdef MEMORY_NODE
         if (type == MessageType::URGENT_MN_TO_CN_SPLIT_REQUEST) {
@@ -592,6 +625,7 @@ public:
             FatalAssert(false, LOG_TAG_COMM_LAYER,
                         "Failed to grab communication buffer for target node %u, message size %zu: %s",
                         target_node_id, message_size, rs.Msg());
+            state_lock.Unlock();
             return rs;
         }
         CHECK_NOT_NULLPTR(message.info.buffer, LOG_TAG_COMM_LAYER);
@@ -600,10 +634,13 @@ public:
                     LOG_TAG_COMM_LAYER,
                     "Failed to set message type %u in message",
                     static_cast<uint8_t>(type));
+        FatalAssert(rs.IsOK(), LOG_TAG_COMM_LAYER,
+                    "Successfully built request message of type %u for target node %u",
+                    static_cast<uint8_t>(type), target_node_id);
         return rs;
     }
 
-    RetStatus SendMessage(CommLayerMessage& message, bool flush) {
+    RetStatus SendMessage(CommLayerMessage& message, bool flush, bool unlock = true) {
         FatalAssert(message.info.buffer != nullptr,
                     LOG_TAG_COMM_LAYER,
                     "Cannot send message with null buffer");
@@ -626,26 +663,47 @@ public:
                     "Compute Node can only send base or CN messages. Invalid message type: %u",
                     static_cast<uint8_t>(type));
 #endif
+        threadSelf->SanityCheckLockHeldByMe(&state_lock);
+        SANITY_CHECK({
+            FatalAssert(state == CommLayerState::RUNNING || state == CommLayerState::INITIALIZATION,
+                        LOG_TAG_COMM_LAYER,
+                        "Cannot send message when communication layer is not running (current state: %u)",
+                        static_cast<uint8_t>(state));
+        });
+
         RDMA_Manager* rdma_manager = RDMA_Manager::GetInstance();
         CHECK_NOT_NULLPTR(rdma_manager, LOG_TAG_COMM_LAYER);
+        RetStatus rs;
 #ifdef MEMORY_NODE
         if (type == MessageType::URGENT_MN_TO_CN_SPLIT_REQUEST) {
             FatalAssert(target_node_id != BROADCAST_NODE_ID,
                         LOG_TAG_COMM_LAYER,
                         "Urgent messages cannot be sent to broadcast node");
             UrgentMessage* raw_message = reinterpret_cast<UrgentMessage*>(message.info.buffer);
-            return rdma_manager->SendUrgentMessage(raw_message, target_node_id);
+            rs = rdma_manager->SendUrgentMessage(raw_message, target_node_id);
+            if (unlock) {
+                state_lock.Unlock();
+            }
+            return rs;
         } else if (target_node_id == BROADCAST_NODE_ID) {
-            return rdma_manager->BroadCastCommRequest(message.info.buffer, message.info.length, flush);
+            rs = rdma_manager->BroadCastCommRequest(message.info.buffer, message.info.length, flush);
+            if (unlock) {
+                state_lock.Unlock();
+            }
+            return rs;
         }
 #endif
 
-        return rdma_manager->ReleaseCommBuffer(message.info, flush);
+        rs = rdma_manager->ReleaseCommBuffer(message.info, flush);
+        if (unlock) {
+            state_lock.Unlock();
+        }
+        return rs;
     }
 
     RetStatus CheckReceivedMessagesFromNode(uint8_t target_node_id, std::vector<CommLayerMessage>& general_messages,
                                             std::unordered_map<VectorID, std::vector<CommLayerMessage>, VectorIDHash>&
-                                                cluster_based_messages) {
+                                                cluster_based_messages, bool need_lock = true) {
         RDMA_Manager* rdma_manager = RDMA_Manager::GetInstance();
         CHECK_NOT_NULLPTR(rdma_manager, LOG_TAG_COMM_LAYER);
         uint8_t self_node_id = rdma_manager->GetSelfNodeId();
@@ -666,12 +724,27 @@ public:
                         "Self node id %u is memory node in CheckReceivedMessagesFromNode",
                         self_node_id);
 #endif
+        if (need_lock) {
+            state_lock.Lock(SX_SHARED);
+        }
+        threadSelf->SanityCheckLockHeldByMe(&state_lock);
+
+        if (state != CommLayerState::RUNNING && state != CommLayerState::INITIALIZATION) {
+            if (need_lock) {
+                state_lock.Unlock();
+            }
+            return RetStatus{.stat = RetStatus::COMM_LAYER_DOWN,
+                                .message = nullptr};
+        }
         std::vector<BufferInfo> receive_buffers;
         RetStatus rs = rdma_manager->PollCommRequests(target_node_id, receive_buffers);
         if (!rs.IsOK()) {
             FatalAssert(false, LOG_TAG_COMM_LAYER,
                         "Failed to poll communication requests from node %u: %s",
                         target_node_id, rs.Msg());
+            if (need_lock) {
+                state_lock.Unlock();
+            }
             return rs;
         }
 
@@ -832,6 +905,9 @@ public:
                         "Failed to release communication receive buffers from node %u: %s",
                         target_node_id, rs.Msg());
         }
+        if (need_lock) {
+            state_lock.Unlock();
+        }
         return rs;
     }
 
@@ -856,19 +932,30 @@ public:
         uint8_t num_nodes = rdma_manager->GetNumNodes();
         FatalAssert(self_node_id < num_nodes, LOG_TAG_COMM_LAYER,
                     "Invalid self_node_id %u in CheckReceivedMessages", self_node_id);
+
+        state_lock.Lock(SX_SHARED);
+        if (state != CommLayerState::RUNNING && state != CommLayerState::INITIALIZATION) {
+            state_lock.Unlock();
+            return RetStatus{.stat = RetStatus::COMM_LAYER_DOWN,
+                                .message = nullptr};
+        }
+
         for (uint8_t node_id = 0; node_id < num_nodes; ++node_id) {
             uint8_t target_node_id = (uint8_t)(((uint64_t)node_id + threadSelf->ID()) % num_nodes);
             if (target_node_id == self_node_id) {
                 continue;
             }
-            RetStatus rs = CheckReceivedMessagesFromNode(target_node_id, general_messages, cluster_based_messages);
+            RetStatus rs = CheckReceivedMessagesFromNode(target_node_id, general_messages, cluster_based_messages,
+                                                         false);
             if (!rs.IsOK()) {
                 FatalAssert(false, LOG_TAG_COMM_LAYER,
                             "Failed to check received messages from node %u: %s",
                             target_node_id, rs.Msg());
+                state_lock.Unlock();
                 return rs;
             }
         }
+        state_lock.Unlock();
         return RetStatus::Success();
     }
 
@@ -895,6 +982,12 @@ public:
     RetStatus PostClusterReadRequests(const std::vector<ClusterRemoteAccessInfo>& clusters_to_read) {
         FatalAssert(!clusters_to_read.empty(), LOG_TAG_COMM_LAYER,
                     "No clusters to read in PostClusterReadRequests");
+        state_lock.Lock(SX_SHARED);
+        if (state != CommLayerState::RUNNING && state != CommLayerState::INITIALIZATION) {
+            state_lock.Unlock();
+            return RetStatus{.stat = RetStatus::COMM_LAYER_DOWN,
+                                .message = nullptr};
+        }
         RDMA_Manager* rdma_manager = RDMA_Manager::GetInstance();
         CHECK_NOT_NULLPTR(rdma_manager, LOG_TAG_COMM_LAYER);
         RetStatus rs = RetStatus::Success();
@@ -930,6 +1023,7 @@ public:
             FatalAssert(false, LOG_TAG_COMM_LAYER,
                         "Failed to post RDMA read for %zu clusters: %s",
                         clusters_to_read.size(), rs.Msg());
+            state_lock.Unlock();
             delete[] buffers;
             return rs;
         }
@@ -950,6 +1044,7 @@ public:
                     task_id._raw);
         pending_reads.emplace(task_id, std::move(new_read_requests));
         pending_reads_lock.Unlock();
+        state_lock.Unlock();
         delete[] buffers;
         return rs;
     }
@@ -957,6 +1052,12 @@ public:
     RetStatus PostClusterWriteRequests(const std::vector<ClusterRemoteAccessInfo>& clusters_to_write) {
         FatalAssert(!clusters_to_write.empty(), LOG_TAG_COMM_LAYER,
                     "No clusters to write in PostClusterWriteRequests");
+        state_lock.Lock(SX_SHARED);
+        if (state != CommLayerState::RUNNING && state != CommLayerState::INITIALIZATION) {
+            state_lock.Unlock();
+            return RetStatus{.stat = RetStatus::COMM_LAYER_DOWN,
+                                .message = nullptr};
+        }
         RDMA_Manager* rdma_manager = RDMA_Manager::GetInstance();
         CHECK_NOT_NULLPTR(rdma_manager, LOG_TAG_COMM_LAYER);
         RetStatus rs = RetStatus::Success();
@@ -990,6 +1091,7 @@ public:
         }
 
 
+        state_lock.Unlock();
         delete[] buffers;
         return rs;
     }
@@ -998,15 +1100,23 @@ public:
         CHECK_NOT_NULLPTR(rdma_manager, LOG_TAG_COMM_LAYER);
         std::vector<ConnTaskId> completed_task_ids;
         completed_reads.clear();
+        state_lock.Lock(SX_SHARED);
+        if (state != CommLayerState::RUNNING && state != CommLayerState::INITIALIZATION) {
+            state_lock.Unlock();
+            return RetStatus{.stat = RetStatus::COMM_LAYER_DOWN,
+                                .message = nullptr};
+        }
         RetStatus rs = rdma_manager->PollCompletion(ConnectionType::CN_CLUSTER_READ, completed_task_ids);
         if (!rs.IsOK()) {
             FatalAssert(false, LOG_TAG_COMM_LAYER,
                         "Failed to poll RDMA read completions from memory node: %s",
                         rs.Msg());
+            state_lock.Unlock();
             return rs;
         }
 
         if (completed_task_ids.empty()) {
+            state_lock.Unlock();
             return rs;
         }
         completed_reads.reserve(completed_task_ids.size());
@@ -1040,11 +1150,18 @@ public:
             pending_reads.erase(it);
         }
         pending_reads_lock.Unlock();
+        state_lock.Unlock();
         return rs;
     }
     /* todo: since currently the only urgenmessage is split request we do not generalize */
     RetStatus CheckUrgentMessages(std::vector<UrgentSplitRequestMessage>& messages) {
         messages.clear();
+        state_lock.Lock(SX_SHARED);
+        if (state != CommLayerState::RUNNING && state != CommLayerState::INITIALIZATION) {
+            state_lock.Unlock();
+            return RetStatus{.stat = RetStatus::COMM_LAYER_DOWN,
+                                .message = nullptr};
+        }
         RDMA_Manager* rdma_manager = RDMA_Manager::GetInstance();
         CHECK_NOT_NULLPTR(rdma_manager, LOG_TAG_COMM_LAYER);
         std::vector<std::pair<UrgentMessageData, uint8_t>> raw_messages;
@@ -1053,6 +1170,7 @@ public:
             FatalAssert(false, LOG_TAG_COMM_LAYER,
                         "Failed to poll urgent messages: %s",
                         rs.Msg());
+            state_lock.Unlock();
             return rs;
         }
 
@@ -1071,9 +1189,193 @@ public:
             memccpy(&messages.back(), &raw_msg, 0, msg_len);
         }
 
+        state_lock.Unlock();
         return rs;
     }
 #endif
+
+    CommLayer(uint16_t vector_dimension, uint16_t clustering_split_factor, size_t leaf_bytes, size_t internal_bytes,
+              void* memory_pool, size_t pool_size) : dim(vector_dimension), split_factor(clustering_split_factor),
+                                                     leaf_size_bytes(leaf_bytes), internal_size_bytes(internal_bytes),
+                                                     state(CommLayerState::INITIALIZATION) {
+        CHECK_NOT_NULLPTR(memory_pool, LOG_TAG_COMM_LAYER);
+        FatalAssert(pool_size > 0, LOG_TAG_COMM_LAYER,
+                    "Invalid communication layer memory pool size %zu", pool_size);
+        FatalAssert(leaf_size_bytes > 0, LOG_TAG_COMM_LAYER,
+                    "Invalid leaf size bytes %zu", leaf_size_bytes);
+        FatalAssert(internal_size_bytes > 0, LOG_TAG_COMM_LAYER,
+                    "Invalid internal size bytes %zu", internal_size_bytes);
+        FatalAssert(dim > 0, LOG_TAG_COMM_LAYER,
+                    "Invalid vector dimension %u", dim);
+        FatalAssert(split_factor >= 2, LOG_TAG_COMM_LAYER,
+                    "Invalid clustering split factor %u", split_factor);
+        FatalAssert(ALIGNED(memory_pool), LOG_TAG_COMM_LAYER,
+                    "Communication layer memory pool %p is not cache aligned",
+                    memory_pool);
+        state_lock.Lock(SX_EXCLUSIVE);
+        RDMA_Manager* rdma_manager = RDMA_Manager::GetInstance();
+        CHECK_NOT_NULLPTR(rdma_manager, LOG_TAG_COMM_LAYER);
+        uint32_t lkey;
+        uint32_t rkey;
+        RetStatus rs = rdma_manager->RegisterMemory(memory_pool, pool_size, lkey, rkey);
+        FatalAssert(rs.IsOK(), LOG_TAG_COMM_LAYER,
+                    "Failed to register communication layer memory pool of size %zu: %s",
+                    pool_size, rs.Msg());
+#ifdef MEMORY_NODE
+        uint8_t num_nodes = rdma_manager->GetNumNodes();
+        uint8_t num_cns = num_nodes - 1; // exclude memory node
+        std::vector<bool> registered(num_cns, false);
+
+        std::vector<CommLayerMessage> general_messages;
+        std::unordered_map<VectorID, std::vector<CommLayerMessage>, VectorIDHash> cluster_based_messages;
+
+        while (num_cns > 0) {
+            for (uint8_t node_id = 0; node_id < num_nodes; ++node_id) {
+                if (node_id == MEMORY_NODE_ID || registered[node_id]) {
+                    continue;
+                }
+                rs = CheckReceivedMessagesFromNode(node_id, general_messages, cluster_based_messages, false);
+                FatalAssert(rs.IsOK(), LOG_TAG_COMM_LAYER,
+                            "Failed to check received messages from node %u: %s",
+                            node_id, rs.Msg());
+                FatalAssert(cluster_based_messages.empty(), LOG_TAG_COMM_LAYER,
+                            "Received unexpected cluster-based messages from node %u during memory registration",
+                            node_id);
+                FatalAssert(general_messages.size() <= 1, LOG_TAG_COMM_LAYER,
+                            "Received multiple general messages from node %u during memory registration",
+                            node_id);
+                if (general_messages.empty()) {
+                    continue;
+                }
+
+                for (CommLayerMessage& message : general_messages) {
+                    FatalAssert(message.GetMessageType() == MessageType::REGISTER_MEMORY,
+                                LOG_TAG_COMM_LAYER,
+                                "Unexpected message type %u from node %u during memory registration",
+                                static_cast<uint8_t>(message.GetMessageType()),
+                                node_id);
+                    RegisterMemoryMessage* register_msg =
+                        reinterpret_cast<RegisterMemoryMessage*>(message.GetMessageBuffer());
+                    CHECK_NOT_NULLPTR(register_msg, LOG_TAG_COMM_LAYER);
+                    FatalAssert(register_msg->type == MessageType::REGISTER_MEMORY,
+                                LOG_TAG_COMM_LAYER,
+                                "Message type mismatch in RegisterMemoryMessage: expected %u, got %u",
+                                static_cast<uint8_t>(MessageType::REGISTER_MEMORY),
+                                static_cast<uint8_t>(register_msg->type));
+                    registered[node_id] = true;
+                    --num_cns;
+                    rs = rdma_manager->RegisterRemoteMemory(node_id, register_msg->addr,
+                                                            register_msg->length,
+                                                            register_msg->rkey);
+                    FatalAssert(rs.IsOK(), LOG_TAG_COMM_LAYER,
+                                "Failed to register remote memory from node %u at addr=0x%lx with length=%zu: %s",
+                                node_id, register_msg->addr, register_msg->length, rs.Msg());
+                }
+                rs = FreeMessages(general_messages, cluster_based_messages);
+                FatalAssert(rs.IsOK(), LOG_TAG_COMM_LAYER,
+                            "Failed to free messages after memory registration from node %u: %s",
+                            node_id, rs.Msg());
+            }
+        }
+
+        uint8_t target_node_id = BROADCAST_NODE_ID;
+        CommLayerMessage message;
+        rs = BuildRequestMessage(target_node_id,
+                                 MessageType::REGISTER_MEMORY, message,
+                                 RegisterMemoryMessage::Size(), false);
+        FatalAssert(rs.IsOK(), LOG_TAG_COMM_LAYER,
+                    "Failed to build REGISTER_MEMORY message: %s",
+                    rs.Msg());
+        RegisterMemoryMessage* register_msg =
+            reinterpret_cast<RegisterMemoryMessage*>(message.GetMessageBuffer());
+        CHECK_NOT_NULLPTR(register_msg, LOG_TAG_COMM_LAYER);
+        FatalAssert(register_msg->type == MessageType::REGISTER_MEMORY,
+                    LOG_TAG_COMM_LAYER,
+                    "Message type mismatch in RegisterMemoryMessage: expected %u, got %u",
+                    static_cast<uint8_t>(MessageType::REGISTER_MEMORY),
+                    static_cast<uint8_t>(register_msg->type));
+        register_msg->addr = reinterpret_cast<uintptr_t>(memory_pool);
+        register_msg->length = pool_size;
+        register_msg->rkey = rkey;
+
+        rs = SendMessage(message, true, false);
+        FatalAssert(rs.IsOK(), LOG_TAG_COMM_LAYER,
+                    "Failed to send REGISTER_MEMORY message: %s",
+                    rs.Msg());
+#else
+        uint8_t target_node_id = MEMORY_NODE_ID;
+        CommLayerMessage message;
+        rs = BuildRequestMessage(target_node_id,
+                                 MessageType::REGISTER_MEMORY, message,
+                                 RegisterMemoryMessage::Size(), false);
+        FatalAssert(rs.IsOK(), LOG_TAG_COMM_LAYER,
+                    "Failed to build REGISTER_MEMORY message: %s",
+                    rs.Msg());
+        RegisterMemoryMessage* register_msg =
+            reinterpret_cast<RegisterMemoryMessage*>(message.GetMessageBuffer());
+        CHECK_NOT_NULLPTR(register_msg, LOG_TAG_COMM_LAYER);
+        FatalAssert(register_msg->type == MessageType::REGISTER_MEMORY,
+                    LOG_TAG_COMM_LAYER,
+                    "Message type mismatch in RegisterMemoryMessage: expected %u, got %u",
+                    static_cast<uint8_t>(MessageType::REGISTER_MEMORY),
+                    static_cast<uint8_t>(register_msg->type));
+        register_msg->addr = reinterpret_cast<uintptr_t>(memory_pool);
+        register_msg->length = pool_size;
+        register_msg->rkey = rkey;
+
+        rs = SendMessage(message, true, false);
+        FatalAssert(rs.IsOK(), LOG_TAG_COMM_LAYER,
+                    "Failed to send REGISTER_MEMORY message: %s",
+                    rs.Msg());
+
+        std::vector<CommLayerMessage> general_messages;
+        std::unordered_map<VectorID, std::vector<CommLayerMessage>, VectorIDHash> cluster_based_messages;
+        bool registered = false;
+        while (!registered) {
+            rs = CheckReceivedMessagesFromNode(target_node_id, general_messages, cluster_based_messages, false);
+            FatalAssert(rs.IsOK(), LOG_TAG_COMM_LAYER,
+                        "Failed to check received messages from memory node: %s",
+                        rs.Msg());
+            FatalAssert(cluster_based_messages.empty(), LOG_TAG_COMM_LAYER,
+                        "Received unexpected cluster-based messages from memory node during memory registration");
+            FatalAssert(general_messages.size() <= 1, LOG_TAG_COMM_LAYER,
+                        "Received multiple general messages from memory node during memory registration");
+            if (general_messages.empty()) {
+                continue;
+            }
+            // Process the general message to check if registration is confirmed
+            for (const auto& msg : general_messages) {
+                FatalAssert(msg.GetMessageType() == MessageType::REGISTER_MEMORY,
+                            LOG_TAG_COMM_LAYER,
+                            "Unexpected message type %u from memory node during memory registration",
+                            static_cast<uint8_t>(msg.GetMessageType()));
+                RegisterMemoryMessage* register_msg =
+                    reinterpret_cast<RegisterMemoryMessage*>(msg.GetMessageBuffer());
+                CHECK_NOT_NULLPTR(register_msg, LOG_TAG_COMM_LAYER);
+                FatalAssert(register_msg->type == MessageType::REGISTER_MEMORY,
+                            LOG_TAG_COMM_LAYER,
+                            "Message type mismatch in RegisterMemoryMessage: expected %u, got %u",
+                            static_cast<uint8_t>(MessageType::REGISTER_MEMORY),
+                            static_cast<uint8_t>(register_msg->type));
+                registered = true;
+                rs = rdma_manager->RegisterRemoteMemory(target_node_id, register_msg->addr,
+                                                        register_msg->length,
+                                                        register_msg->rkey);
+                FatalAssert(rs.IsOK(), LOG_TAG_COMM_LAYER,
+                            "Failed to register remote memory from memory node at addr=0x%lx with length=%zu: %s",
+                            register_msg->addr, register_msg->length, rs.Msg());
+            }
+            rs = FreeMessages(general_messages, cluster_based_messages);
+            FatalAssert(rs.IsOK(), LOG_TAG_COMM_LAYER,
+                        "Failed to free messages after memory registration from memory node: %s",
+                        rs.Msg());
+        }
+#endif
+        /* todo: have a beeter way to handle this! For now sleep for a while to make sure everyone is ready */
+        sleep(30);
+        state = CommLayerState::RUNNING;
+        state_lock.Unlock();
+    }
 };
 
 };

@@ -68,6 +68,8 @@ struct RetStatus {
         RDMA_QP_FULL,
         RDMA_MANAGER_NOT_READY,
 
+        COMM_LAYER_DOWN,
+
         FAIL
     } stat;
 

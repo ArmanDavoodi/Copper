@@ -1077,6 +1077,22 @@ void RDMA_Manager::Destroy() {
     }
 }
 
+RetStatus RDMA_Manager::RegisterRemoteMemory(uint8_t target_node_id, uintptr_t remote_addr,
+                                             size_t length, uint32_t rkey) {
+    FatalAssert(rdmaManagerInstance == this, LOG_TAG_RDMA,
+                "RDMA_Manager instance mismatch in RegisterRemoteMemory");
+    FatalAssert(target_node_id < num_nodes, LOG_TAG_RDMA,
+                "Invalid target_node_id %hhu", target_node_id);
+    FatalAssert(target_node_id != self_node_id, LOG_TAG_RDMA,
+                "Cannot register remote memory from self node %hhu", self_node_id);
+    FatalAssert(length > 0, LOG_TAG_RDMA,
+                "Cannot register remote memory region with zero length");
+    FatalAssert(remote_addr != 0, LOG_TAG_RDMA,
+                "Cannot register remote memory region with null address");
+    nodes[target_node_id].AddRegion(remote_addr, length, rkey);
+    return RetStatus::Success();
+}
+
 RetStatus RDMA_Manager::RegisterMemory(Address addr, size_t length, uint32_t& lkey, uint32_t& rkey) {
     FatalAssert(rdmaManagerInstance == this, LOG_TAG_RDMA,
                 "RDMA_Manager instance mismatch in RegisterMemory");

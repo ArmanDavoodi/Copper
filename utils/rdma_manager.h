@@ -682,6 +682,7 @@ public:
     }
 
     /* Note: this function only registers the memory locally and will not send any notifications to other nodes */
+    RetStatus RegisterRemoteMemory(uint8_t target_node_id, uintptr_t remote_addr, size_t length, uint32_t rkey);
     RetStatus RegisterMemory(Address addr, size_t length, uint32_t& lkey, uint32_t& rkey);
     RetStatus EstablishConnections();
     /* todo: this should be done at comm layer */
