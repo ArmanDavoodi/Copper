@@ -149,7 +149,10 @@ struct RetStatus {
 
 typedef uint64_t RawVectorID;
 constexpr RawVectorID INVALID_VECTOR_ID = UINT64_MAX;
-constexpr uint16_t INVALID_OFFSET = UINT16_MAX;
+
+typedef uint16_t ClusterSizeType;
+constexpr ClusterSizeType INVALID_OFFSET = UINT16_MAX;
+constexpr ClusterSizeType MAX_OFFSET = 1ULL << (sizeof(ClusterSizeType) * 8 - 2) - 1; /* 2^15 - 1 */
 
 /*
  * we should not need more than 10 levels even if we have 1 petabyte of raw vector data with each vector being 128 in
