@@ -2,6 +2,7 @@
 #define DIVFTREE_BUFFER_H_
 
 #include "compute_node/divftree.h"
+#include "comm_layer.h"
 
 #include <memory>
 #include <atomic>
@@ -75,6 +76,8 @@ struct BufferVertexEntry {
     static void operator delete(void* ptr) noexcept;
 
     DIVFTreeVertex& ReadLatestVersion(bool pinCluster = true, bool needsHeaderLock = false);
+    DIVFTreeVertex& Read(Version version, bool pinCluster = false);
+    void Unpin(Version version);
 
     void AddVersion(Version version, uintptr_t remote_addr, ClusterSizeType size, uint64_t initialPin = 0);
     void AddVersion(Version version, uintptr_t remote_addr, ClusterSizeType size, void* local_cpy,
@@ -107,6 +110,8 @@ public:
 
     inline static BufferManager* GetInstance();
 
+    inline CommLayer* GetCommLayer();
+
     // void UpdateRoot(VectorID newRootId, Version newRootVersion, BufferVertexEntry* oldRootEntry);
     // BufferVertexEntry* CreateNewRootEntry(VectorID expRootId);
     void BatchCreateBufferEntry(ClusterSizeType num_entries, uint8_t level, BufferVertexEntry** entries,
@@ -119,16 +124,10 @@ public:
                                               SearchTaskGenerator taskGen);
     RetStatus ReadVertexIfAvailable(VectorID vertexId, Version version, BufferVertexEntry*& vertex,
                                     bool* outdated = nullptr);
-    BufferVertexEntry* ReadAndPinRoot();
 
     uint64_t GetHeight() const;
 
     String ToString();
-
-    RetStatus CreateUpdateHandle(VectorID target);
-    void SignalUpdateHandleIfNeeded(VectorID target);
-    RetStatus WaitForUpdateToGoThrough(VectorID target);
-    RetStatus CheckIfUpdateHasGoneThrough(VectorID target, bool& updated);
 
     bool AddMigrationTaskIfNotExists(VectorID first, VectorID second, BufferVertexEntry* firstEntry = nullptr);
     void RemoveMigrationTask(VectorID first, VectorID second, BufferVertexEntry* firstEntry = nullptr);
@@ -144,8 +143,6 @@ protected:
     const uint64_t leafVertexSize;
     SXSpinLock bufferMgrLock;
     std::vector<BufferVertexEntry*> clusterDirectory[MAX_TREE_HIGHT];
-    SXSpinLock handleLock;
-    std::unordered_map<VectorID, std::atomic<bool>*, VectorIDHash> handles;
 
     inline static BufferManager *bufferMgrInstance = nullptr;
 

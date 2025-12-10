@@ -18,7 +18,8 @@ enum class MessageType : uint8_t {
     BASE_MESSAGE_END = SHUTDOWN_RESPONSE,
 
     CN_MESSAGE_START,
-        CN_TO_MN_INSERT_REQUEST = CN_MESSAGE_START,
+        CN_TO_MN_REQUEST_ROOT = CN_MESSAGE_START,
+        CN_TO_MN_INSERT_REQUEST,
         CN_TO_MN_DELETE_REQUEST,
         CN_TO_MN_MIGRATION_REQUEST,
         CN_TO_MN_MERGE_REQUEST,
@@ -28,7 +29,8 @@ enum class MessageType : uint8_t {
 
     MN_MESSAGE_START,
         MN_RESPONSE_START = MN_MESSAGE_START,
-            MN_TO_CN_INSERT_FAILED_RESPONSE = MN_RESPONSE_START,
+            MN_TO_CN_RESPONSE_ROOT = MN_RESPONSE_START,
+            MN_TO_CN_INSERT_FAILED_RESPONSE,
             MN_TO_CN_DELETE_FAILED_RESPONSE,
             MN_TO_CN_CLUSTER_ADDRESS_RESPONSE,
         MN_RESPONSE_END = MN_TO_CN_CLUSTER_ADDRESS_RESPONSE,
@@ -46,7 +48,8 @@ enum class MessageType : uint8_t {
         MN_NOTIF_END = MN_TO_CN_MERGE_NOTIFICATION,
 
         MN_REQUEST_START,
-            MN_TO_CN_MERGE_CHECK_REQUEST = MN_REQUEST_START,
+            MN_TO_CN_SPLIT_REQUEST = MN_REQUEST_START,
+            MN_TO_CN_MERGE_CHECK_REQUEST,
             // MN_TO_CN_MIGRATION_CHECK_REQUEST,
         MN_REQUEST_END = MN_TO_CN_MERGE_CHECK_REQUEST,
 
@@ -87,6 +90,13 @@ struct  __attribute__((packed)) ShutdownResponseMessage {
     }
 };
 
+struct __attribute__((packed)) RequestRootMessage {
+    const MessageType type = MessageType::CN_TO_MN_REQUEST_ROOT;
+    constexpr static size_t Size() {
+        return sizeof(RequestRootMessage);
+    }
+};
+
 struct  __attribute__((packed)) InsertRequestMessage {
     const MessageType type = MessageType::CN_TO_MN_INSERT_REQUEST;
     VectorID target_leaf; /* should be leaf */
@@ -120,11 +130,11 @@ struct  __attribute__((packed)) MigrationRequestMessage {
     Version second_version;
     uint64_t num_first_to_second;
     uint64_t num_second_to_first;
-    uint16_t offsets[]; /* first num_first_to_second are offsets in first cluster, and the rest are offsets in second cluster */
+    ClusterSizeType offsets[]; /* first num_first_to_second are offsets in first cluster, and the rest are offsets in second cluster */
 
     constexpr static size_t Size(uint64_t num_first_to_second, uint64_t num_second_to_first) {
         return sizeof(MigrationRequestMessage) +
-               sizeof(uint16_t) * (num_first_to_second + num_second_to_first);
+               sizeof(ClusterSizeType) * (num_first_to_second + num_second_to_first);
     }
 };
 
@@ -163,6 +173,17 @@ struct  __attribute__((packed)) ClusterAddressRequestMessage {
 
     constexpr static size_t Size() {
         return sizeof(ClusterAddressRequestMessage);
+    }
+};
+
+struct __attribute__((packed)) ResponseRootMessage {
+    const MessageType type = MessageType::MN_TO_CN_RESPONSE_ROOT;
+    VectorID root_id;
+    Version root_version;
+    uintptr_t root_addr;
+
+    constexpr static size_t Size() {
+        return sizeof(ResponseRootMessage);
     }
 };
 
@@ -205,7 +226,7 @@ struct __attribute__((packed)) VectorInsertNotificationMessage {
     const MessageType type = MessageType::MN_TO_CN_VECTOR_INSERT_NOTIFICATION;
     VectorID container_id;
     Version container_version;
-    uint16_t offset;
+    ClusterSizeType offset;
     VectorID new_vector_id;
     VTYPE vector_data[];
 
@@ -218,12 +239,12 @@ struct __attribute__((packed)) ClusterInsertNotificationMessage {
     const MessageType type = MessageType::MN_TO_CN_CLUSTER_INSERT_NOTIFICATION;
     VectorID container_id;
     Version container_version;
-    uint16_t num_inserted;
-    uint16_t offset;
-    uint16_t outdated_offset;
+    ClusterSizeType num_inserted;
+    ClusterSizeType offset;
+    ClusterSizeType outdated_offset;
     char data[]; /* <VectorID, Version, VectorData>[] */
 
-    constexpr static size_t Size(uint16_t dim, uint16_t num_inserted) {
+    constexpr static size_t Size(uint16_t dim, ClusterSizeType num_inserted) {
         return sizeof(ClusterInsertNotificationMessage) +
                num_inserted * (sizeof(VectorID) + sizeof(Version) + sizeof(VTYPE) * dim);
     }
@@ -248,7 +269,7 @@ struct __attribute__((packed)) SplitNotificationMessage {
     // uintptr_t cluster_addrs[2];
     char data[];
 
-    constexpr static size_t Size(uint16_t split_factor) {
+    constexpr static size_t Size(ClusterSizeType split_factor) {
         return sizeof(SplitNotificationMessage) +
                split_factor * (sizeof(VectorID) + sizeof(Version) + sizeof(uintptr_t));
     }
@@ -264,7 +285,7 @@ struct __attribute__((packed)) ExpansionNotificationMessage {
     // uintptr_t cluster_addrs[2];
     char data[];
 
-    constexpr static size_t Size(uint16_t split_factor) {
+    constexpr static size_t Size(ClusterSizeType split_factor) {
         return sizeof(ExpansionNotificationMessage) +
                split_factor * (sizeof(VectorID) + sizeof(Version) + sizeof(uintptr_t));
     }
@@ -274,7 +295,7 @@ struct __attribute__((packed)) DeleteNotificationMessage {
     const MessageType type = MessageType::MN_TO_CN_DELETE_NOTIFICATION;
     VectorID container_id;
     Version container_version;
-    uint16_t offset;
+    ClusterSizeType offset;
 
     constexpr static size_t Size() {
         return sizeof(DeleteNotificationMessage);
@@ -303,13 +324,13 @@ struct __attribute__((packed)) MigrationNotificationMessage {
     VectorID dest_cluster;
     Version src_version;
     Version dest_version;
-    uint64_t num_migrated;
-    uint16_t offset; /* start offset where they were inserted at dest */
-    uint16_t old_offsets[]; /* <old offsets> */
+    ClusterSizeType num_migrated;
+    ClusterSizeType offset; /* start offset where they were inserted at dest */
+    ClusterSizeType old_offsets[]; /* <old offsets> */
 
     constexpr static size_t Size(uint64_t num_migrated) {
         return sizeof(MigrationNotificationMessage) +
-               num_migrated * (sizeof(uint16_t));
+               num_migrated * (sizeof(ClusterSizeType));
     }
 };
 
@@ -347,6 +368,23 @@ struct __attribute__((packed)) MergeCheckRequestMessage {
     }
 };
 
+struct __attribute__((packed)) SplitRequestMessage {
+    const MessageType type = MessageType::MN_TO_CN_SPLIT_REQUEST;
+    VectorID target_vector;
+    Version target_version;
+    uintptr_t target_vector_addr;
+    ClusterSizeType marked_for_update;
+    ClusterSizeType num_vectors;
+    char data[]; /* uintptr_t[split_factor] new addresses, <VectorID, Version(if applicable?) */
+    // uintptr_t new_cluster_addrs[]; /* the CN will use these for the new clusters and puts the VectorData+ID of the cluster itself as the last vector in it */
+
+    constexpr static size_t Size(ClusterSizeType split_factor, ClusterSizeType num_vectors) {
+        return sizeof(SplitRequestMessage) +
+               sizeof(uintptr_t) * split_factor +
+               (sizeof(VectorID) + sizeof(Version)) * num_vectors;
+    }
+};
+
 struct __attribute__((packed)) UrgentSplitRequestMessage {
     const MessageType type = MessageType::URGENT_MN_TO_CN_SPLIT_REQUEST;
     VectorID target_vector;
@@ -355,7 +393,7 @@ struct __attribute__((packed)) UrgentSplitRequestMessage {
 
     uintptr_t new_cluster_addr[]; /* the CN will use these for the new clusters and puts the VectorData+ID of the cluster itself as the last vector in it */
 
-    constexpr static size_t Size(uint16_t split_factor) {
+    constexpr static size_t Size(ClusterSizeType split_factor) {
         return sizeof(UrgentSplitRequestMessage) +
                sizeof(uintptr_t) * split_factor;
     }
@@ -402,7 +440,7 @@ enum class CommLayerState : uint8_t {
 class CommLayer {
 protected:
     const uint16_t dim;
-    const uint16_t split_factor;
+    const ClusterSizeType split_factor;
     const size_t leaf_size_bytes;
     const size_t internal_size_bytes;
     CommLayerState state;
@@ -427,9 +465,7 @@ protected:
                 "Comm Layer shutdown completed.");
     }
 public:
-    inline uint64_t GetMessageSize(const void* message) const {
-        CHECK_NOT_NULLPTR(message, LOG_TAG_COMM_LAYER);
-        MessageType type = *reinterpret_cast<const MessageType*>(message);
+    inline uint64_t GetMessageSize(MessageType type) const {
         switch (type) {
             case MessageType::REGISTER_MEMORY:
             {
@@ -526,6 +562,12 @@ public:
             {
                 return MergeCheckRequestMessage::Size();
             }
+            case MessageType::MN_TO_CN_SPLIT_REQUEST:
+            {
+                const SplitRequestMessage* split_msg =
+                        reinterpret_cast<const SplitRequestMessage*>(message);
+                return SplitRequestMessage::Size(split_factor, split_msg->num_vectors);
+            }
             case MessageType::URGENT_MN_TO_CN_SPLIT_REQUEST:
             {
                 const UrgentSplitRequestMessage* urgent_msg =
@@ -540,6 +582,12 @@ public:
                 return 0;
             }
         }
+    }
+
+    inline uint64_t GetMessageSize(const void* message) const {
+        CHECK_NOT_NULLPTR(message, LOG_TAG_COMM_LAYER);
+        MessageType type = *reinterpret_cast<const MessageType*>(message);
+        return GetMessageSize(type);
     }
 
     RetStatus BuildRequestMessage(uint8_t target_node_id, MessageType type, CommLayerMessage& message,
@@ -637,6 +685,7 @@ public:
         FatalAssert(rs.IsOK(), LOG_TAG_COMM_LAYER,
                     "Successfully built request message of type %u for target node %u",
                     static_cast<uint8_t>(type), target_node_id);
+        message.info.length = message_size;
         return rs;
     }
 
@@ -1194,10 +1243,12 @@ public:
     }
 #endif
 
-    CommLayer(uint16_t vector_dimension, uint16_t clustering_split_factor, size_t leaf_bytes, size_t internal_bytes,
-              void* memory_pool, size_t pool_size) : dim(vector_dimension), split_factor(clustering_split_factor),
-                                                     leaf_size_bytes(leaf_bytes), internal_size_bytes(internal_bytes),
-                                                     state(CommLayerState::INITIALIZATION) {
+    CommLayer(uint16_t vector_dimension, ClusterSizeType clustering_split_factor, size_t leaf_bytes,
+              size_t internal_bytes, void* memory_pool, size_t pool_size) : dim(vector_dimension),
+                                                                            split_factor(clustering_split_factor),
+                                                                            leaf_size_bytes(leaf_bytes),
+                                                                            internal_size_bytes(internal_bytes),
+                                                                            state(CommLayerState::INITIALIZATION) {
         CHECK_NOT_NULLPTR(memory_pool, LOG_TAG_COMM_LAYER);
         FatalAssert(pool_size > 0, LOG_TAG_COMM_LAYER,
                     "Invalid communication layer memory pool size %zu", pool_size);

@@ -70,6 +70,8 @@ struct RetStatus {
 
         COMM_LAYER_DOWN,
 
+        DUPLICATE_DELETE,
+        INSERT_NOT_COMPLETED,
         FAIL
     } stat;
 

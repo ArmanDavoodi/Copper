@@ -8,6 +8,8 @@
 #include "utils/synchronization.h"
 #include "utils/concurrent_datastructures.h"
 
+#include "interface/divftree.h"
+
 #include <algorithm>
 #include <atomic>
 #include <unordered_map>
@@ -151,7 +153,7 @@ enum class UpdateType : uint8_t {
 };
 
 struct UpdateCMP {
-    inline ClusterSizeType GetOffset(const UpdateType& type, const void* info) const {
+    inline static ClusterSizeType GetOffset(const UpdateType& type, const void* info) {
         switch (type) {
             case UpdateType::INSERTION:
                 return reinterpret_cast<const InsertionBatchInfo*>(info)->insert_offset;
@@ -270,7 +272,16 @@ TESTABLE;
 friend class DIVFTree;
 };
 
-class DIVFTree : public DIVFTreeInterface {
+struct BufferVertexEntry;
+
+struct CompletionHandle {
+    UpdateType type;
+    VectorID vector_id;
+    bool completed;
+    RetStatus status;
+};
+
+class DIVFTree {
 public:
     DIVFTree(DIVFTreeAttributes attributes);
     ~DIVFTree();
@@ -311,6 +322,8 @@ protected:
     DIVFTreeAttributes attr;
     std::atomic<uint64_t> real_size;
     std::atomic<bool> end_signal;
+    std::unordered_map<VectorID, CompletionHandle, VectorIDHash> completion_handles;
+    SXSpinLock handleLock;
 #ifdef HANG_DETECTION
     std::atomic<bool> end_bghang_detector = false;
     static inline constexpr uint64_t BG_HANG_DETECTOR_SLEEP_MS = 60000; /* 60 seconds */
@@ -349,6 +362,9 @@ protected:
 #ifdef COLLECT_LATENCY_STATS
 #endif
 #endif
+    RetStatus ReadAndPinRoot(BufferVertexEntry*& root_entry, Version& root_version);
+
+    inline VectorID GenerateNextVectorID(uint8_t level);
 
     inline void ClearStats(bool need_lock);
 
@@ -356,28 +372,23 @@ protected:
 
     void BGMergeStatsUpdate(uint64_t thread_index, bool completed_task, bool cluster_merged);
 
-    void BGCompactionStatsUpdate(uint64_t thread_index, bool completed_task, bool cluster_compacted);
-
     void BGSearchStatsUpdate(uint64_t thread_index, bool completed_task);
 
     void BGSearchStatsUpdateCreatedTask(uint64_t num_tasks);
 
-    inline void RoundRobinClustering(const DIVFTreeVertex* base, const ConstVectorBatch& batch,
-                                     BufferVertexEntry**& entries, DIVFTreeVertex**& clusters, VectorBatch& centroids,
-                                     uint16_t marked_for_update = INVALID_OFFSET);
+    inline void RoundRobinClustering(BufferVertexEntry* base, const ConstVectorBatch& batch,
+                                     BufferVertexEntry**& entries, ClusterSizeType marked_for_update);
 
     /*
      * will only fill in the raw centroid vectors to
      * the centroids batch and allocates memory for version and ids but does not fill them
      */
-    inline void Clustering(const DIVFTreeVertex* base, const ConstVectorBatch& batch,
-                           BufferVertexEntry**& entries, DIVFTreeVertex**& clusters, VectorBatch& centroids,
-                           uint16_t marked_for_update = INVALID_OFFSET);
+    inline void Clustering(BufferVertexEntry* base, const ConstVectorBatch& batch,
+                           BufferVertexEntry**& entries, ClusterSizeType marked_for_update);
 
-    inline BufferVertexEntry* ExpandTree(VectorID expRootId);
-
-    RetStatus SplitAndInsert(BufferVertexEntry* container_entry, const ConstVectorBatch& batch,
-                             uint16_t marked_for_update = INVALID_OFFSET);
+    RetStatus SplitAndInsert(VectorID target_id, Version target_version, uintptr_t target_remote_addr,
+                             uintptr_t* remote_addrs, const ConstVectorBatch& batch,
+                             ClusterSizeType marked_for_update);
 
     inline RetStatus ReadAndCheckVersion(VectorID containerId, Version containerVersion,
                                          BufferVertexEntry** entries, uint16_t max_entries, uint16_t& num_entries,
@@ -389,17 +400,18 @@ protected:
                       VectorID src_id, VectorID dest_id,
                       Version src_ver, Version dest_ver, uint64_t& num_migrated);
 
-    uint64_t MigrationCheck(VectorID first_cluster, VectorID second_cluster);
+    ClusterSizeType MigrationCheck(VectorID first_cluster, VectorID second_cluster);
 
     /* todo: need to refactor */
     RetStatus Merge(VectorID srcId, Version srcVersion,
                     VectorID destId, Version destVersion);
 
-    bool MergeCheck(VectorID target);
+    bool MergeCheck(VectorID target, Version targetVersion, VectorID parent, Version parentVersion,
+                    uintptr_t target_remote_addr, uintptr_t parent_remote_addr);
 
     void SearchRoot(const VTYPE* query, size_t span,
                     std::vector<SortedList<ANNVectorInfo, SimilarityComparator>*>& layers,
-                    DIVFTreeVertex* pinned_root_version);
+                    DIVFTreeVertex& pinned_root_version);
 
     void SearchVertex(VectorID id, Version version, const VTYPE* query, size_t span,
                       SortedList<ANNVectorInfo, SimilarityComparator>* neighbours,
@@ -414,14 +426,12 @@ protected:
     RetStatus ANNSearch(const VTYPE* query, size_t k, uint8_t internal_node_search_span, uint8_t leaf_node_search_span,
                         uint8_t start_level, uint8_t end_level,
                         std::vector<SortedList<ANNVectorInfo, SimilarityComparator>*>& layers,
-                        DIVFTreeVertex* pinned_root_version);
+                        DIVFTreeVertex& pinned_root_version);
 
-    inline void AsyncSearch(Thread* self, uint64_t idx);
+    inline void AsyncSearchAndComm(Thread* self, uint64_t idx);
 
     inline void BGMigration(Thread* self, uint64_t idx);
     inline void BGMerge(Thread* self, uint64_t idx);
-
-    inline void BGCompaction(Thread* self, uint64_t idx);
 
     inline void StartBGThreads();
     inline void DestroyBGThreads();
