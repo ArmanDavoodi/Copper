@@ -465,7 +465,9 @@ protected:
                 "Comm Layer shutdown completed.");
     }
 public:
-    inline uint64_t GetMessageSize(MessageType type) const {
+    inline uint64_t GetMessageSize(const void* message) const {
+        CHECK_NOT_NULLPTR(message, LOG_TAG_COMM_LAYER);
+        MessageType type = *reinterpret_cast<const MessageType*>(message);
         switch (type) {
             case MessageType::REGISTER_MEMORY:
             {
@@ -582,12 +584,6 @@ public:
                 return 0;
             }
         }
-    }
-
-    inline uint64_t GetMessageSize(const void* message) const {
-        CHECK_NOT_NULLPTR(message, LOG_TAG_COMM_LAYER);
-        MessageType type = *reinterpret_cast<const MessageType*>(message);
-        return GetMessageSize(type);
     }
 
     RetStatus BuildRequestMessage(uint8_t target_node_id, MessageType type, CommLayerMessage& message,

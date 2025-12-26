@@ -39,7 +39,7 @@
 namespace divftree {
 
 enum LockMode : uint8_t  {
-    SX_SHARED, SX_EXCLUSIVE
+    SX_UNLOCKED = 0, SX_SHARED, SX_EXCLUSIVE
 };
 
 enum LockHeld : uint8_t {
@@ -56,6 +56,25 @@ String LockModeToString(LockMode mode) {
 
 typedef uint64_t DIVFThreadID;
 inline constexpr DIVFThreadID INVALID_DIVF_THREAD_ID = UINT64_MAX;
+
+struct DIVFThreadIDHash {
+    inline std::size_t operator()(const DIVFThreadID& k) const {
+        /* since thread ids go up incrementally, using the id itself should not cause issues as it is uniformly distributed */
+        return k;
+    }
+};
+
+struct DIVFThreadIDCMP {
+    inline int operator()(const DIVFThreadID& a, const DIVFThreadID& b) const {
+        if (a < b) {
+            return -1;
+        } else if (a > b) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+};
 
 class Thread;
 
@@ -412,26 +431,26 @@ public:
     inline uint32_t UniformRange32(uint32_t first, uint32_t second) {
         FatalAssert(threadSelf == this, LOG_TAG_THREAD, "thread is not inited!");
         FatalAssert(first <= second, LOG_TAG_THREAD, "first cannot be greater than second!");
-        return std::uniform_int_distribution<uint32_t>(first, second)(_gen);
+        return std::uniform_int_distribution<uint32_t>(first, second + 1)(_gen);
     }
 
     inline uint64_t UniformRange64(uint64_t first, uint64_t second) {
         FatalAssert(threadSelf == this, LOG_TAG_THREAD, "thread is not inited!");
         FatalAssert(first <= second, LOG_TAG_THREAD, "first cannot be greater than second!");
-        return std::uniform_int_distribution<uint64_t>(first, second)(_gen);
+        return std::uniform_int_distribution<uint64_t>(first, second + 1)(_gen);
     }
 
     inline std::pair<uint32_t, uint32_t> UniformRangeTwo32(uint32_t first, uint32_t second) {
         FatalAssert(threadSelf == this, LOG_TAG_THREAD, "thread is not inited!");
         FatalAssert(first <= second, LOG_TAG_THREAD, "first cannot be greater than second!");
-        std::uniform_int_distribution<uint32_t> temp_dist(first, second);
+        std::uniform_int_distribution<uint32_t> temp_dist(first, second + 1);
         return std::make_pair(temp_dist(_gen), temp_dist(_gen));
     }
 
     inline std::pair<uint64_t, uint64_t> UniformRangeTwo64(uint64_t first, uint64_t second) {
         FatalAssert(threadSelf == this, LOG_TAG_THREAD, "thread is not inited!");
         FatalAssert(first <= second, LOG_TAG_THREAD, "first cannot be greater than second!");
-        std::uniform_int_distribution<uint64_t> temp_dist(first, second);
+        std::uniform_int_distribution<uint64_t> temp_dist(first, second + 1);
         return std::make_pair(temp_dist(_gen64), temp_dist(_gen64));
     }
 

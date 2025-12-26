@@ -72,6 +72,7 @@ struct RetStatus {
 
         DUPLICATE_DELETE,
         INSERT_NOT_COMPLETED,
+
         FAIL
     } stat;
 
@@ -445,7 +446,7 @@ constexpr inline uint64_t GET_MASK() {
     return (uint64_t)0;
 }
 
-uint32_t splitmix32(uint32_t x) {
+inline uint32_t splitmix32(uint32_t x) {
     x += 0x9e3779b9;
     x = (x ^ (x >> 16)) * 0x85ebca6b;
     x = (x ^ (x >> 13)) * 0xc2b2ae35;
@@ -467,19 +468,49 @@ inline uint64_t wycombine(uint64_t a, uint64_t b) {
 }
 
 struct VersionHash {
-    size_t operator()(const Version& p) const {
+    inline size_t operator()(const Version& p) const {
         return splitmix32(p._raw);
     }
 };
 
 struct VectorIDHash {
-    size_t operator()(const VectorID& p) const {
+    inline size_t operator()(const VectorID& p) const {
         return splitmix64(p._id);
     }
 };
 
+struct VectorIDCMP {
+    inline int operator()(const VectorID& a, const VectorID& b) const {
+        if (a < b) {
+            return -1;
+        } else if (a > b) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+};
+
+struct VectorIDVersionPairCMP {
+    inline int operator()(const std::pair<VectorID, Version>& a, const std::pair<VectorID, Version>& b) const {
+        if (a.first < b.first) {
+            return -1;
+        } else if (a.first > b.first) {
+            return 1;
+        } else {
+            if (a.second < b.second) {
+                return -1;
+            } else if (a.second > b.second) {
+                return 1;
+            } else {
+                return 0;
+            }
+        }
+    }
+};
+
 struct VectorIDVersionPairHash {
-    size_t operator()(const std::pair<VectorID, Version>& p) const {
+    inline size_t operator()(const std::pair<VectorID, Version>& p) const {
         if (p.first.IsCentroid()) {
             uint64_t h = wycombine(p.first._id, p.second._raw);
 

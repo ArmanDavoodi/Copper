@@ -2,7 +2,6 @@
 #define DIVFTREE_VECTOR_UTILS_H_
 
 #include "common.h"
-#include "distributed_common.h"
 
 #include <algorithm>
 

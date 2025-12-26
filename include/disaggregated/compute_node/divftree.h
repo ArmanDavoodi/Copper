@@ -2,7 +2,7 @@
 #define DIVFTREE_H_
 
 #include "common.h"
-#include "vector_utils.h"
+#include "disaggregated/vector_utils.h"
 #include "distance.h"
 
 #include "utils/synchronization.h"
@@ -28,6 +28,10 @@ struct MergeTask {
     VectorID target;
 };
 
+struct CompactionTask {
+    VectorID target;
+};
+
 struct SearchTask {
     DIVFThreadID master;
     uint64_t taskId;
@@ -36,39 +40,27 @@ struct SearchTask {
     Version version;
     const VTYPE* query;
     size_t k;
+    std::atomic<size_t>* num_completed;
 
-    std::atomic<bool>* taken;
-    std::atomic<bool>* done;
-
-    bool done_waiting;
-    SortedList<ANNVectorInfo, SimilarityComparator>* neighbours;
-
-    std::atomic<size_t>* viewed;
-    std::atomic<bool>* shared_data;
-    SearchTask** task_set;
+    ConcurrentHashTable<std::pair<VectorID, Version>, bool, VectorIDVersionPairCMP, VectorIDVersionPairHash>* seen;
+    ConcurrentHashTable<DIVFThreadID, SortedList<ANNVectorInfo, SimilarityComparator>*,
+                        DIVFThreadIDCMP, DIVFThreadIDHash>* neighbours_list;
 
     SearchTask() = default;
-    SearchTask(uint64_t task_id, uint64_t nt, VectorID id, Version ver, const VTYPE* q,
-               size_t span, std::atomic<bool>* tk, std::atomic<bool>* dn, std::atomic<size_t>* vd,
-               std::atomic<bool>* sd, SearchTask** ts) :
-        master(threadSelf->ID()), taskId(task_id), num_tasks(nt),
+    SearchTask(DIVFThreadID req_thread, uint64_t task_id, uint64_t nt, VectorID id, Version ver, const VTYPE* q,
+               size_t span, std::atomic<size_t>* nc,
+            ConcurrentHashTable<std::pair<VectorID, Version>, bool, VectorIDVersionPairCMP, VectorIDVersionPairHash>* s,
+            ConcurrentHashTable<DIVFThreadID, SortedList<ANNVectorInfo, SimilarityComparator>*,
+                                DIVFThreadIDCMP, DIVFThreadIDHash>* nl) :
+        master(req_thread), taskId(task_id), num_tasks(nt),
         target(id), version(ver), query(q), k(span),
-        taken(tk), done(dn), done_waiting(false), neighbours(nullptr), viewed(vd), shared_data(sd), task_set(ts) {
+        num_completed(nc), seen(s), neighbours_list(nl) {
         CHECK_VECTORID_IS_VALID(id, LOG_TAG_DIVFTREE);
         CHECK_NOT_NULLPTR(q, LOG_TAG_DIVFTREE);
-        CHECK_NOT_NULLPTR(tk, LOG_TAG_DIVFTREE);
-        CHECK_NOT_NULLPTR(dn, LOG_TAG_DIVFTREE);
+        CHECK_NOT_NULLPTR(nc, LOG_TAG_DIVFTREE);
+        CHECK_NOT_NULLPTR(s, LOG_TAG_DIVFTREE);
+        CHECK_NOT_NULLPTR(nl, LOG_TAG_DIVFTREE);
         FatalAssert(span > 0, LOG_TAG_DIVFTREE, "k cannot be 0!");
-    }
-
-    inline void CopyFrom(const SearchTask& other) {
-        master = other.master;
-        taskId = other.taskId;
-        target = other.target;
-        version = other.version;
-        query = other.query;
-        k = other.k;
-        neighbours = other.neighbours;
     }
 };
 
@@ -78,49 +70,102 @@ struct SearchTaskGenerator {
     const uint64_t num_tasks;
     const VTYPE* query;
     const size_t span;
-
-    std::atomic<bool>* taken;
-    std::atomic<bool>* done;
-    SortedList<ANNVectorInfo, SimilarityComparator>* neighbours;
-    std::atomic<size_t>* viewed;
-    std::atomic<bool>* shared_data;
-    SearchTask** task_set;
-
     BlockingQueue<SearchTask*>* taskQueue;
-    uint64_t num_generated;
+
+    SearchTask** task_set;
+    ConcurrentHashTable<std::pair<VectorID, Version>, bool, VectorIDVersionPairCMP, VectorIDVersionPairHash> seen;
+    ConcurrentHashTable<DIVFThreadID, SortedList<ANNVectorInfo, SimilarityComparator>*,
+                        DIVFThreadIDCMP, DIVFThreadIDHash> neighbours_list;
+
+    std::atomic<uint64_t> num_generated;
+    std::atomic<size_t> num_completed;
 
     SearchTaskGenerator(DIVFThreadID m, uint64_t t_id, uint64_t nt, const VTYPE* q, size_t s,
-                        std::atomic<bool>* tk, std::atomic<bool>* dn,
-                        SortedList<ANNVectorInfo, SimilarityComparator>* nb,
-                        std::atomic<size_t>* vd, std::atomic<bool>* sd, SearchTask** ts,
-                        BlockingQueue<SearchTask*>* tq) :
-        master(m), taskId(t_id), num_tasks(nt), query(q), span(s),
-        taken(tk), done(dn), neighbours(nb), viewed(vd), shared_data(sd), task_set(ts), taskQueue(tq),
-        num_generated(0) {
+                        BlockingQueue<SearchTask*>* tq, size_t num_excpected_vectors_in_search) :
+        master(m), taskId(t_id), num_tasks(nt), query(q), span(s), taskQueue(tq),
+        task_set(new SearchTask*[nt]), seen(num_excpected_vectors_in_search),
+        neighbours_list(), num_generated(0), num_completed(0) {
         CHECK_NOT_NULLPTR(q, LOG_TAG_DIVFTREE);
-        CHECK_NOT_NULLPTR(tk, LOG_TAG_DIVFTREE);
-        CHECK_NOT_NULLPTR(dn, LOG_TAG_DIVFTREE);
         CHECK_NOT_NULLPTR(tq, LOG_TAG_DIVFTREE);
         FatalAssert(span > 0, LOG_TAG_DIVFTREE, "k cannot be 0!");
         FatalAssert(nt > 0, LOG_TAG_DIVFTREE, "num_tasks cannot be 0!");
     }
 
-    bool GenerateTask(VectorID target, Version version) {
-        FatalAssert(num_generated < num_tasks, LOG_TAG_DIVFTREE,
+    ~SearchTaskGenerator() {
+        for (uint64_t i = 0; i < num_tasks; ++i) {
+            delete task_set[i];
+        }
+        delete[] task_set;
+        seen.Clear();
+        neighbours_list.Clear();
+    }
+
+    void GenerateTask(VectorID target, Version version) {
+        FatalAssert(num_generated.load(std::memory_order_acquire) < num_tasks, LOG_TAG_DIVFTREE,
                     "All tasks have already been generated!");
         FatalAssert(target.IsValid(), LOG_TAG_DIVFTREE,
                     "Target VectorID is not valid!");
         FatalAssert(target.IsCentroid(), LOG_TAG_DIVFTREE,
                     "Target VectorID is not a centroid!");
-        FatalAssert(task_set[num_generated] == nullptr, LOG_TAG_DIVFTREE,
-                    "Task slot {} is already occupied!", num_generated);
-        task_set[num_generated] =
-            new SearchTask(taskId, num_tasks, target, version, query, span, taken, done, viewed, shared_data, task_set);
-        task_set[num_generated]->master = master;
-        task_set[num_generated]->neighbours = neighbours;
-        taskQueue->Push(task_set[num_generated]);
-        ++num_generated;
-        return num_generated == num_tasks;
+        uint64_t idx = num_generated.fetch_add(1);
+        FatalAssert(idx < num_tasks, LOG_TAG_DIVFTREE,
+                    "All tasks have already been generated!");
+        FatalAssert(task_set[idx] == nullptr, LOG_TAG_DIVFTREE,
+                    "Task slot %lu is already occupied!", idx);
+        task_set[idx] =
+            new SearchTask(master, taskId, num_tasks, target, version, query, span, &num_completed,
+                           &seen, &neighbours_list);
+        taskQueue->Push(task_set[idx]);
+    }
+
+    void GenerateTask(std::vector<std::pair<VectorID, Version>> targets) {
+        FatalAssert(!targets.empty(), LOG_TAG_DIVFTREE,
+                    "Targets list is empty!");
+        FatalAssert(num_generated.load(std::memory_order_acquire) + targets.size() <= num_tasks, LOG_TAG_DIVFTREE,
+                    "All tasks have already been generated!");
+        uint64_t idx = num_generated.fetch_add(targets.size());
+        FatalAssert(idx + targets.size() <= num_tasks, LOG_TAG_DIVFTREE,
+                    "All tasks have already been generated!");
+        for (size_t i = 0; i < targets.size(); ++i) {
+            FatalAssert(targets[i].first.IsValid(), LOG_TAG_DIVFTREE,
+                        "Target VectorID is not valid!");
+            FatalAssert(targets[i].first.IsCentroid(), LOG_TAG_DIVFTREE,
+                        "Target VectorID is not a centroid!");
+            FatalAssert(task_set[idx + i] == nullptr, LOG_TAG_DIVFTREE,
+                        "Task slot %lu is already occupied!", idx + i);
+            task_set[idx + i] =
+                new SearchTask(master, taskId, num_tasks, targets[i].first, targets[i].second, query, span,
+                               &num_completed, &seen, &neighbours_list);
+        }
+        taskQueue->BatchPush(&task_set[idx], targets.size());
+    }
+
+    void GenerateTask(std::vector<std::vector<std::pair<VectorID, Version>>> targets) {
+        FatalAssert(!targets.empty(), LOG_TAG_DIVFTREE,
+                    "Targets list is empty!");
+        size_t total_size = 0;
+        for (const auto& t : targets) {
+            FatalAssert(!t.empty(), LOG_TAG_DIVFTREE,
+                        "One of the target sub-lists is empty!");
+            total_size += t.size();
+        }
+        uint64_t idx = num_generated.fetch_add(total_size);
+        FatalAssert(idx + total_size <= num_tasks, LOG_TAG_DIVFTREE,
+                    "All tasks have already been generated!");
+        for (const auto& t : targets) {
+            for (size_t i = 0; i < t.size(); ++i) {
+                FatalAssert(t[i].first.IsValid(), LOG_TAG_DIVFTREE,
+                            "Target VectorID is not valid!");
+                FatalAssert(t[i].first.IsCentroid(), LOG_TAG_DIVFTREE,
+                            "Target VectorID is not a centroid!");
+                FatalAssert(task_set[idx + i] == nullptr, LOG_TAG_DIVFTREE,
+                            "Task slot %lu is already occupied!", idx + i);
+                task_set[idx + i] =
+                    new SearchTask(master, taskId, num_tasks, t[i].first, t[i].second, query, span,
+                                   &num_completed, &seen, &neighbours_list);
+            }
+        }
+        taskQueue->BatchPush(&task_set[idx], targets.size());
     }
 };
 
@@ -253,10 +298,13 @@ public:
     inline RetStatus ChangeVectorState(CentroidMetaData* targetMeta, VectorState targetState);
 
     void Search(const VTYPE* query, size_t k, SortedList<ANNVectorInfo, SimilarityComparator>* neighbours,
-                std::unordered_set<std::pair<VectorID, Version>, VectorIDVersionPairHash>& seen);
+                ConcurrentHashTable<std::pair<VectorID, Version>, bool, VectorIDVersionPairCMP,
+                                    VectorIDVersionPairHash>& seen);
+
+    inline bool NeedCompaction() const;
 
     inline const DIVFTreeVertexAttributes& GetAttributes() const;
-    inline uint64_t GetVisibleSize() const;
+    inline ClusterSizeType GetVisibleSize() const;
     inline VectorID CentroidID() const;
     inline Version VertexVersion() const;
     String ToString(bool detailed = false) const;
@@ -301,7 +349,7 @@ public:
                                             size_t k, uint8_t internal_node_search_span, uint8_t leaf_node_search_span,
                                             SortType sort_type, std::vector<ANNVectorInfo>& neighbours);
 
-    size_t Size() const;
+    size_t ApproximateSize() const;
 
     const DIVFTreeAttributes& GetAttributes() const;
 
@@ -320,7 +368,7 @@ public:
 
 protected:
     DIVFTreeAttributes attr;
-    std::atomic<uint64_t> real_size;
+    std::atomic<uint64_t> appr_size;
     std::atomic<bool> end_signal;
     std::unordered_map<VectorID, CompletionHandle, VectorIDHash> completion_handles;
     SXSpinLock handleLock;
@@ -415,7 +463,8 @@ protected:
 
     void SearchVertex(VectorID id, Version version, const VTYPE* query, size_t span,
                       SortedList<ANNVectorInfo, SimilarityComparator>* neighbours,
-                      std::unordered_set<std::pair<VectorID, Version>, VectorIDVersionPairHash>& seen);
+                      ConcurrentHashTable<std::pair<VectorID, Version>, bool, VectorIDVersionPairCMP,
+                                          VectorIDVersionPairHash>& seen);
 
     /* todo: use multiple threads for searching each layer -> what if we use a single pool for all searches?
        if there are few threads, they will do the search layer themselves but if there are free threads they
@@ -428,6 +477,8 @@ protected:
                         std::vector<SortedList<ANNVectorInfo, SimilarityComparator>*>& layers,
                         DIVFTreeVertex& pinned_root_version);
 
+    /* use threadSelf->ID() and check if a task is generated by me, I should use my own neighbour list -> bgthreads use nullptr*/
+    inline RetStatus ExecuteSearchTask(SortedList<ANNVectorInfo, SimilarityComparator>* neighbours);
     inline void AsyncSearchAndComm(Thread* self, uint64_t idx);
 
     inline void BGMigration(Thread* self, uint64_t idx);

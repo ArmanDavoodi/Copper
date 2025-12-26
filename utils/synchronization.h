@@ -11,7 +11,7 @@
 
 #include "utils/string.h"
 #include "utils/thread.h"
-#include "utils/concurrent_datastructures.h"
+// #include "utils/concurrent_datastructures.h"
 
 namespace divftree {
 

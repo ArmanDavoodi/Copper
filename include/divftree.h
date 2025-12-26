@@ -5,7 +5,6 @@
 #include "vector_utils.h"
 #include "buffer.h"
 #include "distance.h"
-#include "distributed_common.h"
 
 #include "utils/synchronization.h"
 #include "utils/concurrent_datastructures.h"

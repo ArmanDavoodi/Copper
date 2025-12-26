@@ -1,8 +1,9 @@
 #ifndef DIVFTREE_BUFFER_H_
 #define DIVFTREE_BUFFER_H_
 
-#include "compute_node/divftree.h"
-#include "comm_layer.h"
+#include "disaggregated/compute_node/divftree.h"
+#include "disaggregated/comm_layer.h"
+#include "utils/concurrent_datastructures.h"
 
 #include <memory>
 #include <atomic>
@@ -64,6 +65,7 @@ struct BufferVertexEntry {
     const VectorID selfId;
     SXSpinLock headerLock;
     Version currentVersion;
+    uint64_t currentVersionPin; /* the pin of the cluster it self should be equal or greater than this is a search might pin that version(instead of latest) */
     bool is_root; /* will be set to false when we send unpin -> if set to true it doesn't mean that this is necessarily the current root */
 
     std::unordered_map<Version, VertexData, VersionHash> liveVersions;
@@ -78,6 +80,7 @@ struct BufferVertexEntry {
     DIVFTreeVertex& ReadLatestVersion(bool pinCluster = true, bool needsHeaderLock = false);
     DIVFTreeVertex& Read(Version version, bool pinCluster = false);
     void Unpin(Version version);
+    void Unpin(); /* unpins the current version */
 
     void AddVersion(Version version, uintptr_t remote_addr, ClusterSizeType size, uint64_t initialPin = 0);
     void AddVersion(Version version, uintptr_t remote_addr, ClusterSizeType size, void* local_cpy,
@@ -121,19 +124,29 @@ public:
     VectorID GetCurrentRootIdAndVersion(Version& version);
 
     RetStatus PrefetchAndPinVerticesForSearch(SortedList<ANNVectorInfo, SimilarityComparator>* vertices,
-                                              SearchTaskGenerator taskGen);
+                                              SearchTaskGenerator& taskGen);
+    RetStatus PrefetchAndPinVertex(VectorID vertexId);
     RetStatus ReadVertexIfAvailable(VectorID vertexId, Version version, BufferVertexEntry*& vertex,
                                     bool* outdated = nullptr);
+    RetStatus ReadVertexIfAvailable(VectorID vertexId, BufferVertexEntry*& vertex);
 
     uint64_t GetHeight() const;
 
     String ToString();
 
+    void AddCompactionTaskIfNotExists(VectorID id, BufferVertexEntry* entry = nullptr);
     bool AddMigrationTaskIfNotExists(VectorID first, VectorID second, BufferVertexEntry* firstEntry = nullptr);
     void RemoveMigrationTask(VectorID first, VectorID second, BufferVertexEntry* firstEntry = nullptr);
 
-    VectorID GetRandomCentroidIdAtLayer(uint8_t level, VectorID exclude = INVALID_VECTOR_ID,
-                                        bool need_lock = true, uint64_t* num_retries = nullptr);
+    /*
+     * if both ids are invalid at first, then two random centroids in the cache will be selected and pinned at the same level
+     * if one of them is invalid(the first should be valid and second invalid), then the first will be
+     *  prefetched and pinned and a different id at the same level will be selected for the second which is also pinned
+     * if both of them are valid, then both will be prefetched and pinned -> they should be at the same level
+     */
+    void GetCentroidsForMigrationCheck(VectorID& firstId, VectorID& secondId);
+    void GetCentroidsForMigrationCheck(uint8_t level, VectorID& firstId, VectorID& secondId);
+
     std::pair<VectorID, VectorID> GetTwoRandomCentroidIdAtLayer(uint8_t level, bool need_lock = true);
     VectorID GetRandomCentroidIdAtNonRootLayer(VectorID exclude = INVALID_VECTOR_ID);
     std::pair<VectorID, VectorID> GetTwoRandomCentroidIdAtNonRootLayer();
@@ -143,6 +156,9 @@ protected:
     const uint64_t leafVertexSize;
     SXSpinLock bufferMgrLock;
     std::vector<BufferVertexEntry*> clusterDirectory[MAX_TREE_HIGHT];
+    ConcurrentHashTable<VectorID, BufferVertexEntry*, VectorIDCMP, VectorIDHash> cached_latest_versions[MAX_TREE_HIGHT];
+    ConcurrentHashTable<std::pair<VectorID, Version>, bool, VectorIDVersionPairCMP, VectorIDVersionPairHash>
+        cached_cluster_set;
 
     inline static BufferManager *bufferMgrInstance = nullptr;
 
@@ -153,6 +169,6 @@ TESTABLE;
 
 };
 
-#include "compute_node/buffer_impl.h"
+#include "disaggregated/compute_node/buffer_impl.h"
 
 #endif
