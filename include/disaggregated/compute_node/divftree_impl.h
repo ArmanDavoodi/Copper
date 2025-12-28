@@ -43,8 +43,8 @@ enum BatchState {
 };
 
 template <bool is_leaf>
-inline BatchState IsBatchValid(Address meta, ClusterSizeType batch_start, ClusterSizeType& batch_end,
-                               ClusterSizeType curr_size, BufferManager* buffer) {
+inline BatchState _IsBatchValid(Address meta, ClusterSizeType batch_start, ClusterSizeType& batch_end,
+                                ClusterSizeType curr_size, BufferManager* buffer) {
     for (ClusterSizeType i = batch_start; i != batch_end; --i) {
         FatalAssert(i < curr_size, LOG_TAG_DIVFTREE_VERTEX,
                     "Index out of bounds. i=%hu, current_size=%hu", i, curr_size);
@@ -99,12 +99,12 @@ inline BatchState IsBatchValid(Address meta, ClusterSizeType batch_start, Cluste
 }
 
 template <bool is_leaf>
-inline void SearchBatch(const VTYPE* query, size_t k, SortedList<ANNVectorInfo, SimilarityComparator>* neighbours,
-                        BufferManager* buffer, VTYPE* data, Address meta, ClusterSizeType batch_start,
-                        ClusterSizeType batch_end, uint16_t dim, DistanceType dtype,
-                        ConcurrentHashTable<std::pair<VectorID, Version>, bool, VectorIDVersionPairCMP,
-                                            VectorIDVersionPairHash>& seen,
-                        std::unordered_set<VectorID, VectorIDHash>* in_cluster = nullptr) {
+inline void _SearchBatch(const VTYPE* query, size_t k, SortedList<ANNVectorInfo, SimilarityComparator>* neighbours,
+                         BufferManager* buffer, VTYPE* data, Address meta, ClusterSizeType batch_start,
+                         ClusterSizeType batch_end, uint16_t dim, DistanceType dtype,
+                         ConcurrentHashTable<std::pair<VectorID, Version>, bool, VectorIDVersionPairCMP,
+                                             VectorIDVersionPairHash>& seen,
+                         std::unordered_set<VectorID, VectorIDHash>* in_cluster = nullptr) {
     for (ClusterSizeType i = batch_start; i > batch_end; --i) {
         VectorID target_id;
         if constexpr (is_leaf) {
@@ -178,9 +178,9 @@ void DIVFTreeVertex::Search(const VTYPE* query, size_t k, SortedList<ANNVectorIn
                     batch_start, curr_size);
         BatchState batch_state;
         if (attr.centroid_id.IsLeaf()) {
-            batch_state = IsBatchValid<true>(meta, batch_start, batch_end, curr_size, buffer);
+            batch_state = _IsBatchValid<true>(meta, batch_start, batch_end, curr_size, buffer);
         } else {
-            batch_state = IsBatchValid<false>(meta, batch_start, batch_end, curr_size, buffer);
+            batch_state = _IsBatchValid<false>(meta, batch_start, batch_end, curr_size, buffer);
         }
 
         if (batch_state != BATCH_STATE_VALID) {
@@ -193,10 +193,10 @@ void DIVFTreeVertex::Search(const VTYPE* query, size_t k, SortedList<ANNVectorIn
         }
 
         if (attr.centroid_id.IsLeaf()) {
-            SearchBatch<true>(query, k, neighbours, buffer, data, meta, batch_start, batch_end, dim, dtype, seen);
+            _SearchBatch<true>(query, k, neighbours, buffer, data, meta, batch_start, batch_end, dim, dtype, seen);
         } else {
-            SearchBatch<false>(query, k, neighbours, buffer, data, meta, batch_start, batch_end, dim, dtype, seen,
-                               &in_cluster);
+            _SearchBatch<false>(query, k, neighbours, buffer, data, meta, batch_start, batch_end, dim, dtype, seen,
+                                &in_cluster);
         }
 
         batch_start = batch_end;
@@ -206,14 +206,14 @@ void DIVFTreeVertex::Search(const VTYPE* query, size_t k, SortedList<ANNVectorIn
     for (ClusterSizeType invalid_batch_start : invalid_batches) {
         ClusterSizeType invalid_batch_end = invalid_batch_start - 1;
         if (attr.centroid_id.IsLeaf() &&
-            IsBatchValid<true>(meta, invalid_batch_start, invalid_batch_end, curr_size, buffer) == BATCH_STATE_VALID) {
-            SearchBatch<true>(query, k, neighbours, buffer, data, meta, invalid_batch_start,
-                              invalid_batch_end, dim, dtype, seen);
-        } else if (!attr.centroid_id.IsLeaf() &&
-                   IsBatchValid<false>(meta, invalid_batch_start, invalid_batch_end, curr_size, buffer) ==
-                       BATCH_STATE_VALID) {
-            SearchBatch<false>(query, k, neighbours, buffer, data, meta, invalid_batch_start,
+            _IsBatchValid<true>(meta, invalid_batch_start, invalid_batch_end, curr_size, buffer) == BATCH_STATE_VALID) {
+            _SearchBatch<true>(query, k, neighbours, buffer, data, meta, invalid_batch_start,
                                invalid_batch_end, dim, dtype, seen);
+        } else if (!attr.centroid_id.IsLeaf() &&
+                   _IsBatchValid<false>(meta, invalid_batch_start, invalid_batch_end, curr_size, buffer) ==
+                       BATCH_STATE_VALID) {
+            _SearchBatch<false>(query, k, neighbours, buffer, data, meta, invalid_batch_start,
+                                invalid_batch_end, dim, dtype, seen);
         }
     }
 }
