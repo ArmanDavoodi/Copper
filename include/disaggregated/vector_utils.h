@@ -22,69 +22,134 @@ String VectorToString(const VTYPE* vec, uint16_t dim) {
     return res;
 }
 
-enum VectorState : uint8_t {
-    VECTOR_STATE_VALID = 0b000, /* Is Valid and is there */
-    VECTOR_STATE_INVALID = 0b001, /* the spot is empty and has garbage data */
-
-    VECTOR_STATE_MIGRATED = 0b010, /* vector has been migrated to another node and the data in this cluster is valid */
-    VECTOR_STATE_INV_MIGRATED = 0b011, /* vector has been migrated to another node and the data in this cluster is not valid */
-
-    VECTOR_STATE_OUTDATED = 0b100,
-    VECTOR_STATE_INV_OUTDATED = 0b101,
-
-    VECTOR_STATE_DELETED = 0b110,
-    VECTOR_STATE_INV_DELETED = 0b111
+enum VectorStateDetail : uint8_t {
+    VECTOR_STATE_NORMAL = 0,
+    VECTOR_STATE_MIGRATED = 1,
+    VECTOR_STATE_OUTDATED = 2,
+    VECTOR_STATE_DELETED = 3
 };
 
-inline bool IsVectorStateValid(const VectorState& state) {
-    return (state & 0b001) == VECTOR_STATE_VALID;
+enum VectorLockState : uint8_t {
+    VECTOR_LOCK_UNLOCKED = 0,
+    VECTOR_LOCK_IN_PROGRESS = 1,
+    VECTOR_LOCK_LOCKED = 2,
+};
+
+struct VectorState {
+    uint8_t is_state_valid : 1;
+    VectorStateDetail detail : 2;
+    VectorLockState lock_state : 2; /* Unused for now */
+    uint8_t unused : 3;
+
+    inline bool operator==(const VectorState& other) const {
+        return (is_state_valid == other.is_state_valid) &&
+               (detail == other.detail);
+    }
+};
+
+inline void ChangeVectorState(std::atomic<VectorState>& state, VectorState& expected, VectorStateDetail& target) {
+    if (expected.is_state_valid) {
+        FatalAssert(expected.detail == VECTOR_STATE_NORMAL, LOG_TAG_CLUSTER,
+                    "Only NORMAL state can be changed with this function!");
+        FatalAssert(target != VECTOR_STATE_NORMAL, LOG_TAG_CLUSTER,
+                    "Target state cannot be NORMAL in this function!");
+        FatalAssert(state.load(std::memory_order_acquire) == expected,
+                    LOG_TAG_CLUSTER,
+                    "Expected state does not match the actual state!");
+        state.store(VectorState{true, target, VECTOR_LOCK_UNLOCKED, 0},
+                    std::memory_order_release);
+        return;
+    }
+
+    VectorState desired{true, target, VECTOR_LOCK_UNLOCKED, 0};
+    if (expected.detail == VECTOR_STATE_NORMAL) {
+        /* Expecting Empty Vector Slot(Invalid) */
+        if (target != VECTOR_STATE_NORMAL) {
+            /* Empty -> Migrated/Outdated/Deleted (Invalid state) -> Out-of-order update */
+            desired.is_state_valid = false;
+            if (!state.compare_exchange_strong(expected, desired)) {
+                /* In this case, expected should have become valid-normal */
+                FatalAssert(expected.is_state_valid &&
+                            expected.detail == VECTOR_STATE_NORMAL,
+                            LOG_TAG_CLUSTER,
+                            "Expected state does not match the actual state after failed CAS!");
+                desired.is_state_valid = true;
+                state.store(desired, std::memory_order_release);
+            }
+            return;
+        }
+
+        /* Empty -> Valid (Insertion) */
+        if (state.compare_exchange_strong(expected, desired)) {
+            return;
+        }
+        /* In this case, state should have become Invalid-(migrated/deleted/outdated)
+           and we should now change state from Invalid-non normal to valid-non Normal */
+        target = expected.detail;
+        desired.detail = target;
+    }
+
+    /* Expecting an Invalid non-normal state */
+    FatalAssert(!expected.is_state_valid,
+                LOG_TAG_CLUSTER,
+                "Expected state cannot be valid");
+    FatalAssert(expected.detail != VECTOR_STATE_NORMAL,
+                LOG_TAG_CLUSTER,
+                "Expected state cannot be NORMAL");
+    FatalAssert(target == expected.detail,
+                LOG_TAG_CLUSTER,
+                "Target state must be equal to expected state in this case");
+    FatalAssert(desired.detail == target,
+                LOG_TAG_CLUSTER,
+                "Desired state must be equal to target state in this case");
+    FatalAssert(desired.is_state_valid,
+                LOG_TAG_CLUSTER,
+                "Desired state must be valid in this case");
+    state.store(desired, std::memory_order_release);
+    return;
 }
 
-inline bool IsVectorStateInvalid(const VectorState& state) {
-    return (state & 0b001) == VECTOR_STATE_INVALID;
+/* tries to change state to target. will returns the old state and sets target to current state */
+inline VectorState ChangeVectorState(std::atomic<VectorState>& state, VectorStateDetail& target) {
+    VectorState expected = state.load(std::memory_order_acquire);
+    ChangeVectorState(state, expected, target);
+    return expected;
 }
 
-inline bool IsVectorStateNormal(const VectorState& state) {
-    return (state & 0b110) == 0;
-}
-
-inline bool IsVectorStateMigrated(const VectorState& state) {
-    return (state == VECTOR_STATE_MIGRATED ||
-            state == VECTOR_STATE_INV_MIGRATED);
-}
-
-inline bool IsVectorStateOutdated(const VectorState& state) {
-    return (state == VECTOR_STATE_OUTDATED ||
-            state == VECTOR_STATE_INV_OUTDATED);
-}
-
-inline bool IsVectorStateDeleted(const VectorState& state) {
-    return (state == VECTOR_STATE_DELETED ||
-            state == VECTOR_STATE_INV_DELETED);
-}
-
-inline String VectorStateToString(const VectorState& state) {
+inline String VectorStateDetailToString(const VectorStateDetail& state) {
     switch (state)
     {
-    case VECTOR_STATE_VALID:
-        return String("VALID");
-    case VECTOR_STATE_INVALID:
-        return String("INVALID");
+    case VECTOR_STATE_NORMAL:
+        return String("NORMAL");
     case VECTOR_STATE_MIGRATED:
         return String("MIGRATED");
-    case VECTOR_STATE_INV_MIGRATED:
-        return String("INV_MIGRATED");
     case VECTOR_STATE_OUTDATED:
         return String("OUTDATED");
-    case VECTOR_STATE_INV_OUTDATED:
-        return String("INV_OUTDATED");
     case VECTOR_STATE_DELETED:
         return String("DELETED");
-    case VECTOR_STATE_INV_DELETED:
-        return String("INV_DELETED");
     default:
         return String("UNDEFINED");
     }
+}
+
+inline String VectorLockStateToString(const VectorLockState& state) {
+    switch (state)
+    {
+    case VECTOR_LOCK_UNLOCKED:
+        return String("UNLOCKED");
+    case VECTOR_LOCK_IN_PROGRESS:
+        return String("IN_PROGRESS");
+    case VECTOR_LOCK_LOCKED:
+        return String("LOCKED");
+    default:
+        return String("UNDEFINED");
+    }
+}
+
+inline String VectorStateToString(const VectorState& state) {
+    return String(state.is_state_valid ? "VALID-" : "INVALID-") +
+           VectorStateDetailToString(state.detail) + "-" +
+           VectorLockStateToString(state.lock_state);
 }
 
 /* this struct is always moved and never copied! */
@@ -118,6 +183,7 @@ struct ConstVectorBatch {
 struct VectorMetaData {
     VectorID id;
     VectorBatchMeta batch_meta;
+    std::atomic<bool> batch_valid;
     std::atomic<VectorState> state;
 };
 
@@ -126,6 +192,7 @@ struct CentroidMetaData {
     VectorID id;
     Version version;
     VectorBatchMeta batch_meta;
+    std::atomic<bool> batch_valid;
     std::atomic<VectorState> state;
 };
 

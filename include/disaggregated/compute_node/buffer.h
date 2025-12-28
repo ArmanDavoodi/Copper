@@ -129,6 +129,9 @@ public:
     RetStatus ReadVertexIfAvailable(VectorID vertexId, Version version, BufferVertexEntry*& vertex,
                                     bool* outdated = nullptr);
     RetStatus ReadVertexIfAvailable(VectorID vertexId, BufferVertexEntry*& vertex);
+    
+    /* should always return true for raw vectors */
+    bool Exists(VectorID vertexId, Version version);
 
     uint64_t GetHeight() const;
 

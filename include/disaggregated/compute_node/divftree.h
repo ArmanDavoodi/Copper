@@ -242,61 +242,6 @@ public:
      * otherwise if id.level is vertex/cluster then target should be locked in shared mode
      */
 
-     /*
-        possible:
-            Insertion: invalid -> valid:
-                exp could be: (in other words, vectorstate should be invalid)
-                    invalid -> Succ
-                    migrated_inv -> has to insert to new place instead
-                    outdated_inv -> can be ignored as at this point we have the new version
-                    deleted_inv -> can be ignored
-                exp cannot be:
-                    valid -> double insertion in the same offset of the same version of the same cluster
-                    migrated -> double insertion ...
-                    outdated -> double insertion ...
-                    deleted -> double insertion ...
-            Deletion: valid -> invalid
-                exp could be: (in other words, vectorstate should be normal)
-                    valid -> Succ
-                    invalid -> not inserted yet -> set to deleted_inv
-                exp cannot be:
-                    migrated -> mismatch with MN because if MN has told us that this is migrated it should have happend
-                                and we cannot fail.
-                    migrated_inv -> same reason as above
-                    outdated -> same reason as above
-                    outdated_inv -> same reason as above
-                    deleted -> double deletion
-                    deleted_inv -> double deletion
-            Migration: valid -> migrated
-                exp could be: (in other words, vectorstate should be normal)
-                    valid -> Succ
-                    invalid -> not inserted yet -> set to migrated_inv
-                exp cannot be:
-                    migrated -> double migration
-                    migrated_inv -> double migration
-                    outdated -> ...
-                    outdated_inv -> ...
-                    deleted -> ...
-                    deleted_inv -> ...
-            MarkOutdated: valid -> outdated
-                Note: this is only possible when container is not leaf
-                exp could be: (in other words, vectorstate should be normal)
-                    valid -> Succ
-                    invalid -> not inserted yet -> set to outdated_inv
-                exp cannot be:
-                    migrated -> ...
-                    migrated_inv -> ...
-                    outdated -> ...
-                    outdated_inv -> ...
-                    deleted -> ...
-                    deleted_inv -> ...
-        impossible:
-            MigrationAbortion: migrated -> valid : this should happen only in MN side
-     */
-    inline RetStatus ChangeVectorState(ClusterSizeType targetOffset, VectorState targetState);
-    inline RetStatus ChangeVectorState(VectorMetaData* targetMeta, VectorState targetState);
-    inline RetStatus ChangeVectorState(CentroidMetaData* targetMeta, VectorState targetState);
-
     void Search(const VTYPE* query, size_t k, SortedList<ANNVectorInfo, SimilarityComparator>* neighbours,
                 ConcurrentHashTable<std::pair<VectorID, Version>, bool, VectorIDVersionPairCMP,
                                     VectorIDVersionPairHash>& seen);

@@ -17,12 +17,206 @@ namespace divftree {
 
 // RetStatus DIVFTreeVertex::BatchUpdate(const SortedList<std::pair<UpdateType, void*>, UpdateCMP>& updates);
 
-// inline RetStatus DIVFTreeVertex::ChangeVectorState(ClusterSizeType targetOffset, VectorState targetState);
-// inline RetStatus DIVFTreeVertex::ChangeVectorState(VectorMetaData* targetMeta, VectorState targetState);
-// inline RetStatus DIVFTreeVertex::ChangeVectorState(CentroidMetaData* targetMeta, VectorState targetState);
+/*
+ *
+ * for the vector metadata we have one byte for state(atomic) and 2 bytes for batch size/last offset
+ * If a vector state is Invalid_something then it means that neighter the vector data nor the batch info is valid
+ * If a vector state is pute Invalid, it means that the slot is empty
+ * The only case where we insert vectors in atomic batches is when we have split.
+ *  Note: this means that vertices inserted in a migration are not in the same batch!
+ *        because they are logically independent insertions
+ * If we have out-of-order messages causing the state of a vector to be invalid_something,
+ *  then when the insertion comes we can insert the data and make the state valid(it could be valid outdated etc)
+ *  and then depending on the state, they also insert the data in other vertices.
+ * As long as there is a single Invalid or Invalid_something state in a batch, the whole batch is considered invalid
+ * The reson for this is that if there is an invalid vector in a bathc, that means that we do not have the
+ *  data of that vector and since the vectors in a batch are dependant, not reading them all can cause us
+ *  to ignore some parts of the dataset.
+ * Since we are first checking in a hash table that a vector has already been checked, we do not need to worry
+ * about computation costs of reading an outdated vector
+ */
 
-// void DIVFTreeVertex::Search(const VTYPE* query, size_t k, SortedList<ANNVectorInfo, SimilarityComparator>* neighbours,
-//             std::unordered_set<std::pair<VectorID, Version>, VectorIDVersionPairHash>& seen);
+enum BatchState {
+    BATCH_STATE_VALID,
+    BATCH_STATE_INVALID,
+    BATCH_STATE_MID_INVALID
+};
+
+template <bool is_leaf>
+inline BatchState IsBatchValid(Address meta, ClusterSizeType batch_start, ClusterSizeType& batch_end,
+                               ClusterSizeType curr_size, BufferManager* buffer) {
+    for (ClusterSizeType i = batch_start; i != batch_end; --i) {
+        FatalAssert(i < curr_size, LOG_TAG_DIVFTREE_VERTEX,
+                    "Index out of bounds. i=%hu, current_size=%hu", i, curr_size);
+        VectorState state;
+        VectorBatchMeta batch_meta;
+        VectorID target_id;
+        Version target_version;
+        bool batch_valid;
+        if constexpr (is_leaf) {
+            VectorMetaData* vmd = reinterpret_cast<VectorMetaData*>(meta);
+            state = vmd[i].state.load(std::memory_order_acquire);
+            batch_valid = vmd[i].batch_valid.load(std::memory_order_acquire);
+            batch_meta = vmd[i].batch_meta;
+            target_id = vmd[i].id;
+            target_version = 0;
+            FatalAssert(state.detail != VECTOR_STATE_OUTDATED,
+                        LOG_TAG_DIVFTREE_VERTEX,
+                        "a pure vector cannot become outdated!");
+        } else {
+            CentroidMetaData* vmd = reinterpret_cast<CentroidMetaData*>(meta);
+            state = vmd[i].state.load(std::memory_order_acquire);
+            batch_valid = vmd[i].batch_valid.load(std::memory_order_acquire);
+            batch_meta = vmd[i].batch_meta;
+            target_id = vmd[i].id;
+            target_version = vmd[i].version;
+        }
+
+        if (!state.is_state_valid || !buffer->Exists(target_id, target_version)) {
+            return BATCH_STATE_INVALID;
+        }
+
+        if (i == batch_start) {
+            if (batch_meta.is_batch_size) {
+                batch_end = batch_start - batch_meta.batch_size_or_last_offset;
+                if (!batch_valid) {
+                    return BATCH_STATE_INVALID;
+                }
+            } else {
+                FatalAssert(batch_meta.batch_size_or_last_offset < batch_start,
+                            LOG_TAG_DIVFTREE_VERTEX,
+                            "This should have been seen before");
+                /* the start was definetly invalid so we can only go forward */
+                return BATCH_STATE_MID_INVALID;
+            }
+        } else {
+            FatalAssert(batch_meta.is_batch_size == 0,
+                        LOG_TAG_DIVFTREE_VERTEX,
+                        "Only the first element in a batch can have batch size info");
+        }
+    }
+    return BATCH_STATE_VALID;
+}
+
+template <bool is_leaf>
+inline void SearchBatch(const VTYPE* query, size_t k, SortedList<ANNVectorInfo, SimilarityComparator>* neighbours,
+                        BufferManager* buffer, VTYPE* data, Address meta, ClusterSizeType batch_start,
+                        ClusterSizeType batch_end, uint16_t dim, DistanceType dtype,
+                        ConcurrentHashTable<std::pair<VectorID, Version>, bool, VectorIDVersionPairCMP,
+                                            VectorIDVersionPairHash>& seen,
+                        std::unordered_set<VectorID, VectorIDHash>* in_cluster = nullptr) {
+    for (ClusterSizeType i = batch_start; i > batch_end; --i) {
+        VectorID target_id;
+        if constexpr (is_leaf) {
+            UNUSED_VARIABLE(in_cluster);
+            UNUSED_VARIABLE(buffer);
+            VectorMetaData* vmd = reinterpret_cast<VectorMetaData*>(meta);
+            VectorState state = vmd[i].state.load(std::memory_order_acquire);
+            FatalAssert(state.is_state_valid, LOG_TAG_DIVFTREE_VERTEX,
+                        "State should be valid here!");
+            FatalAssert(state.detail != VECTOR_STATE_OUTDATED,
+                        LOG_TAG_DIVFTREE_VERTEX,
+                        "a pure vector cannot become outdated!");
+            if (state.detail == VECTOR_STATE_DELETED ||
+                !seen.Emplace(std::make_pair(vmd[i].id, 0), true)) {
+                continue;
+            }
+            target_id = vmd[i].id;
+        } else {
+            CentroidMetaData* vmd = reinterpret_cast<CentroidMetaData*>(meta);
+            VectorState state = vmd[i].state.load(std::memory_order_acquire);
+            FatalAssert(state.is_state_valid, LOG_TAG_DIVFTREE_VERTEX,
+                        "State should be valid here!");
+            if (in_cluster != nullptr) {
+                in_cluster->emplace(vmd[i].id);
+            }
+            if (state.detail == VECTOR_STATE_DELETED ||
+                /* since we are here it means that it existed before so now that we are here, it means that
+                    it was later deleted */
+                !buffer->Exists(vmd[i].id, vmd[i].version) ||
+                !seen.Emplace(std::make_pair(vmd[i].id, 0), true)) {
+                continue;
+            }
+
+            if (in_cluster != nullptr && state.detail == VECTOR_STATE_OUTDATED &&
+                (in_cluster->find(vmd[i].id) != in_cluster->end())) {
+                continue;
+            }
+            target_id = vmd[i].id;
+        }
+
+        neighbours->Insert(ANNVectorInfo(Distance(query, &data[i * dim], dim, dtype), target_id));
+        if (neighbours->Size() > k) {
+            neighbours->PopBack();
+        }
+        FatalAssert(neighbours->Size() <= k, LOG_TAG_DIVFTREE_VERTEX,
+                    "Neighbour list size exceeded k after insertion!");
+    }
+}
+
+void DIVFTreeVertex::Search(const VTYPE* query, size_t k, SortedList<ANNVectorInfo, SimilarityComparator>* neighbours,
+                            ConcurrentHashTable<std::pair<VectorID, Version>, bool, VectorIDVersionPairCMP,
+                                                VectorIDVersionPairHash>& seen) {
+    CHECK_NOT_NULLPTR(query, LOG_TAG_DIVFTREE_VERTEX);
+    CHECK_NOT_NULLPTR(neighbours, LOG_TAG_DIVFTREE_VERTEX);
+    FatalAssert(k > 0, LOG_TAG_DIVFTREE_VERTEX, "k must be greater than 0!");
+    FatalAssert(neighbours->Size() <= k, LOG_TAG_DIVFTREE_VERTEX, "neighbour list size out of bounds!");
+    const uint16_t dim = attr.index->GetAttributes().dimension;
+    const DistanceType dtype = attr.index->GetAttributes().distanceAlg;
+    BufferManager* buffer = BufferManager::GetInstance();
+    CHECK_NOT_NULLPTR(buffer, LOG_TAG_DIVFTREE_VERTEX);
+    VTYPE* data = cluster.Data(0, attr.centroid_id.IsLeaf(), attr.block_size, attr.cap, dim);
+    Address meta = cluster.MetaData(0, attr.centroid_id.IsLeaf(), attr.block_size, attr.cap, dim);
+    ClusterSizeType curr_size = size.load(std::memory_order_acquire);
+    std::unordered_set<VectorID, VectorIDHash> in_cluster;
+    std::vector<ClusterSizeType> invalid_batches;
+    ClusterSizeType batch_start = curr_size - 1;
+    ClusterSizeType batch_end = curr_size - 2;
+    while(batch_start != (ClusterSizeType)(-1)) {
+        FatalAssert(batch_start < curr_size, LOG_TAG_DIVFTREE_VERTEX,
+                    "Batch start is out of bounds. batch_start=%hu, current_size=%hu",
+                    batch_start, curr_size);
+        BatchState batch_state;
+        if (attr.centroid_id.IsLeaf()) {
+            batch_state = IsBatchValid<true>(meta, batch_start, batch_end, curr_size, buffer);
+        } else {
+            batch_state = IsBatchValid<false>(meta, batch_start, batch_end, curr_size, buffer);
+        }
+
+        if (batch_state != BATCH_STATE_VALID) {
+            if (batch_state == BATCH_STATE_INVALID) {
+                invalid_batches.push_back(batch_start);
+            }
+            batch_start = batch_end;
+            batch_end = batch_start - 1;
+            continue;
+        }
+
+        if (attr.centroid_id.IsLeaf()) {
+            SearchBatch<true>(query, k, neighbours, buffer, data, meta, batch_start, batch_end, dim, dtype, seen);
+        } else {
+            SearchBatch<false>(query, k, neighbours, buffer, data, meta, batch_start, batch_end, dim, dtype, seen,
+                               &in_cluster);
+        }
+
+        batch_start = batch_end;
+        batch_end = batch_start - 1;
+    }
+
+    for (ClusterSizeType invalid_batch_start : invalid_batches) {
+        ClusterSizeType invalid_batch_end = invalid_batch_start - 1;
+        if (attr.centroid_id.IsLeaf() &&
+            IsBatchValid<true>(meta, invalid_batch_start, invalid_batch_end, curr_size, buffer) == BATCH_STATE_VALID) {
+            SearchBatch<true>(query, k, neighbours, buffer, data, meta, invalid_batch_start,
+                              invalid_batch_end, dim, dtype, seen);
+        } else if (!attr.centroid_id.IsLeaf() &&
+                   IsBatchValid<false>(meta, invalid_batch_start, invalid_batch_end, curr_size, buffer) ==
+                       BATCH_STATE_VALID) {
+            SearchBatch<false>(query, k, neighbours, buffer, data, meta, invalid_batch_start,
+                               invalid_batch_end, dim, dtype, seen);
+        }
+    }
+}
 
 // inline const DIVFTreeVertexAttributes& DIVFTreeVertex::GetAttributes() const;
 // inline uint64_t DIVFTreeVertex::GetVisibleSize() const;
