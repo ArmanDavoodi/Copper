@@ -39,63 +39,60 @@ namespace divftree {
 enum BatchState {
     BATCH_STATE_VALID,
     BATCH_STATE_INVALID,
-    BATCH_STATE_MID_INVALID
+    BATCH_STATE_MID
 };
 
 template <bool is_leaf>
+inline void _GetVectorMeta(Address meta, ClusterSizeType index, VectorState& state, VectorBatchMeta& batch_meta,
+                           VectorID& target_id, Version& target_version, bool& batch_valid) {
+    if constexpr (is_leaf) {
+        VectorMetaData* vmd = reinterpret_cast<VectorMetaData*>(meta);
+        state = vmd[index].state.load(std::memory_order_acquire);
+        batch_valid = vmd[index].batch_valid.load(std::memory_order_acquire);
+        batch_meta = vmd[index].batch_meta;
+        target_id = vmd[index].id;
+        target_version = 0;
+    } else {
+        CentroidMetaData* vmd = reinterpret_cast<CentroidMetaData*>(meta);
+        state = vmd[index].state.load(std::memory_order_acquire);
+        batch_valid = vmd[index].batch_valid.load(std::memory_order_acquire);
+        batch_meta = vmd[index].batch_meta;
+        target_id = vmd[index].id;
+        target_version = vmd[index].version;
+    }
+}
+
+template <bool is_leaf>
 inline BatchState _IsBatchValid(Address meta, ClusterSizeType batch_start, ClusterSizeType& batch_end,
-                                ClusterSizeType curr_size, BufferManager* buffer) {
-    for (ClusterSizeType i = batch_start; i != batch_end; --i) {
-        FatalAssert(i < curr_size, LOG_TAG_DIVFTREE_VERTEX,
-                    "Index out of bounds. i=%hu, current_size=%hu", i, curr_size);
-        VectorState state;
-        VectorBatchMeta batch_meta;
-        VectorID target_id;
-        Version target_version;
-        bool batch_valid;
-        if constexpr (is_leaf) {
-            VectorMetaData* vmd = reinterpret_cast<VectorMetaData*>(meta);
-            state = vmd[i].state.load(std::memory_order_acquire);
-            batch_valid = vmd[i].batch_valid.load(std::memory_order_acquire);
-            batch_meta = vmd[i].batch_meta;
-            target_id = vmd[i].id;
-            target_version = 0;
-            FatalAssert(state.detail != VECTOR_STATE_OUTDATED,
-                        LOG_TAG_DIVFTREE_VERTEX,
-                        "a pure vector cannot become outdated!");
-        } else {
-            CentroidMetaData* vmd = reinterpret_cast<CentroidMetaData*>(meta);
-            state = vmd[i].state.load(std::memory_order_acquire);
-            batch_valid = vmd[i].batch_valid.load(std::memory_order_acquire);
-            batch_meta = vmd[i].batch_meta;
-            target_id = vmd[i].id;
-            target_version = vmd[i].version;
-        }
+                                BufferManager* buffer) {
+    VectorState state;
+    VectorBatchMeta batch_meta;
+    VectorID target_id;
+    Version target_version;
+    bool batch_valid;
+    _GetVectorMeta<is_leaf>(meta, batch_start, state, batch_meta, target_id, target_version, batch_valid);
 
-        if (!state.is_state_valid || !buffer->Exists(target_id, target_version)) {
-            return BATCH_STATE_INVALID;
-        }
+    if (!state.is_state_valid) {
+        return BATCH_STATE_INVALID;
+    }
 
-        if (i == batch_start) {
-            if (batch_meta.is_batch_size) {
-                batch_end = batch_start - batch_meta.batch_size_or_last_offset;
-                if (!batch_valid) {
-                    return BATCH_STATE_INVALID;
-                }
-            } else {
-                FatalAssert(batch_meta.batch_size_or_last_offset < batch_start,
-                            LOG_TAG_DIVFTREE_VERTEX,
-                            "This should have been seen before");
-                /* the start was definetly invalid so we can only go forward */
-                return BATCH_STATE_MID_INVALID;
-            }
-        } else {
-            FatalAssert(batch_meta.is_batch_size == 0,
-                        LOG_TAG_DIVFTREE_VERTEX,
-                        "Only the first element in a batch can have batch size info");
+    if (!batch_meta.is_batch_size) {
+        /* we are in middle of a batch! */
+        batch_start = batch_meta.batch_size_or_last_offset;
+        _GetVectorMeta<is_leaf>(meta, batch_start, state, batch_meta, target_id, target_version, batch_valid);
+        if (!state.is_state_valid) {
+            /* the batch header is invalid so we cannot use its data to see where the batch ends */
+            return BATCH_STATE_MID;
         }
     }
-    return BATCH_STATE_VALID;
+
+    FatalAssert(state.is_state_valid, LOG_TAG_DIVFTREE_VERTEX,
+                "State should be valid here!");
+    FatalAssert(batch_meta.is_batch_size == 1,
+                LOG_TAG_DIVFTREE_VERTEX,
+                "The last element in a batch must have batch size info");
+    batch_end = batch_start - batch_meta.batch_size_or_last_offset;
+    return batch_valid ? BATCH_STATE_VALID : BATCH_STATE_INVALID;
 }
 
 template <bool is_leaf>
@@ -131,8 +128,6 @@ inline void _SearchBatch(const VTYPE* query, size_t k, SortedList<ANNVectorInfo,
                 in_cluster->emplace(vmd[i].id);
             }
             if (state.detail == VECTOR_STATE_DELETED ||
-                /* since we are here it means that it existed before so now that we are here, it means that
-                    it was later deleted */
                 !buffer->Exists(vmd[i].id, vmd[i].version) ||
                 !seen.Emplace(std::make_pair(vmd[i].id, 0), true)) {
                 continue;
@@ -178,15 +173,18 @@ void DIVFTreeVertex::Search(const VTYPE* query, size_t k, SortedList<ANNVectorIn
                     batch_start, curr_size);
         BatchState batch_state;
         if (attr.centroid_id.IsLeaf()) {
-            batch_state = _IsBatchValid<true>(meta, batch_start, batch_end, curr_size, buffer);
+            batch_state = _IsBatchValid<true>(meta, batch_start, batch_end, buffer);
         } else {
-            batch_state = _IsBatchValid<false>(meta, batch_start, batch_end, curr_size, buffer);
+            batch_state = _IsBatchValid<false>(meta, batch_start, batch_end, buffer);
         }
 
         if (batch_state != BATCH_STATE_VALID) {
-            if (batch_state == BATCH_STATE_INVALID) {
-                invalid_batches.push_back(batch_start);
+            while (invalid_batches.size() > 0 &&
+                   invalid_batches.back() <= batch_start) {
+                /* thse are in middle of the batch! */
+                invalid_batches.pop_back();
             }
+            invalid_batches.push_back(batch_start);
             batch_start = batch_end;
             batch_end = batch_start - 1;
             continue;
@@ -205,14 +203,15 @@ void DIVFTreeVertex::Search(const VTYPE* query, size_t k, SortedList<ANNVectorIn
 
     for (ClusterSizeType invalid_batch_start : invalid_batches) {
         ClusterSizeType invalid_batch_end = invalid_batch_start - 1;
+        ClusterSizeType batch_start = invalid_batch_start;
         if (attr.centroid_id.IsLeaf() &&
-            _IsBatchValid<true>(meta, invalid_batch_start, invalid_batch_end, curr_size, buffer) == BATCH_STATE_VALID) {
-            _SearchBatch<true>(query, k, neighbours, buffer, data, meta, invalid_batch_start,
+            _IsBatchValid<true>(meta, batch_start, invalid_batch_end, buffer) == BATCH_STATE_VALID) {
+            _SearchBatch<true>(query, k, neighbours, buffer, data, meta, batch_start,
                                invalid_batch_end, dim, dtype, seen);
         } else if (!attr.centroid_id.IsLeaf() &&
-                   _IsBatchValid<false>(meta, invalid_batch_start, invalid_batch_end, curr_size, buffer) ==
+                   _IsBatchValid<false>(meta, batch_start, invalid_batch_end, buffer) ==
                        BATCH_STATE_VALID) {
-            _SearchBatch<false>(query, k, neighbours, buffer, data, meta, invalid_batch_start,
+            _SearchBatch<false>(query, k, neighbours, buffer, data, meta, batch_start,
                                 invalid_batch_end, dim, dtype, seen);
         }
     }
@@ -370,10 +369,7 @@ RetStatus DIVFTree::Delete(VectorID vec_id, bool create_completion_notification)
                 DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_DIVFTREE,
                         "Completion handle for vector " VECTORID_LOG_FMT " already exists for DELETE!",
                         VECTORID_LOG(vec_id));
-                return RetStatus{
-                    .stat = RetStatus::DUPLICATE_DELETE,
-                    .message = nullptr
-                };
+                return RetStatus(RetStatus::DUPLICATE_DELETE);
             } else {
                 FatalAssert(it->second.type == UpdateType::INSERTION, LOG_TAG_DIVFTREE,
                             "Completion handle for vector " VECTORID_LOG_FMT " has invalid type!",
@@ -385,10 +381,7 @@ RetStatus DIVFTree::Delete(VectorID vec_id, bool create_completion_notification)
                             "Cannot create DELETE completion handle for vector " VECTORID_LOG_FMT
                             " since INSERT has not completed yet!",
                             VECTORID_LOG(vec_id));
-                    return RetStatus{
-                        .stat = RetStatus::INSERT_NOT_COMPLETED,
-                        .message = nullptr
-                    };
+                    return RetStatus(RetStatus::INSERT_NOT_COMPLETED);
                 } else {
                     /* the insert has completed, we can change the handle to DELETE */
                     if (it->second.status.IsOK()) {
@@ -411,10 +404,7 @@ RetStatus DIVFTree::Delete(VectorID vec_id, bool create_completion_notification)
                         char* fail_message = new char[256];
                         snprintf(fail_message, 256,
                                  "Vector not found due to failed INSERT");
-                        return RetStatus{
-                            .stat = RetStatus::VECTOR_NOT_FOUND,
-                            .message = fail_message
-                        };
+                        return RetStatus(RetStatus::VECTOR_NOT_FOUND);
                     }
                 }
             }
@@ -603,16 +593,15 @@ void DIVFTree::SearchVertex(VectorID id, Version version, const VTYPE* query, si
     BufferManager* bufferMgr = BufferManager::GetInstance();
     FatalAssert(bufferMgr != nullptr, LOG_TAG_DIVFTREE, "BufferManager is not initialized.");
     bool outdated;
-    BufferVertexEntry* vertex_entry = nullptr;
-    RetStatus rs = bufferMgr->ReadVertexIfAvailable(id, version, vertex_entry, &outdated);
+    DIVFTreeVertex* vertex = nullptr;
+    RetStatus rs = bufferMgr->ReadVertexIfAvailable(id, version, vertex, &outdated);
     FatalAssert(rs.IsOK(), LOG_TAG_DIVFTREE,
                 "Failed to read vertex " VECTORID_LOG_FMT " version %u in SearchVertex: %s",
                 VECTORID_LOG(id), version._raw, rs.Msg());
-    CHECK_NOT_NULLPTR(vertex_entry, LOG_TAG_DIVFTREE);
-    DIVFTreeVertex& vertex = vertex_entry->Read(version);
+    CHECK_NOT_NULLPTR(vertex, LOG_TAG_DIVFTREE);
     if (!outdated) {
-        if (vertex.NeedCompaction()) {
-            bufferMgr->AddCompactionTaskIfNotExists(id, vertex_entry);
+        if (vertex->NeedCompaction()) {
+            bufferMgr->AddCompactionTaskIfNotExists(id);
         }
     }
 
@@ -621,14 +610,14 @@ void DIVFTree::SearchVertex(VectorID id, Version version, const VTYPE* query, si
         "Searching for query=%s in vertex=%s, neighbours=(%p)%s", VectorToString(query, attr.dimension).ToCStr(),
         vertex->ToString(true).ToCStr(), neighbours, neighbours->ToString<ANNVectorInfoToString>().ToCStr());
 #endif
-    vertex.Search(query, span, neighbours, seen);
+    vertex->Search(query, span, neighbours, seen);
 #ifdef EXCESS_LOGING
     DIVFLOG(LOG_LEVEL_DEBUG, LOG_TAG_DIVFTREE,
         "Searching for query=%s in vertex with id " VECTORID_LOG_FMT ", neighbours=(%p)%s",
         VectorToString(query, attr.dimension).ToCStr(), VECTORID_LOG(vertex->attr.centroid_id), neighbours,
         neighbours->ToString<ANNVectorInfoToString>().ToCStr());
 #endif
-    vertex_entry->Unpin(version);
+    bufferMgr->UnpinVertex(id, version);
 }
 
 void DIVFTree::SearchLayer(const VTYPE* query, size_t span,
@@ -796,7 +785,7 @@ RetStatus DIVFTree::ANNSearch(const VTYPE* query, size_t k,
         if (layers[next_level]->Empty()) {
             layers[current_level]->Clear();
             if (current_level == pinned_root_version.attr.centroid_id._level) {
-                return RetStatus{.stat=RetStatus::FAIL, .message=nullptr};
+                return RetStatus::Fail();
             }
             ++current_level;
             continue;
@@ -854,7 +843,7 @@ inline RetStatus DIVFTree::ExecuteSearchTask(SortedList<ANNVectorInfo, Similarit
         nextTask->num_completed->fetch_add(1);
         rs = RetStatus::Success();
     } else {
-        rs = RetStatus::Fail(nullptr);
+        rs = RetStatus::Fail();
     }
     FatalAssert(threadSelf->SanityCheckNumLocksHeldByMe() == 0, LOG_TAG_THREAD,
                 "should not hold any lock here!");

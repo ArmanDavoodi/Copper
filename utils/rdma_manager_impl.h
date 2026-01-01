@@ -1283,7 +1283,7 @@ RetStatus RDMA_Manager::RDMAWrite(RDMABuffer* rdma_buffers, size_t num_buffers, 
     uint16_t num_outstanding = conn_ctx.num_pending_requests.fetch_add(num_buffers);
     if (num_outstanding + num_buffers > MAX_SEND_WR[conn_ctx.type]) {
         conn_ctx.num_pending_requests.fetch_sub(num_buffers);
-        return RetStatus{.stat=RetStatus::RDMA_QP_FULL, .message=nullptr};
+        return RetStatus(RetStatus::RDMA_QP_FULL);
     }
 
     struct ibv_send_wr* wr_list = new ibv_send_wr[num_buffers];
@@ -1403,7 +1403,7 @@ RetStatus RDMA_Manager::RDMARead(RDMABuffer* rdma_buffers, size_t num_buffers, C
     uint16_t num_outstanding = conn_ctx.num_pending_requests.fetch_add(num_buffers);
     if (num_outstanding + num_buffers > MAX_SEND_WR[conn_ctx.type]) {
         conn_ctx.num_pending_requests.fetch_sub(num_buffers);
-        return RetStatus{.stat=RetStatus::RDMA_QP_FULL, .message=nullptr};
+        return RetStatus(RetStatus::RDMA_QP_FULL);
     }
 
     ConnTaskId new_task_id;

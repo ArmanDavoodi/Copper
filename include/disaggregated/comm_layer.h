@@ -617,8 +617,7 @@ public:
             if (need_lock) {
                 state_lock.Unlock();
             }
-            return RetStatus{.stat = RetStatus::COMM_LAYER_DOWN,
-                                .message = nullptr};
+            return RetStatus(RetStatus::COMM_LAYER_DOWN);
         }
 
 #ifdef MEMORY_NODE
@@ -778,8 +777,7 @@ public:
             if (need_lock) {
                 state_lock.Unlock();
             }
-            return RetStatus{.stat = RetStatus::COMM_LAYER_DOWN,
-                                .message = nullptr};
+            return RetStatus(RetStatus::COMM_LAYER_DOWN);
         }
         std::vector<BufferInfo> receive_buffers;
         RetStatus rs = rdma_manager->PollCommRequests(target_node_id, receive_buffers);
@@ -981,8 +979,7 @@ public:
         state_lock.Lock(SX_SHARED);
         if (state != CommLayerState::RUNNING && state != CommLayerState::INITIALIZATION) {
             state_lock.Unlock();
-            return RetStatus{.stat = RetStatus::COMM_LAYER_DOWN,
-                                .message = nullptr};
+            return RetStatus(RetStatus::COMM_LAYER_DOWN);
         }
 
         for (uint8_t node_id = 0; node_id < num_nodes; ++node_id) {
@@ -1030,8 +1027,7 @@ public:
         state_lock.Lock(SX_SHARED);
         if (state != CommLayerState::RUNNING && state != CommLayerState::INITIALIZATION) {
             state_lock.Unlock();
-            return RetStatus{.stat = RetStatus::COMM_LAYER_DOWN,
-                                .message = nullptr};
+            return RetStatus(RetStatus::COMM_LAYER_DOWN);
         }
         RDMA_Manager* rdma_manager = RDMA_Manager::GetInstance();
         CHECK_NOT_NULLPTR(rdma_manager, LOG_TAG_COMM_LAYER);
@@ -1100,8 +1096,7 @@ public:
         state_lock.Lock(SX_SHARED);
         if (state != CommLayerState::RUNNING && state != CommLayerState::INITIALIZATION) {
             state_lock.Unlock();
-            return RetStatus{.stat = RetStatus::COMM_LAYER_DOWN,
-                                .message = nullptr};
+            return RetStatus(RetStatus::COMM_LAYER_DOWN);
         }
         RDMA_Manager* rdma_manager = RDMA_Manager::GetInstance();
         CHECK_NOT_NULLPTR(rdma_manager, LOG_TAG_COMM_LAYER);
@@ -1148,8 +1143,7 @@ public:
         state_lock.Lock(SX_SHARED);
         if (state != CommLayerState::RUNNING && state != CommLayerState::INITIALIZATION) {
             state_lock.Unlock();
-            return RetStatus{.stat = RetStatus::COMM_LAYER_DOWN,
-                                .message = nullptr};
+            return RetStatus(RetStatus::COMM_LAYER_DOWN);
         }
         RetStatus rs = rdma_manager->PollCompletion(ConnectionType::CN_CLUSTER_READ, completed_task_ids);
         if (!rs.IsOK()) {
@@ -1204,8 +1198,7 @@ public:
         state_lock.Lock(SX_SHARED);
         if (state != CommLayerState::RUNNING && state != CommLayerState::INITIALIZATION) {
             state_lock.Unlock();
-            return RetStatus{.stat = RetStatus::COMM_LAYER_DOWN,
-                                .message = nullptr};
+            return RetStatus(RetStatus::COMM_LAYER_DOWN);
         }
         RDMA_Manager* rdma_manager = RDMA_Manager::GetInstance();
         CHECK_NOT_NULLPTR(rdma_manager, LOG_TAG_COMM_LAYER);

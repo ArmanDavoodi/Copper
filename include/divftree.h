@@ -247,7 +247,7 @@ public:
         uint16_t offset = cluster.header.reserved_size.fetch_add(batch.size);
         if (offset + batch.size >= attr.cap) {
             cluster.header.reserved_size.fetch_sub(batch.size);
-            return RetStatus{.stat = RetStatus::VERTEX_NOT_ENOUGH_SPACE, .message=nullptr};
+            return RetStatus(RetStatus::VERTEX_NOT_ENOUGH_SPACE);
         }
         FatalAssert(offset < cluster.header.reserved_size.load(), LOG_TAG_DIVFTREE_VERTEX, "Overflow detected!");
         BufferManager* bufferMgr = BufferManager::GetInstance();
@@ -406,7 +406,7 @@ public:
 
         return (state->compare_exchange_strong(expectedState, finalState) ?
                 RetStatus::Success() :
-                RetStatus{.stat=RetStatus::FAILED_TO_CAS_VECTOR_STATE, .message=nullptr});
+                RetStatus(RetStatus::FAILED_TO_CAS_VECTOR_STATE));
     }
 
     /*
@@ -464,7 +464,7 @@ public:
 
         return (state->compare_exchange_strong(expectedState, finalState) ?
                 RetStatus::Success() :
-                RetStatus{.stat=RetStatus::FAILED_TO_CAS_VECTOR_STATE, .message=nullptr});
+                RetStatus(RetStatus::FAILED_TO_CAS_VECTOR_STATE));
     }
 
     void Search(const VTYPE* query, size_t k, SortedList<ANNVectorInfo, SimilarityComparator>* neighbours,
@@ -869,7 +869,7 @@ public:
                 /* todo: if there is a difference in version we may be able to solve it using update logs! */
                 /* todo: check how many retries! */
                 bufferMgr->ReleaseBufferEntryIfNotNull(leaf_entry, ReleaseBufferEntryFlags(false, false));
-                rs = RetStatus::Fail(nullptr);
+                rs = RetStatus::Fail();
                 continue;
             }
             /* todo: maybe we can read the parent and only go one layer up instead of rereading from root */
@@ -913,7 +913,7 @@ public:
 #endif
             FatalAssert(threadSelf->SanityCheckNumLocksHeldByMe() == 0, LOG_TAG_THREAD,
                         "should not hold any lock here!");
-            return RetStatus{.stat=RetStatus::VECTOR_NOT_FOUND, .message="Vector does not exist in this index"};
+            return RetStatus(RetStatus::VECTOR_NOT_FOUND, "Vector does not exist in this index");
         }
         VectorLocation loc;
         BufferVertexEntry* parent = nullptr;
@@ -927,8 +927,8 @@ public:
 #endif
                 FatalAssert(threadSelf->SanityCheckNumLocksHeldByMe() == 0, LOG_TAG_THREAD,
                             "should not hold any lock here!");
-                return RetStatus{.stat=RetStatus::VECTOR_NOT_FOUND,
-                                .message="Vector is either deleted or is not yet inserted."};
+                return RetStatus(RetStatus::VECTOR_NOT_FOUND,
+                                 "Vector is either deleted or is not yet inserted.");
             }
         } while(!DeleteVectorAndReleaseContainer(vec_id, parent, loc).IsOK());
 
@@ -2267,7 +2267,7 @@ protected:
                 case BufferVertexEntryState::CLUSTER_FULL:
                 case BufferVertexEntryState::CLUSTER_DELETED: /* Can this happen? */
                     /* it is possible that the update was not applied though! */
-                    rs = RetStatus{.stat=RetStatus::VERTEX_UPDATED, .message=nullptr};
+                    rs = RetStatus(RetStatus::VERTEX_UPDATED);
                     break;
                 default:
                     DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_DIVFTREE, "Invalid entry state!");
@@ -2583,13 +2583,13 @@ protected:
          */
         containerEntry = bufferMgr->ReadBufferEntry(containerId, mode);
         if (containerEntry == nullptr) {
-            rs = RetStatus{.stat=RetStatus::TARGET_DELETED, .message=nullptr};
+            rs = RetStatus(RetStatus::TARGET_DELETED);
         }
 
         if (rs.IsOK()) {
             ++num_entries;
             if (containerEntry->currentVersion._split != containerVersion._split) {
-                rs = RetStatus{.stat=RetStatus::TARGET_UPDATED, .message=nullptr};
+                rs = RetStatus(RetStatus::TARGET_UPDATED);
             }
         }
 
@@ -2797,7 +2797,7 @@ protected:
                                                         expState, VECTOR_STATE_VALID);
                     FatalAssert(rs.IsOK(), LOG_TAG_DIVFTREE, "this should not fail!");
                 }
-                rs = RetStatus{.stat=RetStatus::NEW_CONTAINER_UPDATED, .message=nullptr};
+                rs = RetStatus(RetStatus::NEW_CONTAINER_UPDATED);
                 bufferMgr->ReleaseEntriesIfNotNull(&entries[max_entries - num_entries], num_entries,
                                             ReleaseBufferEntryFlags(false, false));
             } else {
@@ -2842,7 +2842,7 @@ protected:
                 PruneIfNeededAndRelease(src_entry_cpy);
             }
         } else {
-            rs = RetStatus{.stat=RetStatus::EMPTY_MIGRATION_BATCH, .message=nullptr};
+            rs = RetStatus(RetStatus::EMPTY_MIGRATION_BATCH);
             bufferMgr->ReleaseEntriesIfNotNull(&entries[max_entries - num_entries], num_entries,
                                                ReleaseBufferEntryFlags(false, false));
         }
@@ -3125,7 +3125,7 @@ protected:
                 bufferMgr->RemoveMergeTask(srcId, *srcEntry);
                 bufferMgr->ReleaseEntriesIfNotNull(&entries[max_entries - num_entries], num_entries,
                                                    ReleaseBufferEntryFlags(false, false));
-                return RetStatus{.stat=RetStatus::SRC_HAS_TOO_MANY_VECTORS, .message=nullptr};
+                return RetStatus(RetStatus::SRC_HAS_TOO_MANY_VECTORS);
             }
 
             if (totalSize == 0) {
@@ -3133,7 +3133,7 @@ protected:
                 /* todo: check if state is not delete in progress, we should delete the cluster ourselves here? */
                 bufferMgr->ReleaseEntriesIfNotNull(&entries[max_entries - num_entries], num_entries,
                                                    ReleaseBufferEntryFlags(false, false));
-                return RetStatus{.stat=RetStatus::SRC_EMPTY, .message=nullptr};
+                return RetStatus(RetStatus::SRC_EMPTY);
             }
 
             rs = ReadAndCheckVersion(destId, destVersion, entries, max_entries, num_entries, SX_SHARED);
@@ -3170,7 +3170,7 @@ protected:
                 bufferMgr->RemoveMergeTask(srcId, *srcEntry);
                 bufferMgr->ReleaseEntriesIfNotNull(&entries[max_entries - num_entries], num_entries,
                                                    ReleaseBufferEntryFlags(false, false));
-                return RetStatus{.stat=RetStatus::SRC_HAS_TOO_MANY_VECTORS, .message=nullptr};
+                return RetStatus(RetStatus::SRC_HAS_TOO_MANY_VECTORS);
             }
 
             if (totalSize == 0) {
@@ -3178,7 +3178,7 @@ protected:
                 /* todo: check if state is not delete in progress, we should delete the cluster ourselves here? */
                 bufferMgr->ReleaseEntriesIfNotNull(&entries[max_entries - num_entries], num_entries,
                                                    ReleaseBufferEntryFlags(false, false));
-                return RetStatus{.stat=RetStatus::SRC_EMPTY, .message=nullptr};
+                return RetStatus(RetStatus::SRC_EMPTY);
             }
         }
 
@@ -3305,7 +3305,7 @@ protected:
         delete[] batch.id;
         delete[] offsets;
 
-        return RetStatus{.stat=RetStatus::DEST_UPDATED, .message=nullptr};
+        return RetStatus(RetStatus::DEST_UPDATED);
     }
 
     bool MergeCheck(VectorID target) {
@@ -3701,7 +3701,7 @@ protected:
             if (layers[next_level]->Empty()) {
                 layers[current_level]->Clear();
                 if (current_level == pinned_root_version->attr.centroid_id._level) {
-                    return RetStatus{.stat=RetStatus::FAIL, .message=nullptr};
+                    return RetStatus(RetStatus::FAIL);
                 }
                 ++current_level;
                 continue;

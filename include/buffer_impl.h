@@ -266,7 +266,7 @@ RetStatus BufferVertexEntry::UpgradeAccessToExclusive(BufferVertexEntryState& ta
             clusterLock.Unlock();
         }
         targetState = expected;
-        return RetStatus{.stat=RetStatus::FAILED_TO_CAS_ENTRY_STATE, .message=nullptr};
+        return RetStatus(RetStatus::FAILED_TO_CAS_ENTRY_STATE);
     }
 }
 
@@ -919,7 +919,7 @@ RetStatus BufferManager::ReadAndPinVertex(VectorID vertexId, Version version,
     vertex = nullptr;
     BufferVertexEntry* entry = GetVertexEntry(vertexId);
     if (entry == nullptr) {
-        return RetStatus{.stat=RetStatus::VERTEX_DELETED, .message=nullptr};
+        return RetStatus(RetStatus::VERTEX_DELETED);
     }
 
     FatalAssert(entry->centroidMeta.selfId == vertexId, LOG_TAG_BUFFER, "BufferEntry id mismatch! VertexID="
@@ -932,7 +932,7 @@ RetStatus BufferManager::ReadAndPinVertex(VectorID vertexId, Version version,
     entry->headerLock.Lock(SX_SHARED);
     if (version > entry->currentVersion) {
         entry->headerLock.Unlock();
-        return RetStatus{.stat=RetStatus::VERSION_NOT_APPLIED, .message=nullptr};
+        return RetStatus(RetStatus::VERSION_NOT_APPLIED);
     }
 
     FatalAssert(version <= entry->currentVersion, LOG_TAG_BUFFER, "Version is out of bounds: VertexID="
@@ -944,7 +944,7 @@ RetStatus BufferManager::ReadAndPinVertex(VectorID vertexId, Version version,
     auto it = entry->liveVersions.find(version);
     if (it == entry->liveVersions.end() || it->second.versionPin.load() == 0) {
         entry->headerLock.Unlock();
-        return RetStatus{.stat=RetStatus::OUTDATED_VERSION_DELETED, .message=nullptr};
+        return RetStatus(RetStatus::OUTDATED_VERSION_DELETED);
     }
 
     uint64_t pin = it->second.clusterPtr.pin.fetch_add(1);
@@ -1140,8 +1140,8 @@ RetStatus BufferManager::CreateUpdateHandle(VectorID target) {
     auto it = handles.find(target);
     if (it != handles.end()) {
         handleLock.Unlock();
-        return RetStatus{.stat=RetStatus::ALREADY_HAS_A_HANDLE,
-                         .message="Cannot have more than one handle per id at a time"};
+        return RetStatus(RetStatus::ALREADY_HAS_A_HANDLE,
+                         "Cannot have more than one handle per id at a time");
     }
 
     handles[target] = new std::atomic<bool>{false};
@@ -1171,8 +1171,8 @@ RetStatus BufferManager::WaitForUpdateToGoThrough(VectorID target) {
     auto it = handles.find(target);
     if (it == handles.end()) {
         handleLock.Unlock();
-        return RetStatus{.stat=RetStatus::NO_HANDLE_FOUND_FOR_TARGET,
-                            .message="no handle found for the target vectorId"};
+        return RetStatus(RetStatus::NO_HANDLE_FOUND_FOR_TARGET,
+                         "no handle found for the target vectorId");
     }
     std::atomic<bool>* handle = it->second;
     CHECK_NOT_NULLPTR(handle, LOG_TAG_BUFFER);
@@ -1192,8 +1192,8 @@ RetStatus BufferManager::CheckIfUpdateHasGoneThrough(VectorID target, bool& upda
     auto it = handles.find(target);
     if (it == handles.end()) {
         handleLock.Unlock();
-        return RetStatus{.stat=RetStatus::NO_HANDLE_FOUND_FOR_TARGET,
-                            .message="no handle found for the target vectorId"};
+        return RetStatus(RetStatus::NO_HANDLE_FOUND_FOR_TARGET,
+                         "no handle found for the target vectorId");
     }
     std::atomic<bool>* handle = it->second;
     CHECK_NOT_NULLPTR(handle, LOG_TAG_BUFFER);

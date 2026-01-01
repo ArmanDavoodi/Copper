@@ -90,7 +90,7 @@ divftree::RetStatus Insert(FILE*& input_file_ptr, size_t& num_read, size_t& tota
             dataset_finished.store(true, std::memory_order_release);
             DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_TEST, "Dataset finished!");
         }
-        return divftree::RetStatus::Fail(nullptr);
+        return divftree::RetStatus::Fail();
     }
 
     /* todo: make sure that when we return from this it is safe to reuse buffer! */
@@ -107,7 +107,7 @@ divftree::RetStatus Delete(IDSet& id_set) {
     divftree::RetStatus rs;
     if (id_set.empty()) {
         DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_TEST, "id_set is empty!");
-        return divftree::RetStatus::Fail(nullptr);
+        return divftree::RetStatus::Fail();
     }
 
     divftree::VectorID target = id_set.get_random_id();
@@ -131,7 +131,7 @@ divftree::RetStatus Search(std::vector<divftree::ANNVectorInfo>& neighbours) {
         DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_TEST, "Error during search: %s", rs.Msg());
     } else if (neighbours.empty()) {
         DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_TEST, "No neighbours found during search!");
-        rs = divftree::RetStatus::Fail(nullptr);
+        rs = divftree::RetStatus::Fail();
     } else if (collect_avg_distances) {
         DISTANCE_TYPE total_distance = 0;
         for (const auto& neighbour : neighbours) {

@@ -160,6 +160,13 @@ struct VectorBatch {
     ClusterSizeType size = 0;
 };
 
+// enum VectorBatchState : uint8_t {
+//     BATCH_STATE_VALID = 0,
+//     BATCH_STATE_INVALID = 1,
+//     BATCH_STATE_CHAINED_INVALID = 2
+//     /* chained invalid means that there is another batch somewhere that is invalid because of this batch */
+// };
+
 /* this struct is always moved and never copied! */
 struct ConstVectorBatch {
     const VTYPE* data = nullptr;

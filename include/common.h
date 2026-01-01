@@ -20,7 +20,7 @@
 namespace divftree {
 
 struct RetStatus {
-    enum {
+    enum StatusCode : uint16_t {
         SUCCESS,
 
         BATCH_CONFLICTING_OPERATIONS,
@@ -79,16 +79,11 @@ struct RetStatus {
     const char* message = nullptr;
 
     static inline RetStatus Success() {
-        return RetStatus{SUCCESS, nullptr};
+        return RetStatus(SUCCESS);
     }
 
-    static inline RetStatus Fail(const char* msg) {
-        RetStatus status{FAIL, nullptr};
-        if (msg != nullptr) {
-            status.message = new char[strlen(msg) + 1];
-            strcpy(const_cast<char*>(status.message), msg);
-        }
-        return status;
+    static inline RetStatus Fail(const char* msg = nullptr) {
+        return RetStatus(FAIL, msg);
     }
 
     inline bool IsOK() const {
@@ -119,6 +114,13 @@ struct RetStatus {
 
     RetStatus(RetStatus&& other) : stat(other.stat), message(other.message) {
         other.message = nullptr;
+    }
+
+    RetStatus(StatusCode s, const char* msg = nullptr) : stat(s), message(nullptr) {
+        if (msg != nullptr) {
+            message = new char[strlen(msg) + 1];
+            strcpy(const_cast<char*>(message), msg);
+        }
     }
 
     RetStatus& operator=(const RetStatus& other) {
