@@ -45,9 +45,14 @@ struct VectorState {
         return (is_state_valid == other.is_state_valid) &&
                (detail == other.detail);
     }
+
+    VectorState(bool valid, VectorStateDetail det) :
+        is_state_valid(valid), detail(det), lock_state(VECTOR_LOCK_UNLOCKED), unused(0) {}
 };
 
-inline void ChangeVectorState(std::atomic<VectorState>& state, VectorState& expected, VectorStateDetail& target) {
+/* todo: what if it was already read from the memory node? */
+inline VectorState ChangeVectorState(std::atomic<VectorState>& state, VectorState& expected, VectorStateDetail target) {
+    VectorState desired(true, target);
     if (expected.is_state_valid) {
         FatalAssert(expected.detail == VECTOR_STATE_NORMAL, LOG_TAG_CLUSTER,
                     "Only NORMAL state can be changed with this function!");
@@ -56,12 +61,10 @@ inline void ChangeVectorState(std::atomic<VectorState>& state, VectorState& expe
         FatalAssert(state.load(std::memory_order_acquire) == expected,
                     LOG_TAG_CLUSTER,
                     "Expected state does not match the actual state!");
-        state.store(VectorState{true, target, VECTOR_LOCK_UNLOCKED, 0},
-                    std::memory_order_release);
-        return;
+        state.store(desired, std::memory_order_release);
+        return desired;
     }
 
-    VectorState desired{true, target, VECTOR_LOCK_UNLOCKED, 0};
     if (expected.detail == VECTOR_STATE_NORMAL) {
         /* Expecting Empty Vector Slot(Invalid) */
         if (target != VECTOR_STATE_NORMAL) {
@@ -76,12 +79,12 @@ inline void ChangeVectorState(std::atomic<VectorState>& state, VectorState& expe
                 desired.is_state_valid = true;
                 state.store(desired, std::memory_order_release);
             }
-            return;
+            return desired;
         }
 
         /* Empty -> Valid (Insertion) */
         if (state.compare_exchange_strong(expected, desired)) {
-            return;
+            return desired;
         }
         /* In this case, state should have become Invalid-(migrated/deleted/outdated)
            and we should now change state from Invalid-non normal to valid-non Normal */
@@ -106,14 +109,13 @@ inline void ChangeVectorState(std::atomic<VectorState>& state, VectorState& expe
                 LOG_TAG_CLUSTER,
                 "Desired state must be valid in this case");
     state.store(desired, std::memory_order_release);
-    return;
+    return desired;
 }
 
 /* tries to change state to target. will returns the old state and sets target to current state */
-inline VectorState ChangeVectorState(std::atomic<VectorState>& state, VectorStateDetail& target) {
+inline VectorState ChangeVectorState(std::atomic<VectorState>& state, VectorStateDetail target) {
     VectorState expected = state.load(std::memory_order_acquire);
-    ChangeVectorState(state, expected, target);
-    return expected;
+    return ChangeVectorState(state, expected, target);
 }
 
 inline String VectorStateDetailToString(const VectorStateDetail& state) {
@@ -172,7 +174,7 @@ struct ConstVectorBatch {
     const VTYPE* data = nullptr;
     const VectorID* id = nullptr;
     const Version* version = nullptr;
-    const ClusterSizeType size = 0;
+    ClusterSizeType size = 0;
 
     ConstVectorBatch() = default;
     ConstVectorBatch(ClusterSizeType s) : size(s) {};
@@ -184,6 +186,26 @@ struct ConstVectorBatch {
 
     ConstVectorBatch(const VTYPE* d, const VectorID* i, const Version* v, ClusterSizeType s) :
         data(d), id(i), version(v), size(s) {}
+
+    inline ConstVectorBatch& operator=(const ConstVectorBatch& other) {
+        data = other.data;
+        id = other.id;
+        version = other.version;
+        size = other.size;
+        return *this;
+    }
+
+    inline ConstVectorBatch& operator=(ConstVectorBatch&& other) {
+        data = other.data;
+        id = other.id;
+        version = other.version;
+        size = other.size;
+        other.data = nullptr;
+        other.id = nullptr;
+        other.version = nullptr;
+        other.size = 0;
+        return *this;
+    }
 };
 
 /* todo: we may need to use packed attrbite for these in the multi node setup to save network bandwidth */
@@ -239,11 +261,15 @@ public:
                ALIGNED_SIZE(last_block_cap * (header_bytes + data_bytes)) + 1;
     }
 
-    Cluster(bool is_leaf_vertex, ClusterSizeType block_cap, ClusterSizeType cap, uint16_t dim, bool set_valid = true,
-            bool set_zero = true) {
+    Cluster() : blocks(nullptr) {}
+
+    inline void Assign(char* mem, bool is_leaf_vertex, ClusterSizeType block_cap, ClusterSizeType cap, uint16_t dim, bool set_valid = true,
+                       bool set_zero = true) {
         FatalAssert(block_cap > 0, LOG_TAG_CLUSTER, "Block size must be greater than 0. block_size=%hu", block_cap);
         FatalAssert(cap > 0, LOG_TAG_CLUSTER, "Capacity must be greater than 0. capacity=%hu", cap);
         FatalAssert(dim > 0, LOG_TAG_CLUSTER, "Dimension must be greater than 0. dimension=%hu", dim);
+        FatalAssert(blocks == nullptr, LOG_TAG_CLUSTER, "Cluster is already assigned!");
+        blocks = mem;
         const size_t bytes = TotalBytes(is_leaf_vertex, block_cap, cap, dim);
         if (set_zero) {
             memset(blocks, 0, bytes);
@@ -253,8 +279,22 @@ public:
         }
     }
 
+    inline char* Release() {
+        FatalAssert(blocks != nullptr, LOG_TAG_CLUSTER, "Cluster is not assigned!");
+        char* ret = blocks;
+        blocks = nullptr;
+        return ret;
+    }
+
+    inline bool IsAssigned() const {
+        return blocks != nullptr;
+    }
+
     inline AddressToConst MetaData(ClusterSizeType offset, bool is_leaf, ClusterSizeType block_size,
                                    ClusterSizeType capacity, uint16_t dimension) const {
+        if (blocks == nullptr) {
+            return nullptr;
+        }
         FatalAssert(offset < capacity, LOG_TAG_CLUSTER, "Offset is out of bounds. offset=%hu, capacity=%hu",
                     offset, capacity);
         const ClusterSizeType block_number = offset / block_size;
@@ -271,6 +311,9 @@ public:
 
     inline Address MetaData(ClusterSizeType offset, bool is_leaf, ClusterSizeType block_size,
                             ClusterSizeType capacity, uint16_t dimension) {
+        if (blocks == nullptr) {
+            return nullptr;
+        }
         FatalAssert(offset < capacity, LOG_TAG_CLUSTER, "Offset is out of bounds. offset=%hu, capacity=%hu",
                     offset, capacity);
         const ClusterSizeType block_number = offset / block_size;
@@ -287,6 +330,9 @@ public:
 
     inline const VTYPE* Data(ClusterSizeType offset, bool is_leaf, ClusterSizeType block_size,
                              ClusterSizeType capacity, uint16_t dimension) const {
+        if (blocks == nullptr) {
+            return nullptr;
+        }
         FatalAssert(offset < capacity, LOG_TAG_CLUSTER, "Offset is out of bounds. offset=%hu, capacity=%hu",
                     offset, capacity);
         const ClusterSizeType block_number = offset / block_size;
@@ -310,6 +356,10 @@ public:
 
     inline VTYPE* Data(ClusterSizeType offset, bool is_leaf, ClusterSizeType block_size,
                        ClusterSizeType capacity, uint16_t dimension) {
+        if (blocks == nullptr) {
+            return nullptr;
+        }
+
         FatalAssert(offset < capacity, LOG_TAG_CLUSTER, "Offset is out of bounds. offset=%hu, capacity=%hu",
                     offset, capacity);
         const ClusterSizeType block_number = offset / block_size;

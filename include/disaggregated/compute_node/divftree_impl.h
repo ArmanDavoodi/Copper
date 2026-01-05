@@ -483,7 +483,8 @@ RetStatus DIVFTree::ApproximateKNearestNeighbours(const VTYPE* query, size_t k, 
 
     layers[root->selfId._level]->Insert(ANNVectorInfo(0, root->selfId, root_version));
     rs = ANNSearch(query, k, internal_node_search_span, leaf_node_search_span,
-                    (uint8_t)(root->selfId._level), (uint8_t)VectorID::VECTOR_LEVEL, layers, root->Read(root_version));
+                    (uint8_t)(root->selfId._level), (uint8_t)VectorID::VECTOR_LEVEL, layers,
+                    root->Read(root_version));
     FatalAssert(rs.IsOK(), LOG_TAG_DIVFTREE,
                 "ANNSearch failed in ApproximateKNearestNeighbours: %s", rs.Msg());
     root->Unpin(root_version);
@@ -528,6 +529,729 @@ const DIVFTreeAttributes& DIVFTree::GetAttributes() const {
 // void DIVFTree::BGMergeStatsUpdate(uint64_t thread_index, bool completed_task, bool cluster_merged);
 // void DIVFTree::BGSearchStatsUpdate(uint64_t thread_index, bool completed_task);
 // void DIVFTree::BGSearchStatsUpdateCreatedTask(uint64_t num_tasks);
+
+inline void DIVFTree::InsertBatch(VectorID target_id, Version target_version,
+                                  ClusterSizeType insert_offset, ConstVectorBatch batch) {
+    FatalAssert(batch.size > 0, LOG_TAG_DIVFTREE,
+                "Batch size must be greater than 0!");
+    FatalAssert(insert_offset + batch.size <= attr.internal_max_size, LOG_TAG_DIVFTREE,
+                "Insert offset + batch size exceeds max cluster size!");
+    CHECK_VECTORID_IS_VALID(target_id, LOG_TAG_DIVFTREE);
+    CHECK_VECTORID_IS_INTERNAL(target_id, LOG_TAG_DIVFTREE);
+    CHECK_NOT_NULLPTR(batch.data, LOG_TAG_DIVFTREE);
+    CHECK_NOT_NULLPTR(batch.id, LOG_TAG_DIVFTREE);
+
+    BufferManager* bufferMgr = BufferManager::GetInstance();
+    CHECK_NOT_NULLPTR(bufferMgr, LOG_TAG_DIVFTREE);
+
+    BufferVertexEntry* entry = bufferMgr->GetBufferEntry(target_id);
+    if (entry == nullptr) {
+        /* should we ignore this case and assume it is deleted or it is not yet available? */
+        /* if I ignore it and it is not available yet, I will not have enough info on its size */
+        /* unless when I am reading a cluster for the first time, I first read its size */
+        return;
+    }
+    VertexData* vertex_data =
+        entry->ReadVersionIfInCache(target_version, CacheUpdateInfo(insert_offset, batch), true);
+    if (vertex_data == nullptr) {
+        return;
+    }
+    DIVFTreeVertex& vertex = vertex_data->vertex;
+
+    Address meta = vertex.cluster.MetaData(0, false, attr.internal_blck_size, attr.internal_max_size, attr.dimension);
+    VTYPE* data = vertex.cluster.Data(0, false, attr.internal_blck_size, attr.internal_max_size, attr.dimension);
+    CHECK_NOT_NULLPTR(meta, LOG_TAG_DIVFTREE);
+    CHECK_NOT_NULLPTR(data, LOG_TAG_DIVFTREE);
+
+
+}
+
+inline void DIVFTree::InsertAtomicBatch(VectorID target_id, Version target_version,
+                                        ClusterSizeType insert_offset, ClusterSizeType mark_outdated_offset,
+                                        ConstVectorBatch batch) {
+    FatalAssert(batch.size > 1, LOG_TAG_DIVFTREE,
+                "Batch size must be greater than 1!");
+    FatalAssert(insert_offset + batch.size <= attr.internal_max_size, LOG_TAG_DIVFTREE,
+                "Insert offset + batch size exceeds max cluster size!");
+    FatalAssert(mark_outdated_offset < insert_offset, LOG_TAG_DIVFTREE,
+                "Mark outdated offset must be less than insert offset!");
+    CHECK_VECTORID_IS_VALID(target_id, LOG_TAG_DIVFTREE);
+    CHECK_VECTORID_IS_INTERNAL(target_id, LOG_TAG_DIVFTREE);
+    CHECK_NOT_NULLPTR(batch.data, LOG_TAG_DIVFTREE);
+    CHECK_NOT_NULLPTR(batch.id, LOG_TAG_DIVFTREE);
+    CHECK_NOT_NULLPTR(batch.version, LOG_TAG_DIVFTREE);
+
+    BufferManager* bufferMgr = BufferManager::GetInstance();
+    CHECK_NOT_NULLPTR(bufferMgr, LOG_TAG_DIVFTREE);
+
+    BufferVertexEntry* entry = bufferMgr->GetBufferEntry(target_id);
+    if (entry == nullptr) {
+        /* should we ignore this case and assume it is deleted or it is not yet available? */
+        /* if I ignore it and it is not available yet, I will not have enough info on its size */
+        /* unless when I am reading a cluster for the first time, I first read its size */
+        return;
+    }
+
+    VertexData* vertex_data =
+        entry->ReadVersionIfInCache(target_version, CacheUpdateInfo(insert_offset, batch, mark_outdated_offset), true);
+    /* this should be handled by read */
+    // if (vertex == nullptr) {
+    //     if (entry->currentVersion >= target_version) {
+    //         /* the vertex is deleted */
+    //         entry->headerLock.Unlock();
+    //         return;
+    //     }
+
+    //     entry->headerLock.Unlock();
+    //     entry->headerLock.Lock(SX_EXCLUSIVE);
+    //     vertex = entry->Read(target_version, true);
+    //     if (vertex == nullptr) {
+    //         if (entry->currentVersion >= target_version) {
+    //             /* the vertex is deleted */
+    //             entry->headerLock.Unlock();
+    //             return;
+    //         }
+
+    //         Version old_version = entry->currentVersion;
+    //         entry->currentVersion = target_version;
+    //         entry->liveVersions.insert(...)
+    //     }
+    // }
+    if (vertex_data == nullptr) {
+        return;
+    }
+    DIVFTreeVertex& vertex = vertex_data->vertex;
+
+    /* step 1: Insert batch data */
+    ClusterSizeType current_batch_meta_offset = insert_offset + batch.size - 1;
+    CentroidMetaData* vmd =
+        reinterpret_cast<CentroidMetaData*>(
+            vertex.cluster.MetaData(0, false, attr.internal_blck_size, attr.internal_max_size, attr.dimension));
+    VTYPE* cluster_data = vertex.cluster.Data(0, false, attr.internal_blck_size, attr.internal_max_size,
+                                              attr.dimension);
+    CHECK_NOT_NULLPTR(vmd, LOG_TAG_DIVFTREE);
+    CHECK_NOT_NULLPTR(cluster_data, LOG_TAG_DIVFTREE);
+    FatalAssert(!(vmd[current_batch_meta_offset].batch_valid.load(std::memory_order_acquire)),
+                LOG_TAG_DIVFTREE,
+                "The target batch metadata should not be valid when inserting an atomic batch!");
+    memcpy(&cluster_data[insert_offset * attr.dimension],
+           batch.data,
+           batch.size * attr.dimension * sizeof(VTYPE));
+
+    /* step 2: set batch metadata */
+    for (ClusterSizeType i = 0; i < batch.size; ++i) {
+        const ClusterSizeType batch_off = insert_offset + i;
+        FatalAssert(!(vmd[batch_off].batch_valid.load(std::memory_order_acquire)),
+                    LOG_TAG_DIVFTREE,
+                    "The target batch metadata should not be valid when inserting an atomic batch!");
+        CHECK_VECTORID_IS_VALID(batch.id[i], LOG_TAG_DIVFTREE);
+        CHECK_VECTORID_IS_CENTROID(batch.id[i], LOG_TAG_DIVFTREE);
+        vmd[batch_off].id = batch.id[i];
+        vmd[batch_off].version = batch.version[i];
+        vmd[batch_off].batch_meta.is_batch_size = 0;
+        vmd[batch_off].batch_meta.batch_size_or_last_offset = current_batch_meta_offset;
+        VectorState new_state = ChangeVectorState(vmd[batch_off].state, VECTOR_STATE_NORMAL);
+        FatalAssert(new_state.is_state_valid, LOG_TAG_DIVFTREE,
+                    "New state should be valid here!");
+    }
+
+    std::unordered_map<std::pair<VectorID, Version>,
+                       std::vector<std::pair<ClusterSizeType, ClusterSizeType>>,
+                       VectorIDVersionPairHash> out_of_order_migrations;
+    std::vector<ClusterSizeType> out_of_order_deletions;
+    std::vector<ClusterSizeType> out_of_order_outdates;
+
+    out_of_order_migrations.reserve(batch.size);
+    out_of_order_deletions.reserve(batch.size);
+    out_of_order_outdates.reserve(batch.size);
+
+    /* step 3: mark outdated offset */
+    bool cluster_locked = false;
+    VectorState new_state =
+        ChangeVectorState(vmd[mark_outdated_offset].state, VECTOR_STATE_OUTDATED);
+    FatalAssert(new_state.detail == VECTOR_STATE_OUTDATED, LOG_TAG_DIVFTREE,
+                "The new state detail should be outdated here!");
+    if (!new_state.is_state_valid) {
+        cluster_locked = true;
+        vertex_data->clusterLock.Lock(SX_EXCLUSIVE);
+        new_state = vmd[mark_outdated_offset].state.load(std::memory_order_acquire);
+        FatalAssert(new_state.detail == VECTOR_STATE_OUTDATED, LOG_TAG_DIVFTREE,
+                "The new state detail should be outdated here!");
+        if (!new_state.is_state_valid) {
+            if (vertex_data->outofOrderUpdates == nullptr) {
+                vertex_data->outofOrderUpdates = new std::unordered_map<ClusterSizeType, OutOfOrderUpdateInfo>();
+            }
+            FatalAssert(vertex_data->outofOrderUpdates->find(mark_outdated_offset) ==
+                        vertex_data->outofOrderUpdates->end(),
+                        LOG_TAG_DIVFTREE,
+                        "There should not be an existing out-of-order update for this offset!");
+            vertex_data->outofOrderUpdates->emplace(mark_outdated_offset, current_batch_meta_offset);
+            vertex_data->clusterLock.Unlock();
+            entry->Unpin(target_version);
+            vertex_data = nullptr;
+            entry = nullptr;
+            return;
+        }
+    }
+
+    ClusterSizeType outdated_batch_offset;
+    if (vmd[mark_outdated_offset].batch_meta.is_batch_size) {
+        outdated_batch_offset = mark_outdated_offset;
+    } else {
+        outdated_batch_offset = vmd[mark_outdated_offset].batch_meta.batch_size_or_last_offset;
+    }
+    FatalAssert(outdated_batch_offset >= mark_outdated_offset, LOG_TAG_DIVFTREE,
+                "Outdated batch offset should be greater than or equal to mark outdated offset!");
+
+    if ((!vmd[outdated_batch_offset].state.load(std::memory_order_acquire).is_state_valid) ||
+        (!vmd[outdated_batch_offset].batch_valid.load(std::memory_order_acquire))) {
+
+        bool outdated_batch_valid = false;
+        if (!cluster_locked) {
+            cluster_locked = true;
+            vertex_data->clusterLock.Lock(SX_EXCLUSIVE);
+            if ((vmd[outdated_batch_offset].state.load(std::memory_order_acquire).is_state_valid) &&
+                (vmd[outdated_batch_offset].batch_valid.load(std::memory_order_acquire))) {
+                outdated_batch_valid = true;
+            }
+        }
+
+        FatalAssert(cluster_locked, LOG_TAG_DIVFTREE,
+                    "Cluster lock should be held here!");
+        if (!outdated_batch_valid) {
+            if (vertex_data->outofOrderUpdates == nullptr) {
+                vertex_data->outofOrderUpdates = new std::unordered_map<ClusterSizeType, OutOfOrderUpdateInfo>();
+            }
+            FatalAssert(vertex_data->outofOrderUpdates->find(mark_outdated_offset) ==
+                            vertex_data->outofOrderUpdates->end(),
+                        LOG_TAG_DIVFTREE,
+                        "There should not be an existing out-of-order update for this offset!");
+            vertex_data->outofOrderUpdates->emplace(mark_outdated_offset, current_batch_meta_offset);
+            vertex_data->clusterLock.Unlock();
+            entry->Unpin(target_version);
+            vertex_data = nullptr;
+            entry = nullptr;
+            return;
+        }
+    }
+
+    ValidateBatches(target_id, target_version, 1, &outdated_batch_offset, cluster_locked,
+                  out_of_order_migrations, out_of_order_deletions, out_of_order_outdates);
+    threadSelf->SanityCheckLockNotHeldByMe(&vertex_data->clusterLock);
+    return;
+}
+
+inline void DIVFTree::MigrateVectors(VectorID src_id, Version src_version,
+                                     VectorID dest_id, Version dest_version,
+                                     ClusterSizeType num_vectors, const ClusterSizeType* offsets,
+                                     ClusterSizeType dest_insert_offset) {
+    CHECK_VECTORID_IS_VALID(src_id, LOG_TAG_DIVFTREE);
+    CHECK_VECTORID_IS_CENTROID(src_id, LOG_TAG_DIVFTREE);
+    CHECK_VECTORID_IS_VALID(dest_id, LOG_TAG_DIVFTREE);
+    CHECK_VECTORID_IS_CENTROID(dest_id, LOG_TAG_DIVFTREE);
+    FatalAssert(dest_id != src_id, LOG_TAG_DIVFTREE,
+                "Source and destination IDs must be different!");
+    FatalAssert(dest_id._level == src_id._level, LOG_TAG_DIVFTREE,
+                "Source and destination levels must be the same!");
+    FatalAssert(num_vectors > 0, LOG_TAG_DIVFTREE,
+                "Number of vectors to migrate must be greater than 0!");
+    CHECK_NOT_NULLPTR(offsets, LOG_TAG_DIVFTREE);
+
+    BufferManager* bufferMgr = BufferManager::GetInstance();
+    CHECK_NOT_NULLPTR(bufferMgr, LOG_TAG_DIVFTREE);
+
+    BufferVertexEntry* src_entry = bufferMgr->GetBufferEntry(src_id);
+    VertexData* src_vertex_data = nullptr;
+    ClusterCacheState src_cache_state = ClusterCacheState::DELETED;
+    if (src_entry != nullptr) {
+        src_vertex_data =
+            src_entry->ReadAndLockVersion(src_version, true);
+    }
+
+    if (src_vertex_data != nullptr) {
+        src_cache_state = src_vertex_data->cacheState.load(std::memory_order_acquire);
+    }
+
+    if (src_cache_state == ClusterCacheState::REMOTE_READ_IN_PROGRESS) {
+        /* handle this after the read is done */
+        if (src_vertex_data->pendingUpdates == nullptr) {
+            src_vertex_data->pendingUpdates = new std::vector<CacheUpdateInfo>();
+        }
+        src_vertex_data->pendingUpdates->emplace_back(true, dest_id, dest_version,
+                                                      num_vectors, offsets,
+                                                      dest_insert_offset);
+        src_vertex_data->clusterLock.Unlock();
+        src_entry->Unpin(src_version);
+        return;
+    }
+
+    if (src_vertex_data != nullptr) {
+        src_vertex_data->clusterLock.Unlock();
+    }
+
+    BufferVertexEntry* dest_entry = bufferMgr->GetBufferEntry(dest_id);
+    VertexData* dest_vertex_data = nullptr;
+    ClusterCacheState dest_cache_state = ClusterCacheState::DELETED;
+    if (dest_entry != nullptr) {
+        dest_vertex_data =
+            dest_entry->ReadAndLockVersion(dest_version, true);
+    }
+
+    if (dest_vertex_data != nullptr) {
+        dest_cache_state = dest_vertex_data->cacheState.load(std::memory_order_acquire);
+        FatalAssert(dest_cache_state != ClusterCacheState::DELETED, LOG_TAG_DIVFTREE,
+                    "Destination vertex cluster should not be deleted here!");
+        if (dest_cache_state == ClusterCacheState::UNCACHED) {
+            dest_vertex_data->vertex.UpdateApproximateSize(num_vectors + dest_insert_offset);
+        }
+        dest_vertex_data->clusterLock.Unlock();
+    }
+
+    ClusterSizeType* dest_offsets = nullptr;
+    VectorBatch batch;
+    batch.size = 0;
+
+    if (src_cache_state == ClusterCacheState::CACHED_COOLING ||
+        src_cache_state == ClusterCacheState::CACHED_HOT) {
+        if (dest_cache_state == ClusterCacheState::CACHED_COOLING ||
+            dest_cache_state == ClusterCacheState::CACHED_HOT ||
+            dest_cache_state == ClusterCacheState::REMOTE_READ_IN_PROGRESS) {
+            /* both source and destination are cached */
+            batch.data = new VTYPE[num_vectors * attr.dimension];
+            batch.id = new VectorID[num_vectors];
+            batch.version = src_id.IsLeaf() ? nullptr : new Version[num_vectors];
+        } else {
+            /* only source is cached */
+            batch.data = nullptr;
+            batch.id = nullptr;
+            batch.version = nullptr;
+        }
+        DIVFTreeVertex& src_vertex = src_vertex_data->vertex;
+        FatalAssert(src_vertex.cluster.IsAssigned(), LOG_TAG_DIVFTREE,
+                    "Source vertex cluster should be valid here!");
+        Address src_meta = src_vertex.cluster.MetaData(0, src_id.IsLeaf(),
+                                                       src_id.IsLeaf() ? attr.leaf_max_size : attr.internal_max_size,
+                                                       src_id.IsLeaf() ? attr.leaf_max_size : attr.internal_max_size,
+                                                       attr.dimension);
+        VTYPE* src_data = src_vertex.cluster.Data(0, src_id.IsLeaf(),
+                                                  src_id.IsLeaf() ? attr.leaf_blck_size : attr.internal_blck_size,
+                                                  src_id.IsLeaf() ? attr.leaf_max_size : attr.internal_max_size,
+                                                  attr.dimension);
+        bool need_reiterate = false;
+        for (ClusterSizeType i = 0; i < num_vectors; ++i) {
+            const ClusterSizeType src_offset = offsets[i];
+            std::atomic<VectorState>* state = nullptr;
+            if (src_id.IsLeaf()) {
+                state = &((reinterpret_cast<VectorMetaData*>(src_meta))[src_offset].state);
+            } else {
+                state = &((reinterpret_cast<CentroidMetaData*>(src_meta))[src_offset].state);
+            }
+
+            VectorState new_state = ChangeVectorState(*state, VECTOR_STATE_MIGRATED);
+            if (!new_state.is_state_valid) {
+                need_reiterate = true;
+            }
+        }
+
+        if (batch.data != nullptr) {
+            if (need_reiterate) {
+                dest_offsets = new ClusterSizeType[num_vectors];
+                src_vertex_data->clusterLock.Lock(SX_EXCLUSIVE);
+            }
+
+            for (ClusterSizeType i = 0; i < num_vectors; ++i) {
+                const ClusterSizeType src_offset = offsets[i];
+                VectorState new_state =
+                    src_id.IsLeaf() ?
+                        (reinterpret_cast<VectorMetaData*>(src_meta))[src_offset].state.load(std::memory_order_acquire) :
+                        (reinterpret_cast<CentroidMetaData*>(src_meta))[src_offset].state.load(std::memory_order_acquire);
+                if (!new_state.is_state_valid) {
+                    FatalAssert(need_reiterate, LOG_TAG_DIVFTREE,
+                                "Need reiterate should be true here!");
+                    if (src_vertex_data->outofOrderUpdates == nullptr) {
+                        src_vertex_data->outofOrderUpdates = new std::unordered_map<ClusterSizeType, OutOfOrderUpdateInfo>();
+                    }
+                    FatalAssert(src_vertex_data->outofOrderUpdates->find(src_offset) ==
+                                src_vertex_data->outofOrderUpdates->end(), LOG_TAG_DIVFTREE,
+                                "There should not be an existing out-of-order update for this offset!");
+                    src_vertex_data->outofOrderUpdates->emplace(src_offset, dest_id, dest_version,
+                                                                dest_insert_offset + i);
+                } else {
+                    memcpy(&batch.data[batch.size * attr.dimension],
+                           &src_data[src_offset * attr.dimension],
+                           attr.dimension * sizeof(VTYPE));
+                    batch.id[batch.size] =
+                        src_id.IsLeaf() ?
+                            (reinterpret_cast<VectorMetaData*>(src_meta))[src_offset].id :
+                            (reinterpret_cast<CentroidMetaData*>(src_meta))[src_offset].id;
+                    if (!src_id.IsLeaf()) {
+                        batch.version[batch.size] =
+                            (reinterpret_cast<CentroidMetaData*>(src_meta))[src_offset].version;
+                    }
+                    if (need_reiterate) {
+                        dest_offsets[batch.size] = dest_insert_offset + i;
+                    }
+                    batch.size += 1;
+                }
+            }
+
+            if (need_reiterate) {
+                src_vertex_data->clusterLock.Unlock();
+            }
+        }
+    }
+
+    if (src_vertex_data != nullptr) {
+        threadSelf->SanityCheckLockNotHeldByMe(&src_vertex_data->clusterLock);
+        src_entry->Unpin(src_version);
+        src_vertex_data = nullptr;
+        src_entry = nullptr;
+    }
+
+    if (dest_cache_state == ClusterCacheState::UNCACHED) {
+        FatalAssert(batch.size == 0, LOG_TAG_DIVFTREE,
+                    "Batch size should be 0 when destination is uncached!");
+        FatalAssert(batch.data == nullptr, LOG_TAG_DIVFTREE,
+                    "Batch data should be null when destination is uncached!");
+        FatalAssert(batch.id == nullptr, LOG_TAG_DIVFTREE,
+                    "Batch id should be null when destination is uncached!");
+        FatalAssert(batch.version == nullptr, LOG_TAG_DIVFTREE,
+                    "Batch version should be null when destination is uncached!");
+        FatalAssert(dest_vertex_data != nullptr, LOG_TAG_DIVFTREE,
+                    "Destination vertex data should not be null when destination is uncached!");
+        dest_entry->Unpin(dest_version);
+        dest_vertex_data = nullptr;
+        dest_entry = nullptr;
+        return;
+    } else if (dest_cache_state == ClusterCacheState::DELETED) {
+        FatalAssert(batch.size == 0, LOG_TAG_DIVFTREE,
+                    "Batch size should be 0 when destination is uncached!");
+        FatalAssert(batch.data == nullptr, LOG_TAG_DIVFTREE,
+                    "Batch data should be null when destination is uncached!");
+        FatalAssert(batch.id == nullptr, LOG_TAG_DIVFTREE,
+                    "Batch id should be null when destination is uncached!");
+        FatalAssert(batch.version == nullptr, LOG_TAG_DIVFTREE,
+                    "Batch version should be null when destination is uncached!");
+        FatalAssert(dest_vertex_data == nullptr, LOG_TAG_DIVFTREE,
+                    "Destination vertex data should be null when destination is deleted!");
+        dest_entry = nullptr;
+        return;
+    } else if (dest_cache_state == ClusterCacheState::REMOTE_READ_IN_PROGRESS) {
+        dest_vertex_data->clusterLock.Lock(SX_EXCLUSIVE);
+        dest_cache_state = dest_vertex_data->cacheState.load(std::memory_order_acquire);
+        FatalAssert(dest_cache_state != ClusterCacheState::DELETED, LOG_TAG_DIVFTREE,
+                    "Destination vertex cluster should not be deleted here!");
+        FatalAssert(dest_cache_state != ClusterCacheState::UNCACHED, LOG_TAG_DIVFTREE,
+                    "Destination vertex cluster should not be uncached here!");
+    }
+
+    if (batch.data == nullptr) {
+        if (dest_cache_state == ClusterCacheState::REMOTE_READ_IN_PROGRESS) {
+            /* handle this after the read is done */
+            if (dest_vertex_data->pendingUpdates == nullptr) {
+                dest_vertex_data->pendingUpdates = new std::vector<CacheUpdateInfo>();
+            }
+            dest_vertex_data->pendingUpdates->emplace_back(false, src_id, src_version,
+                                                           num_vectors, offsets,
+                                                           dest_insert_offset);
+            dest_vertex_data->clusterLock.Unlock();
+            dest_entry->Unpin(dest_version);
+            return;
+        }
+
+        FatalAssert(dest_cache_state == ClusterCacheState::CACHED_COOLING ||
+                    dest_cache_state == ClusterCacheState::CACHED_HOT, LOG_TAG_DIVFTREE,
+                    "Destination vertex cluster should be cached here!");
+        threadSelf->SanityCheckLockNotHeldByMe(&dest_vertex_data->clusterLock);
+        bufferMgr->ReadVectorsFromRemote(dest_id, dest_version, dest_insert_offset, num_vectors);
+        /* we should keep it pinned until the read is done */
+        return;
+    }
+
+    if (dest_offsets != nullptr) {
+        if (dest_cache_state == ClusterCacheState::REMOTE_READ_IN_PROGRESS) {
+            /* handle this after the read is done */
+            if (dest_vertex_data->pendingUpdates == nullptr) {
+                dest_vertex_data->pendingUpdates = new std::vector<CacheUpdateInfo>();
+            }
+            dest_vertex_data->pendingUpdates->emplace_back(batch, dest_offsets);
+            dest_vertex_data->clusterLock.Unlock();
+            dest_entry->Unpin(dest_version);
+            return;
+        }
+
+        FatalAssert(dest_cache_state == ClusterCacheState::CACHED_COOLING ||
+                    dest_cache_state == ClusterCacheState::CACHED_HOT, LOG_TAG_DIVFTREE,
+                    "Destination vertex cluster should be cached here!");
+        threadSelf->SanityCheckLockNotHeldByMe(&dest_vertex_data->clusterLock);
+        InsertBatch(dest_id, dest_version, dest_offsets, batch);
+        delete[] dest_offsets;
+        dest_offsets = nullptr;
+        if (batch.data != nullptr) {
+            delete[] batch.data;
+            batch.data = nullptr;
+        }
+        if (batch.id != nullptr) {
+            delete[] batch.id;
+            batch.id = nullptr;
+        }
+        if (batch.version != nullptr) {
+            delete[] batch.version;
+            batch.version = nullptr;
+        }
+        dest_entry->Unpin(dest_version);
+        return;
+    }
+
+    if (dest_cache_state == ClusterCacheState::REMOTE_READ_IN_PROGRESS) {
+        /* handle this after the read is done */
+        if (dest_vertex_data->pendingUpdates == nullptr) {
+            dest_vertex_data->pendingUpdates = new std::vector<CacheUpdateInfo>();
+        }
+        dest_vertex_data->pendingUpdates->emplace_back(dest_insert_offset, batch);
+        dest_vertex_data->clusterLock.Unlock();
+        dest_entry->Unpin(dest_version);
+        return;
+    }
+
+    FatalAssert(dest_cache_state == ClusterCacheState::CACHED_COOLING ||
+                dest_cache_state == ClusterCacheState::CACHED_HOT, LOG_TAG_DIVFTREE,
+                "Destination vertex cluster should be cached here!");
+    threadSelf->SanityCheckLockNotHeldByMe(&dest_vertex_data->clusterLock);
+    InsertBatch(dest_id, dest_version, dest_insert_offset, batch);
+    if (batch.data != nullptr) {
+        delete[] batch.data;
+        batch.data = nullptr;
+    }
+    if (batch.id != nullptr) {
+        delete[] batch.id;
+        batch.id = nullptr;
+    }
+    if (batch.version != nullptr) {
+        delete[] batch.version;
+        batch.version = nullptr;
+    }
+    dest_entry->Unpin(dest_version);
+    return;
+}
+
+inline void DIVFTree::MigrateOutOfOrder(VectorID src_id, Version src_version,
+                                        VectorID dest_id, Version dest_version,
+                                        const std::vector<std::pair<ClusterSizeType, ClusterSizeType>>& offset_pairs) {
+    CHECK_VECTORID_IS_VALID(src_id, LOG_TAG_DIVFTREE);
+    CHECK_VECTORID_IS_INTERNAL(src_id, LOG_TAG_DIVFTREE);
+    CHECK_VECTORID_IS_VALID(dest_id, LOG_TAG_DIVFTREE);
+    CHECK_VECTORID_IS_INTERNAL(dest_id, LOG_TAG_DIVFTREE);
+    FatalAssert(dest_id != src_id, LOG_TAG_DIVFTREE,
+                "Source and destination IDs must be different!");
+    FatalAssert(dest_id._level == src_id._level, LOG_TAG_DIVFTREE,
+                "Source and destination levels must be the same!");
+    FatalAssert(!offset_pairs.empty(), LOG_TAG_DIVFTREE,
+                "Offset pairs must not be empty!");
+
+    BufferManager* bufferMgr = BufferManager::GetInstance();
+    CHECK_NOT_NULLPTR(bufferMgr, LOG_TAG_DIVFTREE);
+
+    BufferVertexEntry* dest_entry = bufferMgr->GetBufferEntry(dest_id);
+    if (dest_entry == nullptr) {
+        /* should we ignore this case and assume it is deleted or it is not yet available? */
+        /* if I ignore it and it is not available yet, I will not have enough info on its size */
+        /* unless when I am reading a cluster for the first time, I first read its size */
+        return;
+    }
+
+    VertexData* dest_vertex_data =
+        dest_entry->ReadVersionIfInCache(dest_version, CacheUpdateInfo(src_id, src_version, &offset_pairs), true);
+    if (dest_vertex_data == nullptr) {
+        return;
+    }
+    DIVFTreeVertex& dest_vertex = dest_vertex_data->vertex;
+    CentroidMetaData* dest_vmd =
+        reinterpret_cast<CentroidMetaData*>(
+            dest_vertex.cluster.MetaData(0, false, attr.internal_blck_size, attr.internal_max_size, attr.dimension));
+    VTYPE* dest_cluster_data = dest_vertex.cluster.Data(0, false, attr.internal_blck_size,
+                                                          attr.internal_max_size, attr.dimension);
+
+    BufferVertexEntry* src_entry = bufferMgr->GetBufferEntry(src_id);
+    CHECK_NOT_NULLPTR(src_entry, LOG_TAG_DIVFTREE);
+
+    VertexData* src_vertex_data = src_entry->ReadVersionIfInCache(src_version, false);
+    CHECK_NOT_NULLPTR(src_vertex_data, LOG_TAG_DIVFTREE);
+    DIVFTreeVertex& src_vertex = src_vertex_data->vertex;
+    CentroidMetaData* src_vmd =
+        reinterpret_cast<CentroidMetaData*>(
+            src_vertex.cluster.MetaData(0, false, attr.internal_blck_size, attr.internal_max_size, attr.dimension));
+    VTYPE* src_cluster_data = src_vertex.cluster.Data(0, false, attr.internal_blck_size,
+                                                      attr.internal_max_size, attr.dimension);
+
+    std::vector<ClusterSizeType> batch_offsets;
+    batch_offsets.reserve(offset_pairs.size());
+    for (const auto& offset_pair : offset_pairs) {
+        FatalAssert(src_vmd[offset_pair.first].state.load(std::memory_order_acquire).is_state_valid,
+                    LOG_TAG_DIVFTREE,
+                    "Source vector state should be valid here!");
+        FatalAssert(src_vmd[offset_pair.first].state.load(std::memory_order_acquire).detail == VECTOR_STATE_MIGRATED,
+                    LOG_TAG_DIVFTREE,
+                    "Source vector state should be migrated here!");
+        memcpy(&dest_cluster_data[offset_pair.second * attr.dimension],
+               &src_cluster_data[offset_pair.first * attr.dimension],
+               attr.dimension * sizeof(VTYPE));
+        dest_vmd[offset_pair.second].id = src_vmd[offset_pair.first].id;
+        dest_vmd[offset_pair.second].version = src_vmd[offset_pair.first].version;
+        dest_vmd[offset_pair.second].batch_meta.is_batch_size = 1;
+        dest_vmd[offset_pair.second].batch_meta.batch_size_or_last_offset = 1;
+        FatalAssert(!dest_vmd[offset_pair.second].state.load(std::memory_order_acquire).is_state_valid,
+                    LOG_TAG_DIVFTREE,
+                    "Destination vector state should not be valid here!");
+        VectorState new_state = ChangeVectorState(dest_vmd[offset_pair.second].state, VECTOR_STATE_NORMAL);
+        FatalAssert(new_state.is_state_valid, LOG_TAG_DIVFTREE,
+                    "New state should be valid here!");
+        batch_offsets.emplace_back(offset_pair.second);
+    }
+
+    std::unordered_map<std::pair<VectorID, Version>,
+                       std::vector<std::pair<ClusterSizeType, ClusterSizeType>>,
+                       VectorIDVersionPairHash> out_of_order_migrations;
+    std::vector<ClusterSizeType> out_of_order_deletions;
+    std::vector<ClusterSizeType> out_of_order_outdates;
+    ValidateBatches(dest_id, dest_version, static_cast<ClusterSizeType>(batch_offsets.size()),
+                    batch_offsets.data(), false,
+                    out_of_order_migrations, out_of_order_deletions, out_of_order_outdates);
+    threadSelf->SanityCheckLockNotHeldByMe(&dest_vertex_data->clusterLock);
+    return;
+}
+
+inline void DIVFTree::ValidateBatches(VectorID target_id, Version target_version, ClusterSizeType num_batches,
+                                      ClusterSizeType* batch_meta_offsets, bool cluster_locked,
+                                      std::unordered_map<std::pair<VectorID, Version>,
+                                                         std::vector<std::pair<ClusterSizeType, ClusterSizeType>>,
+                                                         VectorIDVersionPairHash>& out_of_order_migrations,
+                                      std::vector<ClusterSizeType>& out_of_order_deletions,
+                                      std::vector<ClusterSizeType>& out_of_order_outdates) {
+    BufferManager* bufferMgr = BufferManager::GetInstance();
+    CHECK_NOT_NULLPTR(bufferMgr, LOG_TAG_DIVFTREE);
+
+    BufferVertexEntry* entry = bufferMgr->GetBufferEntry(target_id);
+    CHECK_NOT_NULLPTR(entry, LOG_TAG_DIVFTREE);
+
+    VertexData* vertex_data = entry->ReadVersionIfInCache(target_version, false);
+    CHECK_NOT_NULLPTR(vertex_data, LOG_TAG_DIVFTREE);
+    DIVFTreeVertex& vertex = vertex_data->vertex;
+    CentroidMetaData* vmd =
+        reinterpret_cast<CentroidMetaData*>(
+            vertex.cluster.MetaData(0, false, attr.internal_blck_size, attr.internal_max_size, attr.dimension));
+
+    if (!cluster_locked) {
+        vertex_data->clusterLock.Lock(SX_EXCLUSIVE);
+    }
+
+    while (true) {
+        for (ClusterSizeType batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+            const ClusterSizeType batch_meta_offset = batch_meta_offsets[batch_idx];
+            FatalAssert(vmd[batch_meta_offset].state.load(std::memory_order_acquire).is_state_valid,
+                        LOG_TAG_DIVFTREE,
+                        "Vector state should be valid here!");
+            FatalAssert(!vmd[batch_meta_offset].batch_valid.load(std::memory_order_acquire),
+                        LOG_TAG_DIVFTREE,
+                        "Batch metadata should not be valid here!");
+            FatalAssert(vmd[batch_meta_offset].batch_meta.is_batch_size == 1,
+                        LOG_TAG_DIVFTREE,
+                        "Batch metadata should indicate batch size here!");
+            const ClusterSizeType batch_size = vmd[batch_meta_offset].batch_meta.batch_size_or_last_offset;
+            const ClusterSizeType insert_offset = batch_meta_offset - batch_size + 1;
+            FatalAssert((insert_offset == batch_meta_offset) ||
+                        (vmd[insert_offset].batch_meta.is_batch_size == 0),
+                        LOG_TAG_DIVFTREE,
+                        "Insert offset batch metadata should indicate last offset here!");
+            FatalAssert((insert_offset == batch_meta_offset) ||
+                        (vmd[insert_offset].batch_meta.batch_size_or_last_offset == batch_meta_offset),
+                        LOG_TAG_DIVFTREE,
+                        "Insert offset batch metadata should point to current batch meta offset here!");
+            vmd[batch_meta_offset].batch_valid.store(true, std::memory_order_release);
+
+
+            if (vertex_data->outofOrderUpdates == nullptr) {
+                continue;
+            }
+
+            for (ClusterSizeType i = 0; i < batch_size; ++i) {
+                const ClusterSizeType batch_off = insert_offset + i;
+                FatalAssert(vmd[batch_off].state.load(std::memory_order_acquire).is_state_valid,
+                            LOG_TAG_DIVFTREE,
+                            "Vector state should be valid here!");
+                auto it = vertex_data->outofOrderUpdates->find(batch_off);
+                if (it == vertex_data->outofOrderUpdates->end()) {
+                    FatalAssert(vmd[batch_off].state.load(std::memory_order_acquire).detail == VECTOR_STATE_NORMAL,
+                                LOG_TAG_DIVFTREE,
+                                "Vector state should be normal for in-order updates!");
+                    continue;
+                }
+
+                switch (it->second.type) {
+                    case OutOfOrderUpdateType::OUT_OF_ORDER_DELETION:
+                        FatalAssert(vmd[batch_off].state.load(std::memory_order_acquire).detail == VECTOR_STATE_DELETED,
+                                    LOG_TAG_DIVFTREE,
+                                    "Vector state should be deleted for out-of-order deletion!");
+                        out_of_order_deletions.emplace_back(batch_off);
+                        break;
+                    case OutOfOrderUpdateType::OUT_OF_ORDER_MIGRATION:
+                        FatalAssert(vmd[batch_off].state.load(std::memory_order_acquire).detail == VECTOR_STATE_MIGRATED,
+                                    LOG_TAG_DIVFTREE,
+                                    "Vector state should be moved for out-of-order migration!");
+                        std::pair<VectorID, Version> target_container =
+                            std::make_pair(it->second.address.containerId, it->second.address.containerVersion);
+                        if (out_of_order_migrations.find(target_container) == out_of_order_migrations.end()) {
+                            auto res =
+                                out_of_order_migrations.emplace(target_container,
+                                                                std::vector<std::pair<ClusterSizeType, ClusterSizeType>>());
+                            res.first->second.reserve(batch_size);
+                            res.first->second.emplace_back(batch_off, it->second.address.offset);
+                        } else {
+                            out_of_order_migrations[target_container].emplace_back(batch_off, it->second.address.offset);
+                        }
+                        break;
+                    case OutOfOrderUpdateType::OUT_OF_ORDER_OUTDATED:
+                        FatalAssert(vmd[batch_off].state.load(std::memory_order_acquire).detail == VECTOR_STATE_OUTDATED,
+                                    LOG_TAG_DIVFTREE,
+                                    "Vector state should be outdated for out-of-order outdate!");
+                        out_of_order_outdates.emplace_back(it->second.insertion_batch_offset);
+                        break;
+                    default:
+                        FatalAssert(false, LOG_TAG_DIVFTREE,
+                                    "Unknown out-of-order update type!");
+                }
+
+                vertex_data->outofOrderUpdates->erase(it);
+                if (vertex_data->outofOrderUpdates->empty()) {
+                    delete vertex_data->outofOrderUpdates;
+                    vertex_data->outofOrderUpdates = nullptr;
+                }
+            }
+        }
+
+        if (!out_of_order_outdates.empty()) {
+            batch_meta_offsets[0] = out_of_order_outdates.back();
+            num_batches = 1;
+            out_of_order_outdates.pop_back();
+        } else {
+            break;
+        }
+    }
+
+    vertex_data->clusterLock.Unlock();
+    if (!out_of_order_deletions.empty()) {
+        DeleteVectors(target_id, target_version, out_of_order_deletions.size(), out_of_order_deletions.data());
+    }
+    for (const auto& migration : out_of_order_migrations) {
+        MigrateOutOfOrder(target_id, target_version,
+                        migration.first.first, migration.first.second,
+                        migration.second);
+    }
+    entry->Unpin(target_version);
+    vertex_data = nullptr;
+    entry = nullptr;
+    return;
+}
 
 // inline void DIVFTree::RoundRobinClustering(BufferVertexEntry* base, const ConstVectorBatch& batch,
 //                                            BufferVertexEntry**& entries, ClusterSizeType marked_for_update);

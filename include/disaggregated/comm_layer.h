@@ -1005,12 +1005,18 @@ public:
                            std::unordered_map<VectorID, std::vector<CommLayerMessage>, VectorIDHash>&
                                 cluster_based_messages) {
         for (CommLayerMessage& message : general_messages) {
+            if (message.info.buffer == nullptr) {
+                continue;
+            }
             delete[] message.info.buffer;
             message.info.buffer = nullptr;
         }
         general_messages.clear();
         for (auto& pair : cluster_based_messages) {
             for (CommLayerMessage& message : pair.second) {
+                if (message.info.buffer == nullptr) {
+                    continue;
+                }
                 delete[] message.info.buffer;
                 message.info.buffer = nullptr;
             }

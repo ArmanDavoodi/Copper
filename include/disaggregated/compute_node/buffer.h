@@ -2,7 +2,6 @@
 #define DIVFTREE_BUFFER_H_
 
 #include "disaggregated/compute_node/divftree.h"
-#include "disaggregated/comm_layer.h"
 #include "utils/concurrent_datastructures.h"
 
 #include <memory>
@@ -28,17 +27,115 @@ struct VectorAddress {
     ClusterSizeType offset;
 };
 
-enum UpdateType : uint8_t {
-    UPDATE_TYPE_MIGRATION,
-    UPDATE_TYPE_OUTDATED
+enum OutOfOrderUpdateType : uint8_t {
+    OUT_OF_ORDER_MIGRATION,
+    OUT_OF_ORDER_OUTDATED,
+    OUT_OF_ORDER_DELETION
 };
 
-struct UpdateInfo {
-    UpdateType type;
+struct OutOfOrderUpdateInfo {
+    OutOfOrderUpdateType type;
     union {
         VectorAddress address; /* for migration */
         ClusterSizeType insertion_batch_offset; /* for outdated */
     };
+
+    OutOfOrderUpdateInfo(VectorID dest_id, Version dest_version, ClusterSizeType dest_insert_offset) :
+        type(OUT_OF_ORDER_MIGRATION), address{dest_id, dest_version, dest_insert_offset} {}
+    OutOfOrderUpdateInfo(VectorAddress address) : type(OUT_OF_ORDER_MIGRATION), address(address) {}
+    OutOfOrderUpdateInfo(ClusterSizeType offset) : type(OUT_OF_ORDER_OUTDATED), insertion_batch_offset(offset) {}
+    OutOfOrderUpdateInfo() : type(OUT_OF_ORDER_DELETION) {}
+};
+
+enum class CacheUpdateType : uint8_t {
+    BATCH_INSERTION,
+    ATOMIC_BATCH_INSERTION,
+    MIGRATION,
+    OUT_OF_ORDER_MIGRATION,
+    INSERTION,
+    DELETION
+};
+
+struct CacheUpdateInfo {
+    CacheUpdateType type;
+    union {
+        struct {
+            ClusterSizeType insert_offset;
+            ConstVectorBatch batch;
+        } batch_insertion;
+        struct {
+            ClusterSizeType insert_offset;
+            ConstVectorBatch batch;
+            ClusterSizeType mark_outdated_offset;
+        } atomic_batch_insertion;
+        struct {
+            bool at_src;
+            VectorID id;
+            Version version;
+            ClusterSizeType num_vectors;
+            const ClusterSizeType* offsets;
+            ClusterSizeType dest_insert_offset;
+        } migration;
+        struct {
+            VectorID src_id;
+            Version src_version;
+            const std::vector<std::pair<ClusterSizeType, ClusterSizeType>>* offset_pairs;
+        } out_of_order_migration;
+        struct {
+            ConstVectorBatch batch;
+            ClusterSizeType* insert_offsets;
+        } insertion;
+        struct {
+            ClusterSizeType num_vectors;
+            const ClusterSizeType* offsets;
+        } deletion;
+    };
+
+    CacheUpdateInfo(ClusterSizeType insert_offset, const ConstVectorBatch& batch) :
+        type(CacheUpdateType::BATCH_INSERTION) {
+        batch_insertion.insert_offset = insert_offset;
+        batch_insertion.batch = batch;
+    }
+
+    CacheUpdateInfo(ClusterSizeType insert_offset, const ConstVectorBatch& batch,
+                    ClusterSizeType mark_outdated_offset) :
+        type(CacheUpdateType::ATOMIC_BATCH_INSERTION) {
+        atomic_batch_insertion.insert_offset = insert_offset;
+        atomic_batch_insertion.batch = batch;
+        atomic_batch_insertion.mark_outdated_offset = mark_outdated_offset;
+    }
+
+    CacheUpdateInfo(bool at_src, VectorID id, Version version,
+                    ClusterSizeType num_vectors, const ClusterSizeType* offsets,
+                    ClusterSizeType dest_insert_offset) :
+        type(CacheUpdateType::MIGRATION) {
+        migration.at_src = at_src;
+        migration.id = id;
+        migration.version = version;
+        migration.num_vectors = num_vectors;
+        migration.offsets = offsets;
+        migration.dest_insert_offset = dest_insert_offset;
+    }
+
+    CacheUpdateInfo(VectorID src_id, Version src_version,
+                    const std::vector<std::pair<ClusterSizeType, ClusterSizeType>>* offset_pairs) :
+        type(CacheUpdateType::OUT_OF_ORDER_MIGRATION) {
+        out_of_order_migration.src_id = src_id;
+        out_of_order_migration.src_version = src_version;
+        out_of_order_migration.offset_pairs = offset_pairs;
+    }
+
+    CacheUpdateInfo(const ConstVectorBatch& batch, ClusterSizeType* insert_offsets) :
+        type(CacheUpdateType::INSERTION) {
+        insertion.batch = batch;
+        insertion.insert_offsets = insert_offsets;
+    }
+
+    CacheUpdateInfo(ClusterSizeType num_vectors, const ClusterSizeType* offsets) :
+        type(CacheUpdateType::DELETION) {
+        deletion.num_vectors = num_vectors;
+        deletion.offsets = offsets;
+    }
 };
 
 /*
@@ -58,7 +155,8 @@ struct VertexData {
        instead to save memory
        Note: Should be protected by the cluster lock? */
     /* todo: use a better hash than default? */
-    std::unordered_map<ClusterSizeType, UpdateInfo>* outofOrderUpdates;
+    std::unordered_map<ClusterSizeType, OutOfOrderUpdateInfo>* outofOrderUpdates;
+    std::vector<CacheUpdateInfo>* pendingUpdates;
     /* todo we also need a pointer to a list of updates if cache state is remote read in progress */
 
     // VertexData(uint64_t p) : pin{p} {}
@@ -77,310 +175,11 @@ struct VertexData {
     // }
 };
 
-
-/*
-    Insert AtomicBatch (for split -> cause another vector to become outdated):
-        step 1:
-        lock(S) header
-
-        step 2:
-        if (version not available):
-            step 2.1:
-            upgrade header to X
-            if version is newer than currentVersion:
-                change currentVersion to new version
-                deduct currentVersionPin from the old currentVersion pin if exists
-                add new version with pin = currentVersionPin to live versions
-                deduct currentVersionPin from old version pin if exists
-            else:
-                add new version with pin = 0 to live versions
-            set its size to what was given in the message
-            if pin is not 0:
-                set state to REMOTE_READ_IN_PROGRESS
-                issue RDMA read for the whole cluster
-            else :
-                set state to UNCACHED
-            unlock header
-            return
-
-        step 3:
-        v <- read version(no pin needed)
-        increment the pin
-        unlock header
-        // since these are updates we are not accessing them so we should not make them hot!
-
-        step 4
-        set batch state to invalid
-        write vector data + id + version + batch meta
-        change vector states to valid
-        if ( there are out of order updates ):
-            for migrations -> save the offsets in a list
-            for outdated vectors -> save the offset in another list
-
-        step 5:
-        p_off <- go to the vector that needs to be outdated
-        change vector state to outdated
-        if (vector state is invalid):
-            Lock(X) clusterLock
-            if outOforder == nullptr -> creat it(do not pin vertex)
-            add p_off.offset to outOfOrderUpdates with type outdated
-            if (state is outdated_invalid):
-                Unlock clusterLock
-                unpin vertex
-                return
-            remove p_off.offset from outOfOrderUpdates
-            if outOforder.size == 0:
-                delete outOfOrderUpdates
-            Unlock clusterLock
-
-        step 6:
-        p_batch <- get its batch info
-        if the p_batch is invalid:
-            Lock(X) clusterLock
-            if p_batch.state is still invalid:
-                if outOforder == nullptr -> creat it(do not pin vertex)
-                add <p_batch.offset, c_batch.offset> to outOfOrderUpdates with type outdated
-                Unlock clusterLock
-                unpin vertex
-                return
-            Unlock clusterLock
-
-        set c_batch state to valid
-        Lock(X) clusterLock
-        if outOforder == nullptr:
-            Unlock clusterLock
-            unpin vertex
-            return
-        for each e in migration list:
-            if outOfOrder does not contain e.offset:
-                continue
-            save the target address in a temp variable
-        for each e in outdated list:
-            if outOfOrder does not contain e.offset:
-                continue
-            get its batch offset, set it to valid
-            check if there are other batches that are chained to it or its elements and set them all to valid
-        check if anything depends on the validity of c_batch and if yes:
-            validate them and their dependents recursively
-        if outOforder is empty:
-            delete outOfOrderUpdates
-        Unlock clusterLock
-
-        for migrations -> Insert them to their respective clusters if they are cached
-        unpin vertex
-        return
-
-
-
-    Insert Vector (for simple insert to leaves or for migration):
-        step 1:
-        lock(S) header
-
-        if (version not available):
-            step 2.1:
-            upgrade header to X
-            if version is newer than currentVersion:
-                change currentVersion to new version
-                deduct currentVersionPin from the old currentVersion pin if exists
-                add new version with pin = currentVersionPin to live versions
-                deduct currentVersionPin from old version pin if exists
-            else:
-                add new version with pin = 0 to live versions
-            set its size to what was given in the message
-            if pin is not 0:
-                set state to REMOTE_READ_IN_PROGRESS
-                issue RDMA read for the whole cluster
-            else :
-                set state to UNCACHED
-            unlock header
-            return
-
-        step 3:
-        v <- read version(no pin needed)
-        increment the pin
-        unlock header
-        // since these are updates we are not accessing them so we should not make them hot!
-
-        step 4
-        write vector data + id + version + batch meta(should be valid with size 1)
-        change vector states to valid
-        if ( there are out of order updates ):
-            for migrations -> save the offsets in a list
-            for outdated vectors -> save the offset in another list
-
-        step 5:
-        Lock(X) clusterLock
-        if outOforder == nullptr:
-            Unlock clusterLock
-            unpin vertex
-            return
-
-        for each e in migration list:
-            if outOfOrder does not contain e.offset:
-                continue
-            save the target address in a temp variable
-        for each e in outdated list:
-            if outOfOrder does not contain e.offset:
-                continue
-            get its batch offset, set it to valid
-            check if there are other batches that are chained to it or its elements and set them all to valid
-        if outOforder is empty:
-            delete outOfOrderUpdates
-        Unlock clusterLock
-
-        for migrations -> Insert them to their respective clusters if they are cached
-        unpin vertex
-        return
-
-    Migrate Vector:
-        step 1:
-        lock(S) target header
-
-        step 2:
-        if (target version not available):
-            step 2.1:
-            upgrade header to X
-            if version is newer than currentVersion:
-                change currentVersion to new version
-                deduct currentVersionPin from the old currentVersion pin if exists
-                add new version with pin = currentVersionPin to live versions
-                deduct currentVersionPin from old version pin if exists
-            else:
-                add new version with pin = 0 to live versions
-            set its size to what was given in the message
-            if pin is not 0:
-                set state to REMOTE_READ_IN_PROGRESS
-                issue RDMA read for the whole cluster
-            else :
-                set state to UNCACHED
-            unlock target header
-        else:
-            tv <- read version(no pin needed)
-            increment the pin
-            unlock target header
-            // since these are updates we are not accessing them so we should not make them hot!
-
-        lock(S) src header
-        if (src version not available):
-            step 2.2:
-            upgrade header to X
-            if version is newer than currentVersion:
-                change currentVersion to new version
-                deduct currentVersionPin from the old currentVersion pin if exists
-                add new version with pin = currentVersionPin to live versions
-                deduct currentVersionPin from old version pin if exists
-            else:
-                add new version with pin = 0 to live versions
-            set its size to what was given in the message
-            if pin is not 0:
-                set state to REMOTE_READ_IN_PROGRESS
-                issue RDMA read for the whole cluster
-            else :
-                set state to UNCACHED
-            unlock src header
-        else:
-            sv <- read version(no pin needed)
-            increment the pin
-            unlock src header
-            // since these are updates we are not accessing them so we should not make them hot!
-
-        step 3:
-        if (neither sv nor tv is in CACHED_HOT state):
-            return
-
-        step 4:
-        if sv is cached:
-            read offsets to be migrated
-            change all their state to migrated
-
-            if tv is cached:
-                lock(X) src clusterLock
-                if outOforder == nullptr -> creat it(do not pin vertex) only if needed
-                for all with invalid state:
-                    if state is now valid ignore
-                    add their offsets to outOfOrderUpdates with type migration
-                unlock src clusterLock
-
-                put all with valid state in a list with their addresses -> during previous steps
-
-        step 5:
-        if tv is cached:
-            if sv was cached:
-                Insert all of the migrated vectors using the list created before
-                unpin both sv and tv
-                return
-            else:
-                assert all of them should have invalid states(it can be outdated invalid etc)
-                make their batch states valid
-                set batch sizes to 1
-                use request message data to get migration offset and size and issue RDMA read to read
-                    only the vector data and not the metadata!
-                we should keep tv pinned and let the RDMA read handler unpin it
-                return
-        if sv is cached:
-            unpin sv
-        return
-
-    Delete Vector
-        step 1:
-        lock(S) header
-
-        step 2:
-        if (version not available):
-            step 2.1:
-            upgrade header to X
-            if version is newer than currentVersion:
-                change currentVersion to new version
-                deduct currentVersionPin from the old currentVersion pin if exists
-                add new version with pin = currentVersionPin to live versions
-                deduct currentVersionPin from old version pin if exists
-            else:
-                add new version with pin = 0 to live versions
-            if pin is not 0:
-                set state to REMOTE_READ_IN_PROGRESS
-                issue RDMA read for the whole cluster
-            else :
-                set state to UNCACHED
-            unlock header
-            return
-
-        step 3:
-        v <- read version(no pin needed)
-        increment the pin
-        unlock header
-        // since these are updates we are not accessing them so we should not make them hot!
-
-        step 4
-        p_off <- go to the vector that needs to be deleted
-        change vector state to deleted
-        if (vector state is invalid):
-            Lock(X) clusterLock
-            if state is still invalid:
-                if outOforder == nullptr -> creat it(do not pin vertex)
-                add p_off.offset to outOfOrderUpdates with type deleted
-                Unlock clusterLock
-                unpin vertex
-                return
-            Unlock clusterLock
-
-        unpin vertex
-        read vector id and version and change the buffer state for that cluster
-        return
-
-    ------
-
-    these should only change buffer entry data
-    Vertex Split
-    Vertex Merge
-    Vertex Pruned
-    Vertex Compacted
-
-*/
 struct BufferVertexEntry {
     const VectorID selfId;
     SXSpinLock headerLock;
     Version currentVersion;
-    uint64_t currentVersionPin; /* the pin of the cluster it self should be equal or greater than this is a search might pin that version(instead of latest) */
+    // uint64_t currentVersionPin; /* the pin of the cluster it self should be equal or greater than this is a search might pin that version(instead of latest) */
     bool is_root; /* will be set to false when we send unpin -> if set to true it doesn't mean that this is necessarily the current root */
 
     std::unordered_map<Version, VertexData, VersionHash> liveVersions;
@@ -392,10 +191,13 @@ struct BufferVertexEntry {
     static void* operator new(std::size_t size);
     static void operator delete(void* ptr) noexcept;
 
-    DIVFTreeVertex& ReadLatestVersion(bool pinCluster = true, bool needsHeaderLock = false);
+    // DIVFTreeVertex& ReadLatestVersion(bool pinCluster = true, bool needsHeaderLock = false);
+    VertexData* ReadVersionIfInCache(Version version, CacheUpdateInfo updateInfo, bool pinCluster = false);
+    VertexData* ReadVersionIfInCache(Version version, bool pinCluster = false);
+    VertexData* ReadAndLockVersion(Version version, bool pinCluster = false);
     DIVFTreeVertex& Read(Version version, bool pinCluster = false);
     void Unpin(Version version);
-    void Unpin(); /* unpins the current version */
+    // void Unpin(); /* unpins the current version */
 
     void AddVersion(Version version, uintptr_t remote_addr, ClusterSizeType size, uint64_t initialPin = 0);
     void AddVersion(Version version, uintptr_t remote_addr, ClusterSizeType size, void* local_cpy,
@@ -438,16 +240,20 @@ public:
     VectorID GetCurrentRootId() const;
     VectorID GetCurrentRootIdAndVersion(Version& version);
 
+    void ReadVectorsFromRemote(VectorID containerId, Version containerVersion,
+                               ClusterSizeType offset, ClusterSizeType num_vectors);
     RetStatus PrefetchAndPinVerticesForSearch(SortedList<ANNVectorInfo, SimilarityComparator>* vertices,
                                               SearchTaskGenerator& taskGen);
-    RetStatus PrefetchAndPinVertex(VectorID vertexId);
+    /* Note: we should not be able to read the latest version of a random cluster without pinning a root version
+        otherwise, that version may be deleted in memory node while we are reading it!! */
+    // RetStatus PrefetchAndPinVertex(VectorID vertexId);
     RetStatus UnpinVertex(VectorID vertexId, Version version);
     // RetStatus UnpinVertex(VectorID vertexId);
     RetStatus ReadVertexIfAvailable(VectorID vertexId, Version version, DIVFTreeVertex*& vertex,
                                     bool* outdated = nullptr);
     // RetStatus ReadVertexIfAvailable(VectorID vertexId, DIVFTreeVertex*& vertex);
 
-    BufferVertexEntry* GetBufferEntry(VectorID vertexId, LockMode mode);
+    BufferVertexEntry* GetBufferEntry(VectorID vertexId);
 
     /* should always return true for raw vectors */
     bool Exists(VectorID vertexId, Version version);
