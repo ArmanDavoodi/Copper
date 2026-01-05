@@ -698,7 +698,7 @@ protected:
                                                    std::vector<std::pair<ClusterSizeType, ClusterSizeType>>,
                                                    VectorIDVersionPairHash>& out_of_order_migrations,
                                 std::vector<ClusterSizeType>& out_of_order_deletions,
-                                std::vector<ClusterSizeType>& out_of_order_outdates);
+                                std::vector<ClusterSizeType>& out_of_order_outdates, bool batchs_are_valid = false);
 
     inline void RoundRobinClustering(BufferVertexEntry* base, const ConstVectorBatch& batch,
                                      BufferVertexEntry**& entries, ClusterSizeType marked_for_update);

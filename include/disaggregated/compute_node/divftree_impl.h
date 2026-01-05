@@ -535,7 +535,67 @@ inline void DIVFTree::InsertBatch(VectorID target_id, Version target_version,
     CHECK_NOT_NULLPTR(vmd, LOG_TAG_DIVFTREE);
     CHECK_NOT_NULLPTR(data, LOG_TAG_DIVFTREE);
 
-    /* todo: do the rest */
+    const size_t VECTOR_SIZE = target_id.IsLeaf() ?
+                                  VectorData::Size(attr.dimension) :
+                                  CentroidData::Size(attr.dimension);
+
+    memcpy(data + insert_offset * VECTOR_SIZE,
+           batch.data,
+           batch.size * VECTOR_SIZE);
+    std::vector<ClusterSizeType> potential_out_of_order_updates;
+    potential_out_of_order_updates.reserve(batch.size);
+    for (ClusterSizeType i = 0; i < batch.size; ++i) {
+        const ClusterSizeType batch_off = insert_offset + i;
+        FatalAssert(!(vmd[batch_off].batch_valid.load(std::memory_order_acquire)),
+                    LOG_TAG_DIVFTREE,
+                    "The target batch metadata should not be valid when inserting an atomic batch!");
+        SANITY_CHECK({
+            if (target_id.IsLeaf()) {
+                VectorData& vdata = DataArray(data, attr.dimension)[batch_off];
+                CHECK_VECTORID_IS_VALID(vdata.id, LOG_TAG_DIVFTREE);
+                CHECK_VECTORID_IS_VECTOR(vdata.id, LOG_TAG_DIVFTREE);
+            } else {
+                CentroidData& cdata = CentroidArray(data, attr.dimension)[batch_off];
+                CHECK_VECTORID_IS_VALID(cdata.id, LOG_TAG_DIVFTREE);
+                CHECK_VECTORID_IS_CENTROID(cdata.id, LOG_TAG_DIVFTREE);
+            }
+        });
+        vmd[batch_off].batch_meta.is_batch_size = 1;
+        vmd[batch_off].batch_meta.batch_size_or_last_offset = 1;
+        VectorState new_state = ChangeVectorState(vmd[batch_off].state, VECTOR_STATE_NORMAL);
+        FatalAssert(new_state.is_state_valid, LOG_TAG_DIVFTREE,
+                    "New state should be valid here!");
+        vmd[batch_off].batch_valid.store(true, std::memory_order_release);
+        if (new_state.detail != VECTOR_STATE_NORMAL) {
+            potential_out_of_order_updates.emplace_back(batch_off);
+        }
+    }
+    vertex.UpdateApproximateSize(insert_offset + batch.size);
+
+    if (potential_out_of_order_updates.empty()) {
+        entry->Unpin(target_version);
+        vertex_data = nullptr;
+        entry = nullptr;
+        return;
+    }
+
+    vertex_data->clusterLock.Lock(SX_EXCLUSIVE);
+    if (vertex_data->outofOrderUpdates == nullptr) {
+        vertex_data->clusterLock.Unlock();
+        entry->Unpin(target_version);
+        vertex_data = nullptr;
+        entry = nullptr;
+        return;
+    }
+
+    std::unordered_map<std::pair<VectorID, Version>,
+                       std::vector<std::pair<ClusterSizeType, ClusterSizeType>>,
+                       VectorIDVersionPairHash> out_of_order_migrations;
+    std::vector<ClusterSizeType> out_of_order_deletions;
+    std::vector<ClusterSizeType> out_of_order_outdates;
+    ValidateBatches(target_id, target_version, potential_out_of_order_updates.size(),
+                    potential_out_of_order_updates.data(), false, out_of_order_migrations,
+                    out_of_order_deletions, out_of_order_outdates, true);
 }
 
 inline void DIVFTree::InsertAtomicBatch(VectorID target_id, Version target_version,
@@ -1028,7 +1088,10 @@ inline void DIVFTree::MigrateOutOfOrder(VectorID src_id, Version src_version,
         VectorState new_state = ChangeVectorState(dest_vmd[offset_pair.second].state, VECTOR_STATE_NORMAL);
         FatalAssert(new_state.is_state_valid, LOG_TAG_DIVFTREE,
                     "New state should be valid here!");
-        batch_offsets.emplace_back(offset_pair.second);
+        if (new_state.detail != VECTOR_STATE_NORMAL) {
+            batch_offsets.emplace_back(offset_pair.second);
+        }
+        dest_vmd[offset_pair.second].batch_valid.store(true, std::memory_order_release);
     }
 
     std::unordered_map<std::pair<VectorID, Version>,
@@ -1038,7 +1101,7 @@ inline void DIVFTree::MigrateOutOfOrder(VectorID src_id, Version src_version,
     std::vector<ClusterSizeType> out_of_order_outdates;
     ValidateBatches(dest_id, dest_version, static_cast<ClusterSizeType>(batch_offsets.size()),
                     batch_offsets.data(), false,
-                    out_of_order_migrations, out_of_order_deletions, out_of_order_outdates);
+                    out_of_order_migrations, out_of_order_deletions, out_of_order_outdates, true);
     threadSelf->SanityCheckLockNotHeldByMe(&dest_vertex_data->clusterLock);
     return;
 }
@@ -1049,7 +1112,7 @@ inline void DIVFTree::ValidateBatches(VectorID target_id, Version target_version
                                                          std::vector<std::pair<ClusterSizeType, ClusterSizeType>>,
                                                          VectorIDVersionPairHash>& out_of_order_migrations,
                                       std::vector<ClusterSizeType>& out_of_order_deletions,
-                                      std::vector<ClusterSizeType>& out_of_order_outdates) {
+                                      std::vector<ClusterSizeType>& out_of_order_outdates, bool batchs_are_valid) {
     BufferManager* bufferMgr = BufferManager::GetInstance();
     CHECK_NOT_NULLPTR(bufferMgr, LOG_TAG_DIVFTREE);
 
@@ -1066,15 +1129,22 @@ inline void DIVFTree::ValidateBatches(VectorID target_id, Version target_version
         vertex_data->clusterLock.Lock(SX_EXCLUSIVE);
     }
 
+    if (batchs_are_valid && (vertex_data->outofOrderUpdates == nullptr || vertex_data->outofOrderUpdates->empty())) {
+        /* all batches are already valid and there is no out-of-order updates */
+        vertex_data->clusterLock.Unlock();
+        entry->Unpin(target_version);
+        vertex_data = nullptr;
+        entry = nullptr;
+        return;
+    }
+
+    bool first_iteration = true;
     while (true) {
         for (ClusterSizeType batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
             const ClusterSizeType batch_meta_offset = batch_meta_offsets[batch_idx];
             FatalAssert(vmd[batch_meta_offset].state.load(std::memory_order_acquire).is_state_valid,
                         LOG_TAG_DIVFTREE,
                         "Vector state should be valid here!");
-            FatalAssert(!vmd[batch_meta_offset].batch_valid.load(std::memory_order_acquire),
-                        LOG_TAG_DIVFTREE,
-                        "Batch metadata should not be valid here!");
             FatalAssert(vmd[batch_meta_offset].batch_meta.is_batch_size == 1,
                         LOG_TAG_DIVFTREE,
                         "Batch metadata should indicate batch size here!");
@@ -1088,10 +1158,20 @@ inline void DIVFTree::ValidateBatches(VectorID target_id, Version target_version
                         (vmd[insert_offset].batch_meta.batch_size_or_last_offset == batch_meta_offset),
                         LOG_TAG_DIVFTREE,
                         "Insert offset batch metadata should point to current batch meta offset here!");
-            vmd[batch_meta_offset].batch_valid.store(true, std::memory_order_release);
-
+            if (batchs_are_valid && first_iteration) {
+                FatalAssert(vmd[batch_meta_offset].batch_valid.load(std::memory_order_acquire),
+                        LOG_TAG_DIVFTREE,
+                        "Batch metadata should be valid here!");
+            } else {
+                FatalAssert(!vmd[batch_meta_offset].batch_valid.load(std::memory_order_acquire),
+                        LOG_TAG_DIVFTREE,
+                        "Batch metadata should not be valid here!");
+                vmd[batch_meta_offset].batch_valid.store(true, std::memory_order_release);
+            }
 
             if (vertex_data->outofOrderUpdates == nullptr) {
+                FatalAssert(!batchs_are_valid || !first_iteration, LOG_TAG_DIVFTREE,
+                        "If batchs are not valid, we should not have entered this loop!");
                 continue;
             }
 
@@ -1150,6 +1230,7 @@ inline void DIVFTree::ValidateBatches(VectorID target_id, Version target_version
             }
         }
 
+        first_iteration = false;
         if (!out_of_order_outdates.empty()) {
             batch_meta_offsets[0] = out_of_order_outdates.back();
             num_batches = 1;
