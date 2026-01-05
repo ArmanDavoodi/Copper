@@ -265,17 +265,17 @@ RetStatus DIVFTree::Insert(const VTYPE* vec, VectorID& vec_id, uint8_t search_sp
             break;
         }
 
-        layers.reserve(root->selfId._level + 1);
+        layers.reserve(root->selfId.Level() + 1);
         /* level 0 represents vectors and we do not need them */
         layers.emplace_back(nullptr);
-        for (uint64_t i = 1; i <= root->selfId._level; ++i) {
+        for (uint64_t i = 1; i <= root->selfId.Level(); ++i) {
             layers.emplace_back(
                 new SortedList<ANNVectorInfo, SimilarityComparator>(attr.similarityComparator));
         }
 
-        layers[root->selfId._level]->Insert(ANNVectorInfo(0, root->selfId, root_version));
+        layers[root->selfId.Level()]->Insert(ANNVectorInfo(0, root->selfId, root_version));
         rs = ANNSearch(vec, 1, search_span, 1,
-                        (uint8_t)(root->selfId._level), (uint8_t)VectorID::LEAF_LEVEL,
+                        (uint8_t)(root->selfId.Level()), (uint8_t)VectorID::LEAF_LEVEL,
                         layers, root->Read(root_version));
 
         root->Unpin(root_version);
@@ -476,14 +476,14 @@ RetStatus DIVFTree::ApproximateKNearestNeighbours(const VTYPE* query, size_t k, 
     FatalAssert(rs.IsOK(), LOG_TAG_DIVFTREE,
                 "Failed to read and pin root in Insert: %s", rs.Msg());
 
-    layers.reserve(root->selfId._level + 1);
-    for (uint64_t i = 0; i <= root->selfId._level; ++i) {
+    layers.reserve(root->selfId.Level() + 1);
+    for (uint64_t i = 0; i <= root->selfId.Level(); ++i) {
         layers.emplace_back(new SortedList<ANNVectorInfo, SimilarityComparator>(attr.similarityComparator));
     }
 
-    layers[root->selfId._level]->Insert(ANNVectorInfo(0, root->selfId, root_version));
+    layers[root->selfId.Level()]->Insert(ANNVectorInfo(0, root->selfId, root_version));
     rs = ANNSearch(query, k, internal_node_search_span, leaf_node_search_span,
-                    (uint8_t)(root->selfId._level), (uint8_t)VectorID::VECTOR_LEVEL, layers,
+                    (uint8_t)(root->selfId.Level()), (uint8_t)VectorID::VECTOR_LEVEL, layers,
                     root->Read(root_version));
     FatalAssert(rs.IsOK(), LOG_TAG_DIVFTREE,
                 "ANNSearch failed in ApproximateKNearestNeighbours: %s", rs.Msg());
@@ -563,7 +563,7 @@ inline void DIVFTree::InsertBatch(VectorID target_id, Version target_version,
     CHECK_NOT_NULLPTR(meta, LOG_TAG_DIVFTREE);
     CHECK_NOT_NULLPTR(data, LOG_TAG_DIVFTREE);
 
-
+    /* todo: do the rest */
 }
 
 inline void DIVFTree::InsertAtomicBatch(VectorID target_id, Version target_version,
@@ -751,7 +751,7 @@ inline void DIVFTree::MigrateVectors(VectorID src_id, Version src_version,
     CHECK_VECTORID_IS_CENTROID(dest_id, LOG_TAG_DIVFTREE);
     FatalAssert(dest_id != src_id, LOG_TAG_DIVFTREE,
                 "Source and destination IDs must be different!");
-    FatalAssert(dest_id._level == src_id._level, LOG_TAG_DIVFTREE,
+    FatalAssert(dest_id.Level() == src_id.Level(), LOG_TAG_DIVFTREE,
                 "Source and destination levels must be the same!");
     FatalAssert(num_vectors > 0, LOG_TAG_DIVFTREE,
                 "Number of vectors to migrate must be greater than 0!");
@@ -1044,7 +1044,7 @@ inline void DIVFTree::MigrateOutOfOrder(VectorID src_id, Version src_version,
     CHECK_VECTORID_IS_INTERNAL(dest_id, LOG_TAG_DIVFTREE);
     FatalAssert(dest_id != src_id, LOG_TAG_DIVFTREE,
                 "Source and destination IDs must be different!");
-    FatalAssert(dest_id._level == src_id._level, LOG_TAG_DIVFTREE,
+    FatalAssert(dest_id.Level() == src_id.Level(), LOG_TAG_DIVFTREE,
                 "Source and destination levels must be the same!");
     FatalAssert(!offset_pairs.empty(), LOG_TAG_DIVFTREE,
                 "Offset pairs must not be empty!");
@@ -1281,7 +1281,7 @@ void DIVFTree::SearchRoot(const VTYPE* query, size_t span,
     CHECK_NOT_NULLPTR(&pinned_root_version, LOG_TAG_DIVFTREE);
     CHECK_VECTORID_IS_VALID(pinned_root_version.attr.centroid_id, LOG_TAG_DIVFTREE);
     CHECK_VECTORID_IS_CENTROID(pinned_root_version.attr.centroid_id, LOG_TAG_DIVFTREE);
-    uint8_t level = pinned_root_version.attr.centroid_id._level;
+    uint8_t level = pinned_root_version.attr.centroid_id.Level();
     FatalAssert(layers[level]->Size() == 1 &&
                 (*layers[level])[0].id == pinned_root_version.attr.centroid_id &&
                 (*layers[level])[0].version == pinned_root_version.attr.version, LOG_TAG_DIVFTREE,
@@ -1436,7 +1436,7 @@ RetStatus DIVFTree::ANNSearch(const VTYPE* query, size_t k,
     * Since a version of the root is pinned, we basicaly have an MVCC snapshop of the
     * database based on that root version and it's children are not deleted unless they are unpinned or empty
     */
-    FatalAssert(pinned_root_version.attr.centroid_id._level >= start_level, LOG_TAG_DIVFTREE,
+    FatalAssert(pinned_root_version.attr.centroid_id.Level() >= start_level, LOG_TAG_DIVFTREE,
                 "start_level should be lower than or equal to root level!");
     FatalAssert(end_level < start_level, LOG_TAG_DIVFTREE, "last level cannot be higher than start level!");
 
@@ -1496,7 +1496,7 @@ RetStatus DIVFTree::ANNSearch(const VTYPE* query, size_t k,
                     "next level should be empty!");
         FatalAssert(span > 0, LOG_TAG_DIVFTREE,
                     "span should be at least 1");
-        if (pinned_root_version.attr.centroid_id._level == current_level) {
+        if (pinned_root_version.attr.centroid_id.Level() == current_level) {
             FatalAssert(layers[current_level]->Size() == 1 &&
                         (*layers[current_level])[0].id == pinned_root_version.attr.centroid_id &&
                         (*layers[current_level])[0].version == pinned_root_version.attr.version, LOG_TAG_DIVFTREE,
@@ -1508,7 +1508,7 @@ RetStatus DIVFTree::ANNSearch(const VTYPE* query, size_t k,
 
         if (layers[next_level]->Empty()) {
             layers[current_level]->Clear();
-            if (current_level == pinned_root_version.attr.centroid_id._level) {
+            if (current_level == pinned_root_version.attr.centroid_id.Level()) {
                 return RetStatus::Fail();
             }
             ++current_level;

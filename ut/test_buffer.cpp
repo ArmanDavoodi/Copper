@@ -52,7 +52,7 @@ public:
 
         divftree::VectorID first_root_id = divftree::INVALID_VECTOR_ID;
         first_root_id._id = 0;
-        first_root_id._level = 1;
+        first_root_id.Level() = 1;
 
         divftree::VectorID cur_root_id = _BufferManager.RecordRoot();
         status = status && (cur_root_id == first_root_id);
@@ -80,9 +80,9 @@ public:
             }
             if (level >= root_level) {
                 cur_root_id = _BufferManager.RecordRoot();
-                status = status && (cur_root_id._level == root_level + 1);
-                ErrorAssert(cur_root_id._level == root_level + 1, LOG_TAG_TEST, "Root level should be %u.", root_level + 1);
-                root_level = cur_root_id._level;
+                status = status && (cur_root_id.Level() == root_level + 1);
+                ErrorAssert(cur_root_id.Level() == root_level + 1, LOG_TAG_TEST, "Root level should be %u.", root_level + 1);
+                root_level = cur_root_id.Level();
                 status = status && (cur_root_id._val == 0);
                 ErrorAssert(cur_root_id._val == 0, LOG_TAG_TEST, "Root val should be 0.");
                 vecs.emplace_back(cur_root_id._id);
@@ -99,8 +99,8 @@ public:
                         "Buffer manager should not allow to record vector with highet levels than root level.");
 
             vec_id = _BufferManager.RecordVector(level);
-            status = status && (vec_id._level == level);
-            ErrorAssert(vec_id._level == level, LOG_TAG_TEST, "Vector level should be %u.", level);
+            status = status && (vec_id.Level() == level);
+            ErrorAssert(vec_id.Level() == level, LOG_TAG_TEST, "Vector level should be %u.", level);
             status = status && (vec_id == (vecs[level] + 1));
             ErrorAssert(vec_id == (vecs[level]+1), LOG_TAG_TEST, "Vector ID " VECTORID_LOG_FMT
                 " should be %u.", VECTORID_LOG(vec_id), (vecs[level]+1));

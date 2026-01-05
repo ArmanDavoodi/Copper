@@ -356,6 +356,7 @@ protected:
     std::atomic<RawVectorID> currentRootId;
     std::vector<BufferVectorEntry*> vectorDirectory;
     std::vector<BufferVertexEntry*> clusterDirectory[MAX_TREE_HIGHT];
+    VectorID nextVectorId[MAX_TREE_HIGHT + 1];
     SXSpinLock handleLock;
     std::unordered_map<VectorID, std::atomic<bool>*, VectorIDHash> handles;
 

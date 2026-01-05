@@ -33,7 +33,7 @@ public:
         divftree::RetStatus rs = divftree::RetStatus::Success();
         divftree::VectorID vec_id = divftree::INVALID_VECTOR_ID;
         vec_id._id = 0;
-        vec_id._level = 1;
+        vec_id.Level() = 1;
         static constexpr uint16_t size = 8;
         const uint64_t _ids[size] = {0ul, 1ul, 2ul, 3ul,
                                        4ul, 5ul, 6ul, 7ul};

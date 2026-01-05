@@ -70,7 +70,7 @@ public:
     }
 
     uint8_t Level() const override {
-        return _centroid_id._level;
+        return _centroid_id.Level();
     }
 
     Vector ComputeCurrentCentroid() const override {

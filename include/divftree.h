@@ -349,7 +349,7 @@ public:
                                        VectorState& expectedState, VectorState finalState,
                                        Version* version = nullptr) override {
         CHECK_VECTORID_IS_VALID(target, LOG_TAG_DIVFTREE_VERTEX);
-        FatalAssert(target._level + 1 == attr.centroid_id._level, LOG_TAG_DIVFTREE_VERTEX, "level mismatch");
+        FatalAssert(target.Level() + 1 == attr.centroid_id.Level(), LOG_TAG_DIVFTREE_VERTEX, "level mismatch");
         FatalAssert(expectedState == VECTOR_STATE_VALID || expectedState == VECTOR_STATE_MIGRATED,
                     LOG_TAG_DIVFTREE_VERTEX, "expected state can be either VALID or MIGRATED");
         FatalAssert(finalState == VECTOR_STATE_VALID || finalState == VECTOR_STATE_MIGRATED ||
@@ -831,18 +831,18 @@ public:
                     break;
                 }
 
-                layers.reserve(root->attr.centroid_id._level + 1);
+                layers.reserve(root->attr.centroid_id.Level() + 1);
                 /* level 0 represents vectors and we do not need them */
                 layers.emplace_back(nullptr);
-                for (uint64_t i = 1; i <= root->attr.centroid_id._level; ++i) {
+                for (uint64_t i = 1; i <= root->attr.centroid_id.Level(); ++i) {
                     layers.emplace_back(
                         new SortedList<ANNVectorInfo, SimilarityComparator>(attr.similarityComparator));
                 }
 
-                layers[root->attr.centroid_id._level]->Insert(ANNVectorInfo(0, root->attr.centroid_id,
+                layers[root->attr.centroid_id.Level()]->Insert(ANNVectorInfo(0, root->attr.centroid_id,
                                                                             root->attr.version));
                 rs = ANNSearch(vec, 1, search_span, 1,
-                               (uint8_t)(root->attr.centroid_id._level), (uint8_t)VectorID::LEAF_LEVEL,
+                               (uint8_t)(root->attr.centroid_id.Level()), (uint8_t)VectorID::LEAF_LEVEL,
                                layers, root);
                 root->Unpin();
 
@@ -974,15 +974,15 @@ public:
                 static_cast<DIVFTreeVertex*>(bufferMgr->ReadAndPinRoot());
             CHECK_NOT_NULLPTR(root, LOG_TAG_DIVFTREE);
 
-            layers.reserve(root->attr.centroid_id._level + 1);
-            for (uint64_t i = 0; i <= root->attr.centroid_id._level; ++i) {
+            layers.reserve(root->attr.centroid_id.Level() + 1);
+            for (uint64_t i = 0; i <= root->attr.centroid_id.Level(); ++i) {
                 layers.emplace_back(new SortedList<ANNVectorInfo, SimilarityComparator>(attr.similarityComparator));
             }
 
-            layers[root->attr.centroid_id._level]->Insert(ANNVectorInfo(0, root->attr.centroid_id,
+            layers[root->attr.centroid_id.Level()]->Insert(ANNVectorInfo(0, root->attr.centroid_id,
                                                                         root->attr.version));
             rs = ANNSearch(query, k, internal_node_search_span, leaf_node_search_span,
-                           (uint8_t)(root->attr.centroid_id._level), (uint8_t)VectorID::VECTOR_LEVEL, layers, root);
+                           (uint8_t)(root->attr.centroid_id.Level()), (uint8_t)VectorID::VECTOR_LEVEL, layers, root);
             root->Unpin();
 
 #ifdef EXCESS_LOGING
@@ -1343,14 +1343,14 @@ public:
     //         curr_level_stack.pop_back();
     //         CHECK_VECTORID_IS_VALID(curr_vertexId, LOG_TAG_DIVFTREE);
     //         if (go_to_next_level) {
-    //             curr_level = curr_vertexId._level;
+    //             curr_level = curr_vertexId.Level();
     //             out += String("Level %lu:{Size=%lu, Vertexs=[", curr_level, curr_level_stack.size() + 1);
     //             go_to_next_level = false;
     //         }
     //         else {
-    //             FatalAssert(curr_vertexId._level == curr_level, LOG_TAG_DIVFTREE,
+    //             FatalAssert(curr_vertexId.Level() == curr_level, LOG_TAG_DIVFTREE,
     //                         "Current vertex level (%hhu) does not match expected level (%lu).",
-    //                         curr_vertexId._level, curr_level);
+    //                         curr_vertexId.Level(), curr_level);
     //         }
     //         DIVFTreeVertex* vertex = static_cast<DIVFTreeVertex*>(_bufmgr.GetVertex(curr_vertexId));
     //         CHECK_VERTEX_IS_VALID(vertex, LOG_TAG_DIVFTREE, false);
@@ -1360,9 +1360,9 @@ public:
     //             for (uint16_t i = 0; i < vertex->Size(); ++i) {
     //                 const VectorPair& vectorPair = vertex->cluster[i];
     //                 CHECK_VECTORID_IS_VALID(vectorPair.id, LOG_TAG_DIVFTREE);
-    //                 FatalAssert(vectorPair.id._level == curr_vertexId._level - 1, LOG_TAG_DIVFTREE,
+    //                 FatalAssert(vectorPair.id.Level() == curr_vertexId.Level() - 1, LOG_TAG_DIVFTREE,
     //                             "VectorID level (%hhu) does not match current vertex level (%hhu).",
-    //                             vectorPair.id._level, curr_vertexId._level - 1);
+    //                             vectorPair.id.Level(), curr_vertexId.Level() - 1);
     //                 FatalAssert(vectorPair.vec.IsValid(), LOG_TAG_DIVFTREE,
     //                             "Invalid vector in vertex %s at index %hu.", VECTORID_LOG(curr_vertexId), i);
     //                 next_level_stack.emplace_back(vectorPair.id);
@@ -1594,7 +1594,7 @@ protected:
         DIVFTreeVertexAttributes newAttr = current->attr;
         newAttr.version = nextVersion;
         DIVFTreeVertex* compacted =
-            new(bufferMgr->AllocateMemoryForVertex(container_entry->centroidMeta.selfId._level))
+            new(bufferMgr->AllocateMemoryForVertex(container_entry->centroidMeta.selfId.Level()))
             DIVFTreeVertex(newAttr);
 #ifndef EXCESS_LOGING
         DIVFLOG(LOG_LEVEL_DEBUG, LOG_TAG_DIVFTREE, "compacting vertex id: " VECTORID_LOG_FMT
@@ -1945,13 +1945,13 @@ protected:
         CHECK_NOT_NULLPTR(bufferMgr, LOG_TAG_CLUSTERING);
         centroids.id[0] = base->attr.centroid_id;
         centroids.version[0] = base->attr.version.NextSplit();
-        clusters[0] = new (bufferMgr->AllocateMemoryForVertex(centroids.id[0]._level))
+        clusters[0] = new (bufferMgr->AllocateMemoryForVertex(centroids.id[0].Level()))
             DIVFTreeVertex(DIVFTreeVertexAttributes(centroids.id[0], centroids.version[0], base->attr.min_size,
                                                     base->attr.cap, base->attr.block_size, base->attr.index));
         CHECK_NOT_NULLPTR(clusters[0], LOG_TAG_CLUSTERING);
         entries[0] = nullptr;
         DIVFTreeVertexInterface** clusterMemories = reinterpret_cast<DIVFTreeVertexInterface**>(&clusters[1]);
-        bufferMgr->BatchCreateBufferEntry(centroids.size - 1, base->attr.centroid_id._level, &entries[1],
+        bufferMgr->BatchCreateBufferEntry(centroids.size - 1, base->attr.centroid_id.Level(), &entries[1],
                                           clusterMemories, &centroids.id[1], &centroids.version[1]);
 
         for (uint16_t i = 1; i < centroids.size; ++i) {
@@ -2112,7 +2112,7 @@ protected:
         const uint16_t dim = attr.dimension;
         const uint16_t cap = current->attr.cap;
         const uint16_t blckSize = current->attr.block_size;
-        // const uint8_t level = (uint8_t)(container_entry->centroidMeta.selfId._level);
+        // const uint8_t level = (uint8_t)(container_entry->centroidMeta.selfId.Level());
         /* Todo: this will not work if we have more than one block! */
         FatalAssert(current->cluster.NumBlocks(blckSize, cap) == 1,
                     LOG_TAG_NOT_IMPLEMENTED, "Currently cannot handle more than one block!");
@@ -2531,7 +2531,7 @@ protected:
     RetStatus DeleteVectorAndReleaseContainer(VectorID target, BufferVertexEntry* container_entry, VectorLocation loc) {
         CHECK_NOT_NULLPTR(container_entry, LOG_TAG_DIVFTREE);
         CHECK_VECTORID_IS_VALID(target, LOG_TAG_DIVFTREE);
-        FatalAssert(target._level + 1 == container_entry->centroidMeta.selfId._level, LOG_TAG_DIVFTREE,
+        FatalAssert(target.Level() + 1 == container_entry->centroidMeta.selfId.Level(), LOG_TAG_DIVFTREE,
                     "target cannot be child of container");
         FatalAssert(loc.detail.containerId == container_entry->centroidMeta.selfId, LOG_TAG_DIVFTREE, "Location Id mismatch");
         FatalAssert(container_entry->currentVersion == loc.detail.containerVersion, LOG_TAG_DIVFTREE,
@@ -2612,7 +2612,7 @@ protected:
         CHECK_VECTORID_IS_CENTROID(dest_id, LOG_TAG_DIVFTREE);
         FatalAssert(src_id != dest_id, LOG_TAG_DIVFTREE,
                     "containers should not be the same!");
-        FatalAssert(src_id._level == dest_id._level, LOG_TAG_DIVFTREE,
+        FatalAssert(src_id.Level() == dest_id.Level(), LOG_TAG_DIVFTREE,
                     "containers should be on the same level!");
 
         RetStatus rs = RetStatus::Success();
@@ -2638,7 +2638,7 @@ protected:
             for (size_t i = 0; i < targetBatch.size(); ++i) {
                 FatalAssert((i == 0) || (targetBatch[i - 1].id <= targetBatch[i].id), LOG_TAG_DIVFTREE,
                             "target batch should be sorder in the increasing order of IDs");
-                FatalAssert(targetBatch[i].id._level + 1 == src_id._level, LOG_TAG_DIVFTREE, "level mismatch!");
+                FatalAssert(targetBatch[i].id.Level() + 1 == src_id.Level(), LOG_TAG_DIVFTREE, "level mismatch!");
                 rs = ReadAndCheckVersion(targetBatch[i].id, targetBatch[i].version, &entries[0], max_entries,
                                          num_entries, SX_SHARED);
                 if (!rs.IsOK()) {
@@ -2866,7 +2866,7 @@ protected:
         CHECK_VECTORID_IS_CENTROID(second_cluster, LOG_TAG_DIVFTREE);
         FatalAssert(first_cluster != second_cluster, LOG_TAG_DIVFTREE,
                     "clusters should be different!");
-        FatalAssert(first_cluster._level == second_cluster._level, LOG_TAG_DIVFTREE,
+        FatalAssert(first_cluster.Level() == second_cluster.Level(), LOG_TAG_DIVFTREE,
                     "clusters should be on the same level!");
 
         BufferManager* bufferMgr = BufferManager::GetInstance();
@@ -3085,7 +3085,7 @@ protected:
         CHECK_VECTORID_IS_CENTROID(destId, LOG_TAG_DIVFTREE);
         FatalAssert(srcId != destId, LOG_TAG_DIVFTREE,
                     "clusters should be on the same level!");
-        FatalAssert(srcId._level == destId._level, LOG_TAG_DIVFTREE,
+        FatalAssert(srcId.Level() == destId.Level(), LOG_TAG_DIVFTREE,
                     "clusters should be on the same level!");
 
         RetStatus rs = RetStatus::Success();
@@ -3414,7 +3414,7 @@ protected:
         CHECK_NOT_NULLPTR(pinned_root_version, LOG_TAG_DIVFTREE);
         CHECK_VECTORID_IS_VALID(pinned_root_version->attr.centroid_id, LOG_TAG_DIVFTREE);
         CHECK_VECTORID_IS_CENTROID(pinned_root_version->attr.centroid_id, LOG_TAG_DIVFTREE);
-        uint8_t level = pinned_root_version->attr.centroid_id._level;
+        uint8_t level = pinned_root_version->attr.centroid_id.Level();
         FatalAssert(layers[level]->Size() == 1 &&
                     (*layers[level])[0].id == pinned_root_version->attr.centroid_id &&
                     (*layers[level])[0].version == pinned_root_version->attr.version, LOG_TAG_DIVFTREE,
@@ -3513,7 +3513,7 @@ protected:
             layers[level]->ToString<ANNVectorInfoToString>().ToCStr());
 #endif
         if (layers[level]->Size() == 1) {
-            FatalAssert((*layers[level])[0].id._level == (uint64_t)level, LOG_TAG_DIVFTREE, "mismatch level!");
+            FatalAssert((*layers[level])[0].id.Level() == (uint64_t)level, LOG_TAG_DIVFTREE, "mismatch level!");
             SearchVertex((*layers[level])[0].id, (*layers[level])[0].version, query, span, layers[level - 1], seen);
 #ifdef EXCESS_LOGING
         DIVFLOG(LOG_LEVEL_DEBUG, LOG_TAG_DIVFTREE,
@@ -3530,7 +3530,7 @@ protected:
         std::atomic<bool>* sync_bools = new std::atomic<bool>[layers[level]->Size() * 2];
         std::atomic<size_t>* viewed = new std::atomic<size_t>(0);
         for (size_t i = 0; i < layers[level]->Size(); ++i) {
-            FatalAssert((*layers[level])[i].id._level == (uint64_t)level, LOG_TAG_DIVFTREE, "mismatch level!");
+            FatalAssert((*layers[level])[i].id.Level() == (uint64_t)level, LOG_TAG_DIVFTREE, "mismatch level!");
             task_ptrs[i] =
                 new SearchTask(taskId, layers[level]->Size(), (*layers[level])[i].id, (*layers[level])[i].version,
                                query, span, &sync_bools[i], &sync_bools[i + layers[level]->Size()], viewed, sync_bools,
@@ -3625,7 +3625,7 @@ protected:
          * Since a version of the root is pinned, we basicaly have an MVCC snapshop of the
          * database based on that root version and it's children are not deleted unless they are unpinned or empty
          */
-        FatalAssert(pinned_root_version->attr.centroid_id._level >= start_level, LOG_TAG_DIVFTREE,
+        FatalAssert(pinned_root_version->attr.centroid_id.Level() >= start_level, LOG_TAG_DIVFTREE,
                     "start_level should be lower than or equal to root level!");
         FatalAssert(end_level < start_level, LOG_TAG_DIVFTREE, "last level cannot be higher than start level!");
 
@@ -3688,7 +3688,7 @@ protected:
                         "next level should be empty!");
             FatalAssert(span > 0, LOG_TAG_DIVFTREE,
                         "span should be at least 1");
-            if (pinned_root_version->attr.centroid_id._level == current_level) {
+            if (pinned_root_version->attr.centroid_id.Level() == current_level) {
                 FatalAssert(layers[current_level]->Size() == 1 &&
                             (*layers[current_level])[0].id == pinned_root_version->attr.centroid_id &&
                             (*layers[current_level])[0].version == pinned_root_version->attr.version, LOG_TAG_DIVFTREE,
@@ -3700,7 +3700,7 @@ protected:
 
             if (layers[next_level]->Empty()) {
                 layers[current_level]->Clear();
-                if (current_level == pinned_root_version->attr.centroid_id._level) {
+                if (current_level == pinned_root_version->attr.centroid_id.Level()) {
                     return RetStatus(RetStatus::FAIL);
                 }
                 ++current_level;

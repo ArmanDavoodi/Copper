@@ -173,13 +173,22 @@ constexpr float COMPACTION_FACTOR = 1.15;
 
 union VectorID {
     RawVectorID _id;
-    struct {
-        uint64_t _val : 48;
-        uint64_t _level : 8; // == 0 for vectors, == 1 for leaves
-        uint64_t _creator_node_id : 8;
+    /* last 8 bits is always level */
+    union {
+        struct {
+            uint64_t _val : 48;
+            uint64_t _creator_node_id : 8;
+            uint64_t _level : 8; // == 0 for vectors, == 1 for leaves
+        } _vectorRep;
+
+        struct {
+            uint64_t _val : 56;
+            uint64_t _level : 8; // >= 2 for centroids
+        } _centroidRep;
     };
 
-    static constexpr uint64_t MAX_ID_PER_LEVEL = 0x0000FFFFFFFFFFFF;
+    static constexpr uint64_t MAX_VECTOR_ID = 0x0000FFFFFFFFFFFF;
+    static constexpr uint64_t MAX_ID_PER_LEVEL = 0x00FFFFFFFFFFFFFF;
     static constexpr uint64_t VECTOR_LEVEL = 0;
     static constexpr uint64_t LEAF_LEVEL = 1;
 
@@ -189,28 +198,79 @@ union VectorID {
     constexpr VectorID(VectorID&& ID) : _id(ID._id) {}
     ~VectorID() = default;
 
-    inline static VectorID AsID(RawVectorID id) {
+    constexpr inline static VectorID AsID(RawVectorID id) {
         return VectorID(id);
     }
 
-    inline bool IsValid() const {
-        return (_id != INVALID_VECTOR_ID) && (_val < MAX_ID_PER_LEVEL);
+    constexpr inline bool IsValid() const {
+        FatalAssert(_vectorRep._level == _centroidRep._level, LOG_TAG_BASIC,
+                    "Inconsistent VectorID representation detected!");
+        return (_id != INVALID_VECTOR_ID) &&
+               (((_vectorRep._level == VECTOR_LEVEL) && (_vectorRep._val < MAX_VECTOR_ID)) ||
+                ((_centroidRep._level > VECTOR_LEVEL) && (_centroidRep._val < MAX_ID_PER_LEVEL)));
     }
 
-    inline bool IsCentroid() const {
-        return _level > VECTOR_LEVEL;
+    constexpr inline bool IsCentroid() const {
+        FatalAssert(_vectorRep._level == _centroidRep._level, LOG_TAG_BASIC,
+                    "Inconsistent VectorID representation detected!");
+        return _centroidRep._level > VECTOR_LEVEL;
     }
 
-    inline bool IsVector() const {
-        return _level == VECTOR_LEVEL;
+    constexpr inline bool IsVector() const {
+        FatalAssert(_vectorRep._level == _centroidRep._level, LOG_TAG_BASIC,
+                    "Inconsistent VectorID representation detected!");
+        return _vectorRep._level == VECTOR_LEVEL;
     }
 
-    inline bool IsLeaf() const {
-        return _level == LEAF_LEVEL;
+    constexpr inline bool IsLeaf() const {
+        FatalAssert(_vectorRep._level == _centroidRep._level, LOG_TAG_BASIC,
+                    "Inconsistent VectorID representation detected!");
+        return _centroidRep._level == LEAF_LEVEL;
     }
 
-    inline bool IsInternalVertex() const {
-        return _level > LEAF_LEVEL;
+    constexpr inline bool IsInternalVertex() const {
+        FatalAssert(_vectorRep._level == _centroidRep._level, LOG_TAG_BASIC,
+                    "Inconsistent VectorID representation detected!");
+        return _centroidRep._level > LEAF_LEVEL;
+    }
+
+    constexpr VectorID(uint8_t level, uint64_t value) : _centroidRep{._val = value, ._level = level} {
+        FatalAssert(IsCentroid(), LOG_TAG_BASIC,
+                    "Created VectorID is not a valid centroid ID!");
+        FatalAssert(value < MAX_ID_PER_LEVEL, LOG_TAG_BASIC,
+                    "Centroid ID value is out of bounds!");
+    }
+
+    constexpr VectorID(uint8_t level, uint8_t creator_node_id, uint64_t value) :
+        _vectorRep{._val = value, ._creator_node_id = creator_node_id, ._level = level} {
+        FatalAssert(IsVector(), LOG_TAG_BASIC,
+                    "Created VectorID is not a valid Vector ID!");
+        FatalAssert(value < MAX_VECTOR_ID, LOG_TAG_BASIC,
+                    "Vector ID value is out of bounds!");
+    }
+
+    static constexpr VectorID CreateCentroidID(uint8_t level, uint64_t value) {
+        return VectorID(level, value);
+    }
+
+    static constexpr VectorID CreateVectorID(uint8_t creator_node_id, uint64_t value) {
+        return VectorID(VECTOR_LEVEL, creator_node_id, value);
+    }
+
+    constexpr inline uint8_t Level() const {
+        FatalAssert(_vectorRep._level == _centroidRep._level, LOG_TAG_BASIC,
+                    "Inconsistent VectorID representation detected!");
+        return _vectorRep._level;
+    }
+
+    constexpr inline uint8_t CreatorNodeID() const {
+        FatalAssert(IsVector() || !IsValid(), LOG_TAG_BASIC,
+                    "Only vectors have creator node ID!");
+        return _vectorRep._creator_node_id;
+    }
+
+    constexpr inline uint64_t Value() const {
+        return IsVector() ? _vectorRep._val : _centroidRep._val;
     }
 
     inline constexpr void operator=(const VectorID& ID) {
@@ -219,6 +279,21 @@ union VectorID {
 
     inline constexpr void operator=(VectorID&& ID) {
         _id = ID._id;
+    }
+
+    inline constexpr VectorID operator++() {
+        FatalAssert(IsValid(), LOG_TAG_BASIC,
+                    "Cannot increment an invalid VectorID!");
+        SANITY_CHECK(
+            VectorID old_id = *this;
+        );
+        ++_id;
+        FatalAssert(IsValid(), LOG_TAG_BASIC,
+                    "Cannot increment an invalid VectorID!");
+        SANITY_CHECK(
+            FatalAssert(old_id.Value() + 1 == this->Value(), LOG_TAG_BASIC,
+                        "VectorID increment operator inconsistency");
+        );
     }
 
     inline bool operator==(const VectorID& ID) const {
@@ -891,7 +966,8 @@ inline constexpr const void* ALIGNED_PTR(const void* ptr, size_t align_bytes = C
 
 
 #define VECTORID_LOG_FMT "%s%lu(%lu, %lu, %lu)"
-#define VECTORID_LOG(vid) (!((vid).IsValid()) ? "[INV]" : ""), (vid)._id, (vid)._creator_node_id, (vid)._level, (vid)._val
+#define VECTORID_LOG(vid) (!((vid).IsValid()) ? "[INV]" : ""), (vid)._id, (vid).Level(),\
+                            ((vid).IsVector() ? (vid).CreatorNodeID() : 0), (vid).Value()
 
 typedef VECTOR_TYPE VTYPE;
 typedef DISTANCE_TYPE DTYPE;
