@@ -97,6 +97,7 @@ struct __attribute__((packed)) RequestRootMessage {
     }
 };
 
+/* todo: vectorID/version/vdata should be in this order! */
 struct  __attribute__((packed)) InsertRequestMessage {
     const MessageType type = MessageType::CN_TO_MN_INSERT_REQUEST;
     VectorID target_leaf; /* should be leaf */

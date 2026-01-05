@@ -658,7 +658,7 @@ protected:
 #endif
     RetStatus ReadAndPinRoot(BufferVertexEntry*& root_entry, Version& root_version);
 
-    inline VectorID GenerateNextVectorID(uint8_t level);
+    inline VectorID GenerateNextVectorID();
 
     inline void ClearStats(bool need_lock);
 
