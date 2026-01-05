@@ -598,6 +598,106 @@ inline void DIVFTree::InsertBatch(VectorID target_id, Version target_version,
                     out_of_order_deletions, out_of_order_outdates, true);
 }
 
+inline void DIVFTree::InsertBatch(VectorID target_id, Version target_version,
+                                  ClusterSizeType* insert_offsets, ConstVectorBatch batch) {
+    FatalAssert(batch.size > 0, LOG_TAG_DIVFTREE,
+                "Batch size must be greater than 0!");
+    CHECK_NOT_NULLPTR(insert_offsets, LOG_TAG_DIVFTREE);
+    CHECK_VECTORID_IS_VALID(target_id, LOG_TAG_DIVFTREE);
+    CHECK_VECTORID_IS_INTERNAL(target_id, LOG_TAG_DIVFTREE);
+    CHECK_NOT_NULLPTR(batch.data, LOG_TAG_DIVFTREE);
+
+    BufferManager* bufferMgr = BufferManager::GetInstance();
+    CHECK_NOT_NULLPTR(bufferMgr, LOG_TAG_DIVFTREE);
+
+    BufferVertexEntry* entry = bufferMgr->GetBufferEntry(target_id);
+    if (entry == nullptr) {
+        /* should we ignore this case and assume it is deleted or it is not yet available? */
+        /* if I ignore it and it is not available yet, I will not have enough info on its size */
+        /* unless when I am reading a cluster for the first time, I first read its size */
+        return;
+    }
+    VertexData* vertex_data =
+        entry->ReadVersionIfInCache(target_version, CacheUpdateInfo(batch, insert_offsets), true);
+    if (vertex_data == nullptr) {
+        return;
+    }
+    DIVFTreeVertex& vertex = vertex_data->vertex;
+
+    VectorMetaData* vmd = vertex.cluster.MetaData(0, target_id.IsLeaf(), attr.internal_blck_size,
+                                                  attr.internal_max_size, attr.dimension);
+    Address data = vertex.cluster.Data(0, target_id.IsLeaf(), attr.internal_blck_size,
+                                       attr.internal_max_size, attr.dimension);
+    CHECK_NOT_NULLPTR(vmd, LOG_TAG_DIVFTREE);
+    CHECK_NOT_NULLPTR(data, LOG_TAG_DIVFTREE);
+
+    const size_t VECTOR_SIZE = target_id.IsLeaf() ?
+                                  VectorData::Size(attr.dimension) :
+                                  CentroidData::Size(attr.dimension);
+
+    std::vector<ClusterSizeType> potential_out_of_order_updates;
+    ClusterSizeType max_offset = insert_offsets[0];
+    potential_out_of_order_updates.reserve(batch.size);
+    for (ClusterSizeType i = 0; i < batch.size; ++i) {
+        const ClusterSizeType batch_off = insert_offsets[i];
+        if (batch_off > max_offset) {
+            max_offset = batch_off;
+        }
+        memcpy(data + (batch_off * VECTOR_SIZE),
+               batch.data + (i * VECTOR_SIZE),
+               VECTOR_SIZE);
+        FatalAssert(!(vmd[batch_off].batch_valid.load(std::memory_order_acquire)),
+                    LOG_TAG_DIVFTREE,
+                    "The target batch metadata should not be valid when inserting an atomic batch!");
+        SANITY_CHECK({
+            if (target_id.IsLeaf()) {
+                VectorData& vdata = DataArray(data, attr.dimension)[batch_off];
+                CHECK_VECTORID_IS_VALID(vdata.id, LOG_TAG_DIVFTREE);
+                CHECK_VECTORID_IS_VECTOR(vdata.id, LOG_TAG_DIVFTREE);
+            } else {
+                CentroidData& cdata = CentroidArray(data, attr.dimension)[batch_off];
+                CHECK_VECTORID_IS_VALID(cdata.id, LOG_TAG_DIVFTREE);
+                CHECK_VECTORID_IS_CENTROID(cdata.id, LOG_TAG_DIVFTREE);
+            }
+        });
+        vmd[batch_off].batch_meta.is_batch_size = 1;
+        vmd[batch_off].batch_meta.batch_size_or_last_offset = 1;
+        VectorState new_state = ChangeVectorState(vmd[batch_off].state, VECTOR_STATE_NORMAL);
+        FatalAssert(new_state.is_state_valid, LOG_TAG_DIVFTREE,
+                    "New state should be valid here!");
+        vmd[batch_off].batch_valid.store(true, std::memory_order_release);
+        if (new_state.detail != VECTOR_STATE_NORMAL) {
+            potential_out_of_order_updates.emplace_back(batch_off);
+        }
+    }
+    vertex.UpdateApproximateSize(max_offset + 1);
+
+    if (potential_out_of_order_updates.empty()) {
+        entry->Unpin(target_version);
+        vertex_data = nullptr;
+        entry = nullptr;
+        return;
+    }
+
+    vertex_data->clusterLock.Lock(SX_EXCLUSIVE);
+    if (vertex_data->outofOrderUpdates == nullptr) {
+        vertex_data->clusterLock.Unlock();
+        entry->Unpin(target_version);
+        vertex_data = nullptr;
+        entry = nullptr;
+        return;
+    }
+
+    std::unordered_map<std::pair<VectorID, Version>,
+                       std::vector<std::pair<ClusterSizeType, ClusterSizeType>>,
+                       VectorIDVersionPairHash> out_of_order_migrations;
+    std::vector<ClusterSizeType> out_of_order_deletions;
+    std::vector<ClusterSizeType> out_of_order_outdates;
+    ValidateBatches(target_id, target_version, potential_out_of_order_updates.size(),
+                    potential_out_of_order_updates.data(), false, out_of_order_migrations,
+                    out_of_order_deletions, out_of_order_outdates, true);
+}
+
 inline void DIVFTree::InsertAtomicBatch(VectorID target_id, Version target_version,
                                         ClusterSizeType insert_offset, ClusterSizeType mark_outdated_offset,
                                         ConstVectorBatch batch) {
@@ -651,6 +751,7 @@ inline void DIVFTree::InsertAtomicBatch(VectorID target_id, Version target_versi
         return;
     }
     DIVFTreeVertex& vertex = vertex_data->vertex;
+    vertex.UpdateApproximateSize(insert_offset + batch.size);
 
     /* step 1: Insert batch data */
     ClusterSizeType current_batch_meta_offset = insert_offset + batch.size - 1;
@@ -762,7 +863,7 @@ inline void DIVFTree::InsertAtomicBatch(VectorID target_id, Version target_versi
     }
 
     ValidateBatches(target_id, target_version, 1, &outdated_batch_offset, cluster_locked,
-                  out_of_order_migrations, out_of_order_deletions, out_of_order_outdates);
+                    out_of_order_migrations, out_of_order_deletions, out_of_order_outdates);
     threadSelf->SanityCheckLockNotHeldByMe(&vertex_data->clusterLock);
     return;
 }
@@ -827,7 +928,8 @@ inline void DIVFTree::MigrateVectors(VectorID src_id, Version src_version,
         dest_cache_state = dest_vertex_data->cacheState.load(std::memory_order_acquire);
         FatalAssert(dest_cache_state != ClusterCacheState::DELETED, LOG_TAG_DIVFTREE,
                     "Destination vertex cluster should not be deleted here!");
-        if (dest_cache_state == ClusterCacheState::UNCACHED) {
+        if (dest_cache_state != ClusterCacheState::REMOTE_READ_IN_PROGRESS &&
+            dest_cache_state != ClusterCacheState::DELETED) {
             dest_vertex_data->vertex.UpdateApproximateSize(num_vectors + dest_insert_offset);
         }
         dest_vertex_data->clusterLock.Unlock();
@@ -1068,9 +1170,13 @@ inline void DIVFTree::MigrateOutOfOrder(VectorID src_id, Version src_version,
                                                        attr.internal_max_size, attr.dimension);
     const size_t VECTOR_SIZE = CentroidData::Size(attr.dimension);
 
+    ClusterSizeType max_dest_offset = offset_pairs[0].second;
     std::vector<ClusterSizeType> batch_offsets;
     batch_offsets.reserve(offset_pairs.size());
     for (const auto& offset_pair : offset_pairs) {
+        if (offset_pair.second > max_dest_offset) {
+            max_dest_offset = offset_pair.second;
+        }
         FatalAssert(src_vmd[offset_pair.first].state.load(std::memory_order_acquire).is_state_valid,
                     LOG_TAG_DIVFTREE,
                     "Source vector state should be valid here!");
@@ -1093,6 +1199,7 @@ inline void DIVFTree::MigrateOutOfOrder(VectorID src_id, Version src_version,
         }
         dest_vmd[offset_pair.second].batch_valid.store(true, std::memory_order_release);
     }
+    dest_vertex.UpdateApproximateSize(max_dest_offset + 1);
 
     std::unordered_map<std::pair<VectorID, Version>,
                        std::vector<std::pair<ClusterSizeType, ClusterSizeType>>,
@@ -1113,6 +1220,11 @@ inline void DIVFTree::ValidateBatches(VectorID target_id, Version target_version
                                                          VectorIDVersionPairHash>& out_of_order_migrations,
                                       std::vector<ClusterSizeType>& out_of_order_deletions,
                                       std::vector<ClusterSizeType>& out_of_order_outdates, bool batchs_are_valid) {
+    FatalAssert(num_batches > 0, LOG_TAG_DIVFTREE,
+                "Number of batches must be greater than 0!");
+    CHECK_VECTORID_IS_VALID(target_id, LOG_TAG_DIVFTREE);
+    CHECK_NOT_NULLPTR(batch_meta_offsets, LOG_TAG_DIVFTREE);
+
     BufferManager* bufferMgr = BufferManager::GetInstance();
     CHECK_NOT_NULLPTR(bufferMgr, LOG_TAG_DIVFTREE);
 
@@ -1139,9 +1251,13 @@ inline void DIVFTree::ValidateBatches(VectorID target_id, Version target_version
     }
 
     bool first_iteration = true;
+    ClusterSizeType max_offset = batch_meta_offsets[0];
     while (true) {
         for (ClusterSizeType batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
             const ClusterSizeType batch_meta_offset = batch_meta_offsets[batch_idx];
+            if (batch_meta_offset > max_offset) {
+                max_offset = batch_meta_offset;
+            }
             FatalAssert(vmd[batch_meta_offset].state.load(std::memory_order_acquire).is_state_valid,
                         LOG_TAG_DIVFTREE,
                         "Vector state should be valid here!");
@@ -1177,6 +1293,9 @@ inline void DIVFTree::ValidateBatches(VectorID target_id, Version target_version
 
             for (ClusterSizeType i = 0; i < batch_size; ++i) {
                 const ClusterSizeType batch_off = insert_offset + i;
+                if (batch_off > max_offset) {
+                    max_offset = batch_off;
+                }
                 FatalAssert(vmd[batch_off].state.load(std::memory_order_acquire).is_state_valid,
                             LOG_TAG_DIVFTREE,
                             "Vector state should be valid here!");
@@ -1241,6 +1360,7 @@ inline void DIVFTree::ValidateBatches(VectorID target_id, Version target_version
     }
 
     vertex_data->clusterLock.Unlock();
+    vertex_data->vertex.UpdateApproximateSize(max_offset + 1);
     if (!out_of_order_deletions.empty()) {
         DeleteVectors(target_id, target_version, out_of_order_deletions.size(), out_of_order_deletions.data());
     }
