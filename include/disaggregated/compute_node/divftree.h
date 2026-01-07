@@ -669,6 +669,35 @@ protected:
     void BGSearchStatsUpdate(uint64_t thread_index, bool completed_task);
 
     void BGSearchStatsUpdateCreatedTask(uint64_t num_tasks);
+    /* CommLayer Updates:
+        Split:
+            Bool Expanded
+            ChainLength -> greater than 0
+            if Expanded: NewRootID, NewRootVersion, NewRootSize, NewRootAddress
+            Else:
+                ContainerID, ContainerVersion, OutdatedOffset, InsertedOffset,
+                [<ChildID, ChildVersion(if applicable), ChildCentroid>...]{size = span}, -> first one is the orig
+                [<ChildSize, ChildRemoteAddr>...]{size = span}
+            For i = 0 to ChildLength - 1:
+                [<ChildID, ChildVersion(if applicable), ChildSize, ChildRemoteAddr>...]{size = span}, -> first one is the orig
+        Compaction:
+            VertexID, OldVersion, ContainerID, ContainerVersion, NewSize, RemoteAddress
+        Merge:
+            VertexID, VertexVersion, ContainerID, ContainerVersion, DestID, DestVersion, DestOffset
+            NumVectors, MigratedOffsets*
+        Prune/Delete Vertex:
+            VertexID, VertexVersion, ContainerID, ContainerVersion
+        Prune/Delete Root:
+            OldRootID, OldRootVersion, NewRootID, NewRootVersion
+        GarbageCollection:
+            NumCollected, [<VectorID, Version>...]
+        Migration:
+            srcID, destID, srcVer, destVer, NumVectors, Offsets, DestInsertOffset
+        InsertVectorToLeaf:
+            LeafID, LeafVersion, Offset, VectorID, VectorData
+        DeleteVectorFromLeaf:
+            LeafID, LeafVersion, Offset
+    */
 
     inline void InsertBatch(VectorID target_id, Version target_version,
                             ClusterSizeType insert_offset, ConstVectorBatch batch);
