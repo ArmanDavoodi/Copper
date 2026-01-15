@@ -768,13 +768,14 @@ inline void BufferManager::UnpinVertexVersion(VectorID vertexId, Version version
     entry->UnpinVersion(version);
 }
 
-inline VectorLocation BufferManager::LoadCurrentVectorLocation(VectorID vectorId) {
+inline VectorLocation BufferManager::LoadCurrentVectorLocation(VectorID vectorId, bool return_invalid_if_created) {
     FatalAssert(bufferMgrInstance == this, LOG_TAG_BUFFER, "Buffer not initialized");
     CHECK_VECTORID_IS_VALID(vectorId, LOG_TAG_BUFFER);
 
     if (vectorId.IsCentroid()) {
         BufferVertexEntry* entry = GetVertexEntry(vectorId);
-        if (entry == nullptr || entry->state.load() == CLUSTER_DELETED || entry->state.load() == CLUSTER_CREATED) {
+        if (entry == nullptr || entry->state.load() == CLUSTER_DELETED ||
+            (entry->state.load() == CLUSTER_CREATED && return_invalid_if_created)) {
             return INVALID_VECTOR_LOCATION;
         }
         FatalAssert(entry->centroidMeta.selfId == vectorId, LOG_TAG_BUFFER, "BufferEntry id mismatch! VertexID="
@@ -822,6 +823,12 @@ inline void BufferManager::UpdateVectorLocation(VectorID vectorId, VectorLocatio
                     VECTORID_LOG_FMT, VECTORID_LOG(vectorId));
         oldLocation = entry->location.Load();
         entry->location.Store(newLocation);
+        // DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_BUFFER, "Updated vector location with id " VECTORID_LOG_FMT
+        //         " from {id: " VECTORID_LOG_FMT ", ver:%s, offset:%hu} to {id: "
+        //         VECTORID_LOG_FMT ", ver:%s, offset:%hu} with pin=%s",
+        //         VECTORID_LOG(vectorId), VECTORID_LOG(oldLocation.detail.containerId), oldLocation.detail.containerVersion.ToString().ToCStr(),
+        //         oldLocation.detail.entryOffset, VECTORID_LOG(newLocation.detail.containerId),
+        //         newLocation.detail.containerVersion.ToString().ToCStr(), newLocation.detail.entryOffset, (pinNewUnpinOld ? "ON" : "OFF"));
     }
 
     SANITY_CHECK(
@@ -838,11 +845,13 @@ inline void BufferManager::UpdateVectorLocation(VectorID vectorId, VectorLocatio
         }
     );
 
-    FatalAssert(oldLocation != newLocation, LOG_TAG_BUFFER, "new and old location are the same!");
+    FatalAssert((oldLocation != newLocation) || ((oldLocation == INVALID_VECTOR_LOCATION)), LOG_TAG_BUFFER,
+                "new and old location are the same!");
     FatalAssert((oldLocation != INVALID_VECTOR_LOCATION) || pinNewUnpinOld, LOG_TAG_BUFFER,
                 "if oldLocation is invalid then pinNewUnpinOld should be true");
-    FatalAssert(!pinNewUnpinOld == ((newLocation.detail.containerId == oldLocation.detail.containerId) &&
-                                    (newLocation.detail.containerVersion == oldLocation.detail.containerVersion)),
+    FatalAssert((oldLocation == newLocation) ||
+                (!pinNewUnpinOld == ((newLocation.detail.containerId == oldLocation.detail.containerId) &&
+                 (newLocation.detail.containerVersion == oldLocation.detail.containerVersion))),
                 LOG_TAG_BUFFER,
                 "if pinNewUnpinOld is false, only the offset of the old and new location should be different");
     if (pinNewUnpinOld && (oldLocation != INVALID_VECTOR_LOCATION)) {

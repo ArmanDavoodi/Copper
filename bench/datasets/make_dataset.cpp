@@ -21,34 +21,52 @@ double stddev;
 double alpha;
 
 #define UINT8 1
-#define UINT32 2
-#define UINT64 3
+#define UINT16 2
+#define UINT32 3
 #define FLOAT 4
-#define DOUBLE 5
 
 #if defined(VECTOR_TYPE)
     #if VECTOR_TYPE == UINT8
         using VTYPE = uint8_t;
+        using DTYPE = uint32_t;
+        using MVTYPE = uint64_t;
+        #define VTYPE_FMT "%hhu"
+        #define DTYPE_FMT "%u"
+        #define MVTYPE_FMT "%lu"
         #pragma message("TYPE = UINT8")
-    #elif VECTOR_TYPE == UINT32
-        using VTYPE = uint32_t;
-        #pragma message("TYPE = UINT32")
-    #elif VECTOR_TYPE == UINT64
-        using VTYPE = uint64_t;
-        #pragma message("TYPE = UINT64")
-        #define USE64_BIT
+    #elif VECTOR_TYPE == UINT16
+        using VTYPE = uint16_t;
+        using DTYPE = uint64_t;
+        using MVTYPE = uint64_t;
+        #define VTYPE_FMT "%hu"
+        #define DTYPE_FMT "%lu"
+        #define MVTYPE_FMT "%lu"
+        #pragma message("TYPE = UINT16")
+    // #elif VECTOR_TYPE == UINT32
+    //     using VTYPE = uint32_t;
+    //     using DTYPE = uint64_t;
+    //     using MVTYPE = uint64_t;
+    //     #define VTYPE_FMT "%u"
+    //     #define DTYPE_FMT "%lu"
+    //     #define MVTYPE_FMT "%lu"
+    //     #pragma message("TYPE = UINT32")
     #elif VECTOR_TYPE == FLOAT
         using VTYPE = float;
+        using DTYPE = double;
+        using MVTYPE = double;
+        #define VTYPE_FMT "%0.2f"
+        #define DTYPE_FMT "%0.4f"
+        #define MVTYPE_FMT "%0.4f"
         #pragma message("TYPE = FLOAT")
-    #elif VECTOR_TYPE == DOUBLE
-        using VTYPE = double;
-        #pragma message("TYPE = DOUBLE")
-        #define USE64_BIT
     #else
         #error UNDEFINED VECTOR_TYPE!
     #endif
 #else
 using VTYPE = uint8_t;
+using DTYPE = uint16_t;
+using MVTYPE = uint64_t;
+#define VTYPE_FMT "%hhu"
+#define DTYPE_FMT "%hu"
 #error VECTOR_TYPE not found!
 #endif
 
@@ -74,11 +92,7 @@ public:
 
 private:
     double mu, sigma, alpha;
-#ifdef USE64_BIT
-    mt19937_64 gen;
-#else
     mt19937 gen;
-#endif
     normal_distribution<double> dist;
 };
 

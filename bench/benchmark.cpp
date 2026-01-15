@@ -18,8 +18,8 @@ inline std::atomic<size_t> insert_errors = 0;
 inline std::atomic<size_t> delete_errors = 0;
 
 inline divftree::SXSpinLock distance_lock;
-inline DISTANCE_TYPE sum_search_distance = 0;
-inline DISTANCE_TYPE avg_search_distance = 0;
+inline double sum_search_distance = 0;
+inline double avg_search_distance = 0;
 inline uint64_t num_returned_neighbours = 0;
 inline uint64_t num_total_returned_neighbours = 0;
 
@@ -133,7 +133,7 @@ divftree::RetStatus Search(std::vector<divftree::ANNVectorInfo>& neighbours) {
         DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_TEST, "No neighbours found during search!");
         rs = divftree::RetStatus::Fail(nullptr);
     } else if (collect_avg_distances) {
-        DISTANCE_TYPE total_distance = 0;
+        double total_distance = 0;
         for (const auto& neighbour : neighbours) {
             total_distance += std::sqrt(neighbour.distance_to_query);
         }
@@ -157,7 +157,7 @@ void FlushIncrement(uint64_t& local_cnt, std::atomic<uint64_t>& shared_cnt) {
 
 /* todo: instead of this get a batch per thread and make reading the file atomic? */
 void worker(divftree::Thread* self) {
-    self->InitDIVFThread();
+    self->InitDIVFThread(DIMENSION);
     divftree::VTYPE buffer[bench_batch_size * DIMENSION];
     FILE* input_file_ptr = nullptr;
     OpenDataFile(input_file_ptr, false);
@@ -426,7 +426,7 @@ int main() {
                 ExclusiveBenchLog("[%u s]: Warmup Phase Report: RPS: %.2f | Avg Distance: " DTYPE_FMT " | REPS: %.2f",
                                 total_wait_time + time_to_wait,
                                 (double)(cur_rps - last_rps) / (double)time_to_wait,
-                                sum_search_distance / (DISTANCE_TYPE)num_returned_neighbours,
+                                (divftree::DTYPE)(sum_search_distance / (double)num_returned_neighbours),
                                 (double)(cur_reps - last_reps) / (double)time_to_wait);
                 sum_search_distance = 0;
                 num_returned_neighbours = 0;
@@ -509,7 +509,7 @@ int main() {
                                   (double)(cur_rps - last_rps) / (double)time_to_wait,
                                   (double)(cur_ips - last_ips) / (double)time_to_wait,
                                   (double)(cur_dps - last_dps) / (double)time_to_wait,
-                                  sum_search_distance / (DISTANCE_TYPE)num_returned_neighbours,
+                                  (divftree::DTYPE)(sum_search_distance / (double)num_returned_neighbours),
                                   (double)total_eps / (double)time_to_wait,
                                   (double)(cur_reps - last_reps) / (double)time_to_wait,
                                   (double)(cur_ieps - last_ieps) / (double)time_to_wait,
@@ -572,7 +572,7 @@ int main() {
         num_total_returned_neighbours += num_returned_neighbours;
 
         if (num_total_returned_neighbours > 0) {
-            avg_search_distance /= (DISTANCE_TYPE)num_total_returned_neighbours;
+            avg_search_distance /= (double)num_total_returned_neighbours;
         } else if (avg_search_distance > 0) {
             DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_TEST, "Error: no neighbours returned but avg distance is not 0!");
             avg_search_distance = 0;
@@ -644,7 +644,7 @@ int main() {
     if (collect_avg_distances) {
         ExclusiveBenchLog("------------------------");
 
-        BenchLog("Average Search Distance: " DTYPE_FMT, avg_search_distance);
+        BenchLog("Average Search Distance: " DTYPE_FMT, (divftree::DTYPE)avg_search_distance);
     }
 
     ExclusiveBenchLog("\n___________________________________________\n");

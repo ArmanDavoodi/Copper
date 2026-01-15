@@ -111,6 +111,12 @@ struct DIVFTreeAttributes {
     }
 };
 
+enum class DuplicateState : uint8_t {
+    UNIQUE = 0,
+    DUPLICATE_NOT_INSERTED = 1,
+    DUPLICATE_INSERTED = 2
+};
+
 class DIVFTreeVertexInterface {
 public:
     DIVFTreeVertexInterface() = default;
@@ -122,7 +128,9 @@ public:
     virtual void Unpin() = 0;
     virtual void MarkForRecycle(uint64_t pinCount) = 0;
 
-    virtual RetStatus BatchInsert(const ConstVectorBatch& batch, uint16_t marked_for_update = INVALID_OFFSET) = 0;
+    virtual RetStatus BatchInsert(const ConstVectorBatch& batch, DuplicateState* dup_state,
+                                  uint16_t num_duplicates_found, uint16_t checked_offset,
+                                  uint16_t marked_for_update = INVALID_OFFSET) = 0;
     virtual RetStatus ChangeVectorState(VectorID target, uint16_t targetOffset,
                                         VectorState& expectedState, VectorState finalState,
                                         Version* version = nullptr) = 0;
@@ -131,6 +139,9 @@ public:
     virtual void Search(const VTYPE* query, size_t k,
                         SortedList<ANNVectorInfo, SimilarityComparator>* neighbours,
                         std::unordered_set<std::pair<VectorID, Version>, VectorIDVersionPairHash>& seen) = 0;
+    virtual void Exists(const ConstVectorBatch batch, uint16_t expected_size, DuplicateState* dup_state,
+                        uint16_t& num_found, DuplicateState set_if_found,
+                        uint16_t checked_for_duplicates = UINT16_MAX) = 0;
 
     virtual VectorID CentroidID() const = 0;
     virtual Version VertexVersion() const = 0;

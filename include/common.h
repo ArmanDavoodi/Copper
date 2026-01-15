@@ -428,6 +428,7 @@ constexpr Address INVALID_ADDRESS = nullptr;
 enum class ClusteringType : int8_t {
     Invalid,
     RoundRobin,
+    KMeans,
     PCA1,
     GradientDescentLinearRegression, // GDLR
     /* first use a 2-mean(as in k mean) and if it produced higly imbalanced clusters use PCA1 or something becuase it usually means that the cluster */
@@ -438,7 +439,7 @@ enum class ClusteringType : int8_t {
     NumTypes
 };
 inline constexpr char* CLUSTERING_TYPE_NAME[(int8_t)(ClusteringType::NumTypes) + 1] =
-    {"Invalid", "RoundRobin", "PCA1", "GradientDescentLinearRegression", "KMeansWithFallBackPCA1",
+    {"Invalid", "RoundRobin", "KMeans", "PCA1", "GradientDescentLinearRegression", "KMeansWithFallBackPCA1",
      "KMeansWithFallBackGDLR", "OutLierDetectionThenKMeansWithFallBackPCA1",
      "OutLierDetectionThenKMeansWithFallBackGDLR", "NumTypes"};
 inline constexpr bool IsValid(ClusteringType type) {
@@ -447,6 +448,8 @@ inline constexpr bool IsValid(ClusteringType type) {
 inline constexpr ClusteringType CLUSTERING_NAME_TO_ENUM(const char * const name) {
     if (!strcmp(name, "RoundRobin")) {
         return ClusteringType::RoundRobin;
+    } else if (!strcmp(name, "KMeans")) {
+        return ClusteringType::KMeans;
     } else if (!strcmp(name, "PCA1")) {
         return ClusteringType::PCA1;
     } else if (!strcmp(name, "GradientDescentLinearRegression")) {
@@ -730,11 +733,11 @@ might cause deadlock or unnecessary errors*/
 
 #ifndef VECTOR_TYPE
 #define VECTOR_TYPE uint16_t
+typedef uint16_t VTYPE;
+typedef uint32_t DTYPE;
+typedef uint64_t MVTYPE;
 #define VTYPE_FMT "%hu"
-#endif
-#ifndef DISTANCE_TYPE
-#define DISTANCE_TYPE double
-#define DTYPE_FMT "%lf"
+#define DTYPE_FMT "%u"
 #endif
 
 /* todo: use cpuid to get cahceline size */
@@ -778,10 +781,6 @@ inline constexpr const void* ALIGNED_PTR(const void* ptr, size_t align_bytes = C
 
 #define VECTORID_LOG_FMT "%s%lu(%lu, %lu, %lu)"
 #define VECTORID_LOG(vid) (!((vid).IsValid()) ? "[INV]" : ""), (vid)._id, (vid)._creator_node_id, (vid)._level, (vid)._val
-
-typedef VECTOR_TYPE VTYPE;
-typedef DISTANCE_TYPE DTYPE;
-
 struct ANNVectorInfo {
     DTYPE distance_to_query;
     VectorID id;

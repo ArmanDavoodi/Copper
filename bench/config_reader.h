@@ -225,7 +225,7 @@ void ParseConfigs() {
         vit = var_configs.find("leaf-block-size");
         if (vit != var_configs.end()) {
             if (!parseUnsignedInt(vit->second, index_attr.leaf_blck_size) ||
-                index_attr.leaf_blck_size < index_attr.dimension * sizeof(divftree::VTYPE)) {
+                (index_attr.leaf_blck_size == 0) || (index_attr.leaf_blck_size > index_attr.leaf_max_size)) {
                 throw std::runtime_error("Invalid leaf block size!");
             }
         } else {
@@ -235,7 +235,7 @@ void ParseConfigs() {
         vit = var_configs.find("internal-block-size");
         if (vit != var_configs.end()) {
             if (!parseUnsignedInt(vit->second, index_attr.internal_blck_size) ||
-                index_attr.internal_blck_size < index_attr.dimension * sizeof(divftree::VTYPE)) {
+                (index_attr.internal_blck_size == 0) || (index_attr.internal_blck_size > index_attr.internal_max_size)) {
                 throw std::runtime_error("Invalid internal block size!");
             }
         } else {

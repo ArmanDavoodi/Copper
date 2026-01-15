@@ -7,10 +7,10 @@ CONF_FILE="bench/run.conf"
 
 VAR_LOG_OUTPUT_PATH=$ROOT/bench/out/logs/
 
-VAR_CLUSTERING="RoundRobin"
+VAR_CLUSTERING="KMeans"
 VAR_LEAF_SIZE=(128 1024)
 VAR_INTERNAL_SIZE=(128 1024)
-# VAR_LEAF_SIZE=(2 8)
+# VAR_LEAF_SIZE=(1 8)
 # VAR_INTERNAL_SIZE=(1 4)
 VAR_LEAF_SPLIT=2
 VAR_INTERNAL_SPLIT=2
@@ -47,10 +47,11 @@ VAR_NUM_BG_COMPACTOR_THREADS=18
 #todo: add numa ctl and bind threads
 
 VAR_WRITE_RATIO=10 #10% of queries are updates
-VAR_DELETE_RATIO=50
+VAR_DELETE_RATIO=0
 # VAR_DELETE_RATIO=50  #50% of update queries are deletions
 # todo: what about deletions?
 
+# VAR_BATCH_SIZE=$(( 4 )) #num embeddings read from disk at once during build
 # VAR_BUILT_SIZE=$(( 64 )) #num embedings to insert during build
 # VAR_WARMUP_TIME_SEC=10 #only search
 # VAR_RUN_TIME_SEC=10 #real test used for stat collection

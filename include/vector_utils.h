@@ -317,7 +317,60 @@ struct VectorBatch {
     VectorID* id = nullptr;
     Version* version = nullptr;
     uint16_t size = 0;
+    uint16_t capacity = 0;
+
+    void Resize(uint16_t new_cap, bool is_leaf, uint16_t dim) {
+        FatalAssert(new_cap > 0, LOG_TAG_BASIC, "New capacity must be greater than 0.");
+        if (new_cap == capacity) {
+            return;
+        }
+
+        VTYPE* new_data = new VTYPE[new_cap * dim];
+        VectorID* new_id = new VectorID[new_cap];
+        Version* new_version = nullptr;
+        if (!is_leaf) {
+            new_version = new Version[new_cap];
+        }
+
+        uint16_t copy_size = std::min(size, new_cap);
+        if (data != nullptr) {
+            memcpy((void*)new_data, (void*)data, copy_size * dim * sizeof(VTYPE));
+            delete[] data;
+        }
+        if (id != nullptr) {
+            memcpy((void*)new_id, (void*)id, copy_size * sizeof(VectorID));
+            delete[] id;
+        }
+        if (version != nullptr) {
+            FatalAssert(!is_leaf, LOG_TAG_BASIC, "Version array should not exist for leaf nodes.");
+            memcpy((void*)new_version, (void*)version, copy_size * sizeof(Version));
+            delete[] version;
+        }
+
+        data = new_data;
+        id = new_id;
+        version = new_version;
+        size = copy_size;
+        capacity = new_cap;
+    }
 };
+
+template<typename T>
+inline void ResizeArray(T*& array, uint16_t size, uint16_t new_cap) {
+    FatalAssert(new_cap > 0, LOG_TAG_BASIC, "New capacity must be greater than 0.");
+    if (new_cap == size) {
+        return;
+    }
+
+    T* new_array = new T[new_cap];
+    if (array != nullptr) {
+        uint16_t copy_size = std::min(size, new_cap);
+        memcpy(new_array, array, copy_size * sizeof(T));
+        delete[] array;
+    }
+
+    array = new_array;
+}
 
 /* this struct is always moved and never copied! */
 struct ConstVectorBatch {

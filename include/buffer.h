@@ -297,7 +297,7 @@ public:
     inline void PinVertexVersion(VectorID vertexId, Version version);
     inline void UnpinVertexVersion(VectorID vertexId, Version version);
 
-    inline VectorLocation LoadCurrentVectorLocation(VectorID vectorId);
+    inline VectorLocation LoadCurrentVectorLocation(VectorID vectorId, bool return_invalid_if_created = true);
 
     /*
      * The caller has to handle pinVersion and UnpinVersion for the container clusters.

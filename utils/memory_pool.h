@@ -63,7 +63,7 @@ public:
 
 class LocalMemoryPool : public MemoryPool {
 public:
-    LocalMemoryPool(size_t leaf_size, size_t internal_size, size_t pool_size) :
+    LocalMemoryPool(size_t internal_size, size_t leaf_size, size_t pool_size) :
         leafObjectSize(leaf_size), internalObjectSize(internal_size),
         leafSlotSize(ALIGNED_SIZE(sizeof(SlotMeta)) + ALIGNED_SIZE(leaf_size)),
         internalSlotSize(ALIGNED_SIZE(sizeof(SlotMeta)) + ALIGNED_SIZE(internal_size)), poolSize(pool_size),
@@ -167,6 +167,8 @@ public:
 #endif
 
     void* Allocate(SlotType type, AllocationFlags flags = {.value = 0}) override {
+        // return std::aligned_alloc(CACHE_LINE_SIZE,
+        //                                (type == SlotType::Leaf ? leafObjectSize : internalObjectSize));
         Slot* slot_ptr = nullptr;
         bool success = false;
         size_t objectSize;
@@ -471,6 +473,7 @@ public:
 
     void Free(void* ptr) override {
         CHECK_NOT_NULLPTR(ptr, LOG_TAG_MEMORY);
+        // std::free(ptr);
         FatalAssert(ALIGNED(ptr), LOG_TAG_MEMORY, "Slot data is not properly aligned");
         Slot* slot_ptr = reinterpret_cast<Slot*>(
             reinterpret_cast<uintptr_t>(ptr) - ALIGNED_SIZE(sizeof(SlotMeta)));

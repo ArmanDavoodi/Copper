@@ -16,10 +16,12 @@
 #undef DTYPE_FMT
 #endif
 
-#define VECTOR_TYPE uint8_t
-#define VTYPE_FMT "%hhu"
-#define DISTANCE_TYPE uint32_t
-#define DTYPE_FMT "%u"
+#define UINT8 1
+#define UINT16 2
+#define UINT32 3
+#define FLOAT 4
+
+#define VECTOR_TYPE UINT8
 
 #define DIMENSION ((uint16_t)3)
 #define DISTANCE_ALG (divftree::DistanceType::L2)

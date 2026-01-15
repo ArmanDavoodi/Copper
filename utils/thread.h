@@ -63,7 +63,8 @@ inline thread_local Thread* threadSelf = nullptr;
 
 class Thread {
 public:
-    Thread(uint32_t random_perc) : _parent_id((threadSelf == nullptr) ? INVALID_DIVF_THREAD_ID : threadSelf->ID()),
+    Thread(uint32_t random_perc) : centroid_compute_buffer(nullptr),
+                                   _parent_id((threadSelf == nullptr) ? INVALID_DIVF_THREAD_ID : threadSelf->ID()),
                                    _id(nextId.fetch_add(1)), _done(true), _safty_net(false), _thrd(nullptr),
                                    _gen(DIVF_SEED), _gen64(DIVF_SEED), _uniform_dist(1, random_perc),
                                    _next_task_id(0) {}
@@ -114,6 +115,13 @@ public:
         _done.store(false, std::memory_order_release);
     }
 
+    inline void InitDIVFThread(uint16_t dim) {
+        InitDIVFThread();
+        FatalAssert(centroid_compute_buffer == nullptr, LOG_TAG_THREAD,
+                    "centroid compute buffer should not be initialized yet!");
+        centroid_compute_buffer = new MVTYPE[dim * 2];
+    }
+
     /* should be the last thing called before exiting the thread */
     inline void DestroyDIVFThread() {
         FatalAssert(threadSelf == this, LOG_TAG_THREAD, "thread is not inited!");
@@ -125,6 +133,10 @@ public:
                     LOG_TAG_THREAD, "the thread itself should call this function");
         DIVFLOG(LOG_LEVEL_DEBUG, LOG_TAG_THREAD, "Destroying thread %p - ID:%lu - parent:%lu", this, _id, _parent_id);
         threadSelf = nullptr;
+        if (centroid_compute_buffer != nullptr) {
+            delete[] centroid_compute_buffer;
+            centroid_compute_buffer = nullptr;
+        }
         _safty_net.store(true, std::memory_order_release);
 #ifdef HANG_DETECTION
         all_threads_lock.lock();
@@ -450,6 +462,7 @@ public:
     static inline std::vector<Thread*> all_threads;
     static inline std::mutex all_threads_lock;
 #endif
+    MVTYPE* centroid_compute_buffer;
 
 protected:
     static inline std::atomic<DIVFThreadID> nextId = 0;
