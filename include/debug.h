@@ -609,6 +609,7 @@ inline void Log(LOG_LEVELS level, uint64_t tag, const Log_Msg& msg,
 #endif
 #else
 
+#define SANITY_CHECK(codeBlock...)
 #define DIVFLOG_ELINE()
 #define DIVFLOG(level, tag, msg, ...)
 #define DIVFLOG_IF_TRUE(cond, level, tag, msg, ...)

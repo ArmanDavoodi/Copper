@@ -1,3 +1,6 @@
 [submodule "third_party/moodycamel/concurrentqueue"]
 	path = third_party/moodycamel/concurrentqueue
 	url = https://github.com/cameron314/concurrentqueue.git
+[submodule "third_party/index/hnswlib"]
+	path = third_party/index/hnswlib
+	url = https://github.com/nmslib/hnswlib
