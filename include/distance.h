@@ -25,6 +25,18 @@ inline constexpr DTYPE Distance(const VTYPE* a, const VTYPE* b, uint16_t dim) {
     return static_cast<DTYPE>(dist);
 }
 
+inline constexpr DTYPE Distance(const VTYPE* a, const MVTYPE* b, uint16_t dim) {
+    CHECK_NOT_NULLPTR(a, LOG_TAG_BASIC);
+    CHECK_NOT_NULLPTR(b, LOG_TAG_BASIC);
+
+    DTYPE dist = 0;
+    for (size_t i = 0; i < dim; ++i) {
+        const DTYPE abs = static_cast<DTYPE>(a[i]) - static_cast<DTYPE>(b[i]);
+        dist += abs * abs;
+    }
+    return static_cast<DTYPE>(dist);
+}
+
 /* todo: A better method(compared to passing a pointer) to allow inlining for optimization */
 inline constexpr int MoreSimilar(const DTYPE& a, const DTYPE& b) {
     return (a == b ? 0 : (a < b ? 1 : -1));
@@ -254,6 +266,17 @@ inline void ComputeCentroids(const VTYPE* cluster_vectors, const VTYPE* batch_ve
 
 
 inline constexpr DTYPE Distance(const VTYPE* a, const VTYPE* b, uint16_t dim, DistanceType distanceAlg) {
+    switch (distanceAlg) {
+    case DistanceType::L2:
+        return L2::Distance(a, b, dim);
+    default:
+        DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC,
+             "Distance: Invalid distance type: %s", DISTANCE_TYPE_NAME[(int8_t)distanceAlg]);
+    }
+    return 0; // Return 0 if the distance type is invalid
+}
+
+inline constexpr DTYPE Distance(const VTYPE* a, const MVTYPE* b, uint16_t dim, DistanceType distanceAlg) {
     switch (distanceAlg) {
     case DistanceType::L2:
         return L2::Distance(a, b, dim);

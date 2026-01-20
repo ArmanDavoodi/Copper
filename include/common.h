@@ -336,6 +336,21 @@ union Version {
     }
 };
 
+struct IVFVectorID {
+    uint64_t vector_hash;
+    uint32_t value;
+
+    inline bool operator==(const IVFVectorID& other) const {
+        return (vector_hash == other.vector_hash) && (value == other.value);
+    }
+
+    inline bool operator!=(const IVFVectorID& other) const {
+        return (vector_hash != other.vector_hash) || (value != other.value);
+    }
+};
+
+constexpr IVFVectorID INVALID_IVF_VECTOR_ID = {UINT64_MAX, UINT32_MAX};
+
 template<uint8_t bits>
 constexpr inline uint64_t GET_HALF_MASK() {
     if (bits == 1) {
@@ -380,34 +395,82 @@ constexpr inline uint64_t GET_MASK() {
     return (uint64_t)0;
 }
 
+typedef uint64_t VectorDataHash;
+
+inline uint32_t splitmix32(uint32_t x) {
+    x += 0x9e3779b9;
+    x = (x ^ (x >> 16)) * 0x85ebca6b;
+    x = (x ^ (x >> 13)) * 0xc2b2ae35;
+    return x ^ (x >> 16);
+}
+
+inline uint64_t splitmix64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+inline uint64_t wycombine(uint64_t a, uint64_t b) {
+    a ^= b;
+    a *= 0xd6e8feb86659fd93ULL;
+    a ^= a >> 32;
+    return a;
+}
+
 struct VersionHash {
-    size_t operator()(const Version& p) const {
-        return std::hash<uint32_t>()(p._raw);
+    inline size_t operator()(const Version& p) const {
+        return splitmix32(p._raw);
     }
 };
 
 struct VectorIDHash {
-    size_t operator()(const VectorID& p) const {
-        return std::hash<uint64_t>()(p._id);
+    inline size_t operator()(const VectorID& p) const {
+        return splitmix64(p._id);
+    }
+};
+
+struct VectorIDCMP {
+    inline int operator()(const VectorID& a, const VectorID& b) const {
+        if (a < b) {
+            return -1;
+        } else if (a > b) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+};
+
+struct VectorIDVersionPairCMP {
+    inline int operator()(const std::pair<VectorID, Version>& a, const std::pair<VectorID, Version>& b) const {
+        if (a.first < b.first) {
+            return -1;
+        } else if (a.first > b.first) {
+            return 1;
+        } else {
+            if (a.second < b.second) {
+                return -1;
+            } else if (a.second > b.second) {
+                return 1;
+            } else {
+                return 0;
+            }
+        }
     }
 };
 
 struct VectorIDVersionPairHash {
-    size_t operator()(const std::pair<VectorID, Version>& p) const {
+    inline size_t operator()(const std::pair<VectorID, Version>& p) const {
         if (p.first.IsCentroid()) {
-            /*
-             * use the first 4 bits of level as level will not exceed 10
-             * use the first 4 bits of creator Id as we won't have too many nodes in our tests
-             * use all 48 bits of valud
-             * use the first 1 byte of version as it is highly unlikely to have two versions with 256 or more distance
-             * in the same function
-             */
-            return ((((((p.first._creator_node_id & GET_HALF_MASK<4>()) << 4) |
-                    (p.first._level & GET_HALF_MASK<4>()) << 48) |
-                    p.first._val) << 8) |
-                    (p.second._raw & GET_MASK<1>()));
+            uint64_t h = wycombine(p.first._id, p.second._raw);
+
+            h ^= h >> 30; h *= 0xbf58476d1ce4e5b9ULL;
+            h ^= h >> 27; h *= 0x94d049bb133111ebULL;
+            h ^= h >> 31;
+            return h;
         } else {
-            return std::hash<uint64_t>()(p.first._id);
+            return splitmix64(p.first._id);
         }
     }
 };

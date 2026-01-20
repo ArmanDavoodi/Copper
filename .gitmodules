@@ -4,3 +4,6 @@
 [submodule "third_party/index/hnswlib"]
 	path = third_party/index/hnswlib
 	url = https://github.com/nmslib/hnswlib
+[submodule "third_party/xxhash"]
+	path = third_party/xxhash
+	url = https://github.com/redspah/xxhash_cpp
