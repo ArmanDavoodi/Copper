@@ -43,6 +43,7 @@ public:
     }
 
     void Rehash(size_t new_num_buckets) {
+        FatalAssert(false, LOG_TAG_NOT_IMPLEMENTED, "VectorDirectory::Rehash() not currently supported!");
         if (new_num_buckets == buckets.size() || new_num_buckets < MIN_NUM_BUCKETS) {
             return;
         }
@@ -62,11 +63,23 @@ public:
         buckets = std::move(new_buckets);
     }
 
-    uint64_t GetVectorHash(const VTYPE* vector) const {
+    inline uint64_t GetVectorHash(const VTYPE* vector) const {
         return xxh::xxhash3<64>(reinterpret_cast<const uint8_t*>(vector), dimension * sizeof(VTYPE));
     }
 
-    IVFVectorID Insert(const VTYPE* vector, bool fail_if_duplicate, bool* is_duplicate = nullptr) {
+    inline size_t GetNumBuckets() const {
+        return buckets.size();
+    }
+
+    inline size_t GetNumLocks() const {
+        return locks.size();
+    }
+
+    inline size_t GetLockIndex(uint64_t vector_hash) const {
+        return (vector_hash % buckets.size()) % locks.size();
+    }
+
+    inline IVFVectorID Insert(const VTYPE* vector, bool fail_if_duplicate, bool* is_duplicate = nullptr) {
         return Insert(GetVectorHash(vector), vector, fail_if_duplicate, is_duplicate);
     }
 
@@ -86,6 +99,7 @@ public:
                         return INVALID_IVF_VECTOR_ID;
                     } else {
                         ++((*node)->num_duplicates);
+                        ++num_vectors;
                         return ((*node)->id);
                     }
                 } else {
@@ -105,7 +119,8 @@ public:
         (*node)->info.vector = nullptr;
         (*node)->next = head;
         head = *node;
-        size++;
+        ++size;
+        ++num_vectors;
 
         if (size > buckets.size() * MAX_VECTOR_PER_BUCKET_RATIO) {
             Rehash(buckets.size() * RESIZE_STEP);
@@ -136,28 +151,29 @@ public:
     }
 
     void LockVector(uint64_t vector_hash, LockMode mode) {
-        size_t lock_idx = vector_hash % locks.size();
+        size_t lock_idx = GetLockIndex(vector_hash);
         locks[lock_idx].Lock(mode);
     }
 
     bool TryLockVector(uint64_t vector_hash, LockMode mode) {
-        size_t lock_idx = vector_hash % locks.size();
+        size_t lock_idx = GetLockIndex(vector_hash);
         return locks[lock_idx].TryLock(mode);
     }
 
     void UnlockVector(uint64_t vector_hash) {
-        size_t lock_idx = vector_hash % locks.size();
+        size_t lock_idx = GetLockIndex(vector_hash);
         locks[lock_idx].Unlock();
     }
 
-    size_t Size() const {
-        return size;
+    size_t Size(bool unique = false) const {
+        return (unique ? size : num_vectors);
     }
 
 protected:
     const uint16_t dimension;
     std::vector<SXSpinLock> locks;
     size_t size;
+    size_t num_vectors;
     VectorDirectoryNode* head;
     std::vector<VectorDirectoryNode*> buckets;
 };

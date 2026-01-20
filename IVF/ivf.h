@@ -14,6 +14,18 @@
 
 namespace divftree {
 
+struct L2DTYPEIDPairCMP {
+    inline int operator()(const std::pair<DTYPE, IVFVectorID>& a,
+                          const std::pair<DTYPE, IVFVectorID>& b) const {
+        return L2::MoreSimilar(a.first, b.first);
+    }
+
+    inline int operator()(const std::pair<DTYPE, VectorID>& a,
+                          const std::pair<DTYPE, VectorID>& b) const {
+        return L2::MoreSimilar(a.first, b.first);
+    }
+};
+
 struct IVFCluster {
     VectorID centroid_id;
     union {
@@ -37,6 +49,10 @@ public:
         if (dim == 0) {
             DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "IVFIndex dimension cannot be zero!");
         }
+
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
+                "IVFIndex created with dimension %hu, max vectors %zu, and %zu locks.",
+                dim, max_vectors, num_locks);
     }
 
     ~IVFIndex() {}
@@ -58,6 +74,12 @@ public:
             }
         }
 
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
+                "Starting IVFIndex::Build() with %zu data points, %zu clusters, %zu max iterations, "
+                "%s duplicate insertion, and %zu threads.",
+                num_points, num_clusters, max_iterations,
+                insert_duplicates ? "allowing" : "disallowing", num_threads);
+
         clusters.resize(num_clusters);
         ClearClusterData();
         memset(out_vector_ids, UINT8_MAX, num_points * sizeof(IVFVectorID));
@@ -68,6 +90,8 @@ public:
         SXSpinLock* cluster_build_locks = new SXSpinLock[num_clusters];
         MVTYPE* temp_storage = new MVTYPE[dim * clusters.size() * num_threads];
         size_t* cluster_sizes = new size_t[clusters.size() * num_threads];
+
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Choosing the first centroids from the existing data points...");
         for (size_t c = 0; c < num_clusters; c++) {
             FatalAssert(data_seen < num_points, LOG_TAG_BASIC,
                         "Not enough unique data points to initialize centroids!");
@@ -99,25 +123,121 @@ public:
             clusters[c].num_points = 1;
             clusters[c].data = nullptr;
             info->centroid_id = clusters[c].centroid_id;
+
+            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%zu-th vector was chosen as the %zu-th centroid.", data_seen, c);
             data_seen++;
         }
 
-        std::vector<Thread> builder_threads;
+        std::vector<Thread*> builder_threads;
+        std::atomic<size_t>* current_size = new std::atomic<size_t>[clusters.size()];
+        for (size_t c = 0; c < clusters.size(); c++) {
+            current_size[c].store(0, std::memory_order_relaxed);
+        }
         if (num_threads == 1) {
             SequentialBuild(data, data_seen, num_points, distances, valid,
-                            insert_duplicates, out_vector_ids, temp_storage, cluster_sizes,
+                            insert_duplicates, out_vector_ids, temp_storage, cluster_sizes, current_size,
                             max_iterations);
         } else {
             builder_threads.reserve(num_threads - 1);
             uint64_t thread_range = (num_points / num_threads);
-            
+            uint64_t thread_step = std::max(1lu, thread_range / 8lu);
+            std::atomic<size_t> seen_idx(data_seen);
+            std::atomic<bool> converged(true);
+            std::barrier<> sync_point(num_threads);
+            for (size_t t = 1; t < num_threads; t++) {
+                builder_threads.emplace_back(new Thread(100));
+                Thread* thrd = builder_threads.back();
+                thrd->StartMemberFunction(&IVFIndex::ParallelBuilder, this, data, seen_idx, num_points,
+                                         thread_step, distances + (t * clusters.size()), valid, insert_duplicates,
+                                         out_vector_ids, cluster_build_locks,
+                                         temp_storage + (t * dim * clusters.size()),
+                                         cluster_sizes + (t * clusters.size()), &sync_point, &converged,
+                                         current_size, max_iterations);
+            }
+            ParallelBuild(data, seen_idx, num_points, thread_step, distances,
+                          valid, insert_duplicates, out_vector_ids, cluster_build_locks,
+                          temp_storage, cluster_sizes, true, &sync_point, &converged, current_size, max_iterations);
+
+            for (Thread* t : builder_threads) {
+                delete t;
+            }
+            builder_threads.clear();
         }
+
+        delete[] distances;
+        delete[] valid;
+        delete[] cluster_build_locks;
+        delete[] temp_storage;
+        delete[] cluster_sizes;
+        delete[] current_size;
+
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "IVFIndex::Build() completed successfully with %zu unique vectors and"
+                "%lu total size.", vectorDirectory.Size(true), vectorDirectory.Size());
+        size = vectorDirectory.Size();
+        return RetStatus::Success();
     }
 
-    RetStatus ANNSearch(const VTYPE* query, size_t k,
-                        std::vector<std::pair<DTYPE, VectorID>>& neighbours) {
-        DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_NOT_IMPLEMENTED, "IVFIndex ANNSearch() not implemented!");
-        return RetStatus::Fail(nullptr);
+    RetStatus ANNSearch(const VTYPE* query, size_t k, size_t nprobe,
+                        std::vector<std::pair<DTYPE, IVFVectorID>>& neighbours) {
+        if (query == nullptr || k == 0 || nprobe == 0) {
+            FatalAssert(false, LOG_TAG_BASIC, "Invalid arguments to IVFIndex::ANNSearch()");
+            return RetStatus::Fail("Invalid arguments to IVFIndex::ANNSearch()");
+        }
+
+        if (clusters.empty() || size == 0) {
+            FatalAssert(false, LOG_TAG_BASIC, "Index is not built yet!");
+            return RetStatus::Fail("Index is not built yet!");
+        }
+
+        if (nprobe > clusters.size()) {
+            DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_BASIC,
+                    "nprobe (%zu) is greater than the number of clusters (%zu). Reducing nprobe to %zu.",
+                    nprobe, clusters.size(), clusters.size());
+            nprobe = clusters.size();
+        }
+
+        if (neighbours.size() > 0) {
+            DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_BASIC,
+                    "Output neighbours vector is not empty. Clearing previous contents.");
+            neighbours.clear();
+        }
+
+        SortedList<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP> topk_list(L2DTYPEIDPairCMP(), std::move(neighbours));
+        SortedList<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP> closest_centroids(L2DTYPEIDPairCMP(), nprobe);
+
+        for (size_t c = 0; c < clusters.size(); c++) {
+            closest_centroids.Insert(std::make_pair(Distance(query, clusters[c].centroid, dim, DistanceType::L2),
+                                                    clusters[c].centroid_id));
+            if (closest_centroids.Size() > nprobe) {
+                closest_centroids.PopBack();
+            }
+        }
+
+        for (const auto& cent : closest_centroids) {
+            size_t cent_idx = cent.second._val;
+            FatalAssert(cent_idx < clusters.size(), LOG_TAG_BASIC,
+                        "Invalid centroid index found during ANNSearch()");
+            size_t num_points = clusters[cent_idx].num_points;
+            if (num_points == 0 || clusters[cent_idx].data == nullptr) {
+                continue;
+            }
+
+            for (size_t p = 0; p < num_points; p++) {
+                void* v_off =
+                    reinterpret_cast<void*>(clusters[cent_idx].data +
+                        (p * (sizeof(IVFVectorID) + (dim * sizeof(VTYPE)))));
+                IVFVectorID vid = *(reinterpret_cast<IVFVectorID*>(v_off));
+                VTYPE* vector = reinterpret_cast<VTYPE*>(v_off + sizeof(IVFVectorID));
+                DTYPE dist = Distance(query, vector, dim, DistanceType::L2);
+                topk_list.Insert(std::make_pair(dist, vid));
+                if (topk_list.Size() > k) {
+                    topk_list.PopBack();
+                }
+            }
+        }
+
+        topk_list.Extract(neighbours);
+        return RetStatus::Success();
     }
 
 protected:
@@ -141,6 +261,7 @@ protected:
                                         bool* is_valid, bool insert_duplicates, IVFVectorID* out_vector_ids) {
         FatalAssert(start_idx < end_idx, LOG_TAG_BASIC,
                     "Invalid start and end indices for PartialFirstAssignments()");
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "First Assignments from %zu to %zu...", start_idx, end_idx);
         bool duplicate = false;
         for (size_t i = start_idx; i < end_idx; i++) {
             FatalAssert(out_vector_ids[i] == INVALID_IVF_VECTOR_ID, LOG_TAG_BASIC,
@@ -168,7 +289,7 @@ protected:
                 DTYPE dist = Distance(data + (i * dim), clusters[c].centroid_tmp, dim, DistanceType::L2);
                 FatalAssert(dist > 0, LOG_TAG_BASIC,
                             "Distance computation returned 0!");
-                if (MoreSimilar(dist, distances[i], DistanceType::L2)) {
+                if (MoreSimilar(dist, distances[i], DistanceType::L2) > 0) {
                     distances[i] = dist;
                     closest_idx = c;
                 }
@@ -185,6 +306,7 @@ protected:
                                    std::atomic<bool>* converged) {
         FatalAssert(start_idx < end_idx, LOG_TAG_BASIC,
                     "Invalid start and end indices for PartialAssignments()");
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Assignments from %zu to %zu...", start_idx, end_idx);
         for (size_t i = start_idx; i < end_idx; i++) {
             if (!is_valid[i]) {
                 continue;
@@ -201,7 +323,7 @@ protected:
                 DTYPE dist = Distance(data + (i * dim), clusters[c].centroid_tmp, dim, DistanceType::L2);
                 FatalAssert(dist > 0, LOG_TAG_BASIC,
                             "Distance computation returned 0!");
-                if (MoreSimilar(dist, distances[i], DistanceType::L2)) {
+                if (MoreSimilar(dist, distances[i], DistanceType::L2) > 0) {
                     distances[i] = dist;
                     closest_idx = c;
                 }
@@ -217,6 +339,8 @@ protected:
     inline void PartialUpdateCentroids(const VTYPE* data, size_t start_idx, size_t end_idx, const bool* is_valid,
                                        const IVFVectorID* out_vector_ids, SXSpinLock* cluster_locks,
                                        MVTYPE* temp_storage, size_t* cluster_sizes) {
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Updating Centroids by checking vectors %zu to %zu...",
+                start_idx, end_idx);
         memset(temp_storage, 0, sizeof(MVTYPE) * dim * clusters.size());
         memset(cluster_sizes, 0, sizeof(size_t) * clusters.size());
 
@@ -382,6 +506,7 @@ protected:
                              std::atomic<size_t>* current_size) {
         FatalAssert(start_idx < end_idx, LOG_TAG_BASIC,
                     "Invalid start and end indices for PartialStore()");
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Storing vectors from %zu to %zu...", start_idx, end_idx);
         for (size_t i = start_idx; i < end_idx; i++) {
             if (!is_valid[i]) {
                 continue;
@@ -395,7 +520,11 @@ protected:
             info->offset = current_size[c_idx].fetch_add(1);
             FatalAssert(info->offset < clusters[c_idx].num_points, LOG_TAG_BASIC,
                         "Cluster data offset exceeded allocated size!");
-            info->vector = reinterpret_cast<VTYPE*>(clusters[c_idx].data) + (info->offset * dim);
+            void* add =
+                reinterpret_cast<void*>(clusters[c_idx].data) + (i * (sizeof(IVFVectorID) + (dim * sizeof(VTYPE))));
+            info->vector = reinterpret_cast<VTYPE*>(add + sizeof(IVFVectorID));
+
+            memcpy(add, &out_vector_ids[i], sizeof(IVFVectorID));
             memcpy(info->vector, data + (i * dim), sizeof(VTYPE) * dim);
         }
     }
@@ -431,11 +560,19 @@ protected:
         for (size_t c = 0; c < clusters.size(); c++) {
             FatalAssert(clusters[c].num_points > 0, LOG_TAG_BASIC,
                         "Cluster has no points assigned to it!");
+            String centroid_data = "[";
             for (size_t d = 0; d < dim; d++) {
                 clusters[c].centroid_tmp[d] =
                     static_cast<MVTYPE>(clusters[c].centroid_tmp[d] / static_cast<MVTYPE>(clusters[c].num_points));
+                centroid_data += String(MVTYPE_FMT "%s", clusters[c].centroid_tmp[d],
+                                       (d + 1 == dim) ? "]" : ", ");
             }
+            DIVFLOG(LOG_LEVEL_DEBUG, LOG_TAG_BASIC,
+                    "Centroid %zu has %zu points assigned to it. Centroid data: %s",
+                    c, clusters[c].num_points, centroid_data.ToCStr());
         }
+
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "First iteration completed.");
 
         bool wait_until_converged = (max_iterations == 0);
         std::atomic<bool> converged = true;
@@ -457,12 +594,23 @@ protected:
                         static_cast<MVTYPE>(clusters[c].centroid_tmp[d] / static_cast<MVTYPE>(clusters[c].num_points));
                 }
             }
+            if (wait_until_converged) {
+                DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%zu%s iteration completed. converged: %s",
+                        i + 2, (i == 0 ? "ed" : "th"), converged.load(std::memory_order_relaxed) ? "true" : "false");
+            } else {
+                DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%zu/%zu iteration completed. converged: %s",
+                        i + 2, max_iterations, converged.load(std::memory_order_relaxed) ? "true" : "false");
+            }
         }
+
+
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Clustering completed. Finalizing centroids and storing data...");
 
         for (size_t c = 0; c < clusters.size(); c++) {
             FatalAssert(clusters[c].num_points > 0, LOG_TAG_BASIC,
                         "Cluster has no points assigned to it!");
             VTYPE* final_centroid = new VTYPE[dim];
+            String centroid_data = "[";
             for (size_t d = 0; d < dim; d++) {
                 if (converged.load(std::memory_order_relaxed)) {
                     final_centroid[d] = static_cast<VTYPE>(clusters[c].centroid_tmp[d]);
@@ -470,10 +618,15 @@ protected:
                     final_centroid[d] = static_cast<VTYPE>(clusters[c].centroid_tmp[d] /
                                                             static_cast<MVTYPE>(clusters[c].num_points));
                 }
+                centroid_data += String(VTYPE_FMT "%s", final_centroid[d],
+                                       (d + 1 == dim) ? "]" : ", ");
             }
             delete[] clusters[c].centroid_tmp;
             clusters[c].centroid = final_centroid;
-            clusters[c].data = new char[clusters[c].num_points * dim * sizeof(VTYPE)];
+            clusters[c].data = new char[clusters[c].num_points * ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID))];
+            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
+                    "Finalized centroid %zu with %zu points. Centroid data: %s",
+                    c, clusters[c].num_points, centroid_data.ToCStr());
         }
 
 
@@ -501,11 +654,18 @@ protected:
             for (size_t c = 0; c < clusters.size(); c++) {
                 FatalAssert(clusters[c].num_points > 0, LOG_TAG_BASIC,
                             "Cluster has no points assigned to it!");
+                String centroid_data = "[";
                 for (size_t d = 0; d < dim; d++) {
                     clusters[c].centroid_tmp[d] =
                         static_cast<MVTYPE>(clusters[c].centroid_tmp[d] / static_cast<MVTYPE>(clusters[c].num_points));
+                    centroid_data += String(MVTYPE_FMT "%s", clusters[c].centroid_tmp[d],
+                                           (d + 1 == dim) ? "]" : ", ");
                 }
+                DIVFLOG(LOG_LEVEL_DEBUG, LOG_TAG_BASIC,
+                        "Centroid %zu has %zu points assigned to it. Centroid data: %s",
+                        c, clusters[c].num_points, centroid_data.ToCStr());
             }
+            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "First iteration completed.");
         }
         sync_point->arrive_and_wait();
         converged->store(true, std::memory_order_release);
@@ -532,16 +692,27 @@ protected:
                             static_cast<MVTYPE>(clusters[c].centroid_tmp[d] / static_cast<MVTYPE>(clusters[c].num_points));
                     }
                 }
+
+                if (wait_until_converged) {
+                    DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%zu%s iteration completed. converged: %s",
+                            i + 2, (i == 0 ? "ed" : "th"), converged->load(std::memory_order_acquire) ? "true" : "false");
+                } else {
+                    DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%zu/%zu iteration completed. converged: %s",
+                            i + 2, max_iterations, converged->load(std::memory_order_acquire) ? "true" : "false");
+                }
             }
             sync_point->arrive_and_wait();
         }
 
         if (is_master_thread) {
+            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Clustering completed. Finalizing centroids and storing data...");
+
             seen_idx.store(0, std::memory_order_release);
             for (size_t c = 0; c < clusters.size(); c++) {
                 FatalAssert(clusters[c].num_points > 0, LOG_TAG_BASIC,
                             "Cluster has no points assigned to it!");
                 VTYPE* final_centroid = new VTYPE[dim];
+                String centroid_data = "[";
                 for (size_t d = 0; d < dim; d++) {
                     if (conv) {
                         final_centroid[d] = static_cast<VTYPE>(clusters[c].centroid_tmp[d]);
@@ -549,10 +720,15 @@ protected:
                         final_centroid[d] = static_cast<VTYPE>(clusters[c].centroid_tmp[d] /
                                                                static_cast<MVTYPE>(clusters[c].num_points));
                     }
+                    centroid_data += String(VTYPE_FMT "%s", final_centroid[d],
+                                           (d + 1 == dim) ? "]" : ", ");
                 }
                 delete[] clusters[c].centroid_tmp;
                 clusters[c].centroid = final_centroid;
-                clusters[c].data = new char[clusters[c].num_points * dim * sizeof(VTYPE)];
+                clusters[c].data = new char[clusters[c].num_points * ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID))];
+                DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
+                        "Finalized centroid %zu with %zu points. Centroid data: %s",
+                        c, clusters[c].num_points, centroid_data.ToCStr());
             }
         }
 

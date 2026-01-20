@@ -801,6 +801,7 @@ typedef uint32_t DTYPE;
 typedef uint64_t MVTYPE;
 #define VTYPE_FMT "%hu"
 #define DTYPE_FMT "%u"
+#define MVTYPE_FMT "%lu"
 #endif
 
 /* todo: use cpuid to get cahceline size */
