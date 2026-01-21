@@ -10,6 +10,9 @@ source bench/build_configs.sh
 rm bench/hnswlib_run.conf
 source bench/hnswlib_build_configs.sh
 
+rm bench/ivfflat_run.conf
+source bench/ivfflat_build_configs.sh
+
 
 make clean -C bench
 rm -r bench/out
@@ -17,7 +20,7 @@ mkdir -p bench/out/cores
 mkdir -p bench/out/logs
 
 VAR_LOG_MIN_LEVEL=LOG_LEVEL_PANIC
-VAR_LOG_LEVEL=LOG_LEVEL_PANIC
+VAR_LOG_LEVEL=LOG_LEVEL_LOG
 
 VAR_LOG_TAG_BASIC=ON
 VAR_LOG_TAG_BASIC_NUM=$(( 2#1 ))

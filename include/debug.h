@@ -662,4 +662,54 @@ static inline std::map<std::string, std::binary_semaphore> FI_MAP;
 #define DIVF_TEXT_TO_STR(T) #T
 #define DIVF_MACRO_TO_STR(T) DIVF_TEXT_TO_STR(T)
 
+
+
+namespace divftree {
+    constexpr inline int MemCMP(const void* ptr1, const void* ptr2, size_t num) {
+        const uint8_t* p1 = static_cast<const uint8_t*>(ptr1);
+        const uint8_t* p2 = static_cast<const uint8_t*>(ptr2);
+        for (size_t i = 0; i < num; ++i) {
+            if (p1[i] != p2[i]) {
+                return (p1[i] < p2[i]) ? -1 : 1;
+            }
+        }
+        return 0;
+    }
+
+    constexpr inline void MemSET(void* ptr, uint8_t value, size_t num) {
+        uint8_t* p = static_cast<uint8_t*>(ptr);
+        for (size_t i = 0; i < num; ++i) {
+            p[i] = value;
+        }
+    }
+
+    constexpr inline void MemCOPY(void* dest, const void* src, size_t num) {
+        uint8_t* d = static_cast<uint8_t*>(dest);
+        const uint8_t* s = static_cast<const uint8_t*>(src);
+        for (size_t i = 0; i < num; ++i) {
+            d[i] = s[i];
+        }
+    }
+};
+// #define MEM_FUN_DEBUG
+#ifdef MEM_FUN_DEBUG
+#define DIVF_MEMCMP(ptr1, ptr2, num) ::divftree::MemCMP((ptr1), (ptr2), (num))
+#define DIVF_MEMSET(ptr, value, num) ::divftree::MemSET((ptr), (value), (num))
+#define DIVF_MEMCOPY(dest, src, num) ::divftree::MemCOPY((dest), (src), (num))
+#define BARRIER(barrier, point_name) \
+    do {\
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_THREAD, "Thread reached point '%s'.", (point_name));\
+        (barrier).arrive_and_wait();\
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_THREAD, "Thread passed point '%s'.", (point_name));\
+    } while(0)
+
+#else
+#define DIVF_MEMCMP(ptr1, ptr2, num) memcmp((ptr1), (ptr2), (num))
+#define DIVF_MEMSET(ptr, value, num) memset((ptr), (value), (num))
+#define DIVF_MEMCOPY(dest, src, num) memcpy((dest), (src), (num))
+#define BARRIER(barrier, point_name) \
+    do {\
+        (barrier).arrive_and_wait();\
+    } while(0)
+#endif
 #endif

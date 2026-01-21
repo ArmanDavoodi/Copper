@@ -8,7 +8,7 @@
 namespace divftree {
 
 struct IVFVectorInfo {
-    VectorID centroid_id = INVLID_VECTOR_ID;
+    VectorID centroid_id = INVALID_VECTOR_ID;
     size_t offset = 0;
     VTYPE* vector = nullptr;
 };
@@ -90,7 +90,7 @@ public:
         VectorDirectoryNode** node = &buckets[bucket_idx];
         while(*node != nullptr) {
             if ((*node)->id.vector_hash == vid.vector_hash) {
-                if (memcmp((*node)->info.vector, vector, dimension * sizeof(VTYPE)) == 0) {
+                if (DIVF_MEMCMP((*node)->info.vector, vector, dimension * sizeof(VTYPE)) == 0) {
                     if (is_duplicate != nullptr) {
                         *is_duplicate = true;
                     }
@@ -132,6 +132,7 @@ public:
     }
 
     void Delete(IVFVectorID id) {
+        UNUSED_VARIABLE(id);
         DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_NOT_IMPLEMENTED, "VectorDirectory::Delete() not implemented!");
     }
 
