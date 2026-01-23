@@ -8,14 +8,14 @@ CONF_FILE="bench/ivfflat_run.conf"
 VAR_LOG_OUTPUT_PATH=$ROOT/bench/out/logs/
 
 VAR_BUILT_SIZE=$(( 1024 * 1024 * 4 )) #num embedings to insert during build
-VAR_NUM_CLUSTERS=$((VAR_BUILT_SIZE / 1024))
+VAR_NUM_CLUSTERS=$((VAR_BUILT_SIZE / (1024 * 2)))
 
 VAR_DEF_K=1
 VAR_N_PROBES=64
-VAR_KMEANS_MAX_ITERS=32
+VAR_KMEANS_MAX_ITERS=10
 VAR_INSERT_DUPLICATES=0 #1 to allow inserting duplicate vectors and 0 to not allow
 
-VAR_NUM_QUERY_THREADS=60
+VAR_NUM_QUERY_THREADS=160
 
 VAR_WARMUP_TIME_SEC=10 #only search
 VAR_RUN_TIME_SEC=30 #real test used for stat collection

@@ -691,6 +691,8 @@ namespace divftree {
         }
     }
 };
+
+/* todo: remove */
 // #define MEM_FUN_DEBUG
 #ifdef MEM_FUN_DEBUG
 #define DIVF_MEMCMP(ptr1, ptr2, num) ::divftree::MemCMP((ptr1), (ptr2), (num))

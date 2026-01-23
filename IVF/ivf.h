@@ -509,8 +509,11 @@ protected:
             info->offset = current_size[c_idx].fetch_add(1);
             FatalAssert(info->offset < clusters[c_idx].num_points, LOG_TAG_BASIC,
                         "Cluster data offset exceeded allocated size!");
+            FatalAssert(info->vector == (data + (i * dim)), LOG_TAG_BASIC,
+                        "Vector pointer mismatch during store!");
             void* add =
-                reinterpret_cast<void*>(clusters[c_idx].data) + (i * (sizeof(IVFVectorID) + (dim * sizeof(VTYPE))));
+                reinterpret_cast<void*>(clusters[c_idx].data) +
+                (info->offset * (sizeof(IVFVectorID) + (dim * sizeof(VTYPE))));
             info->vector = reinterpret_cast<VTYPE*>(add + sizeof(IVFVectorID));
 
             DIVF_MEMCOPY(add, &out_vector_ids[i], sizeof(IVFVectorID));
@@ -674,7 +677,6 @@ protected:
 
             if (is_master_thread) {
                 seen_idx.store(0, std::memory_order_release);
-                converged->store(true, std::memory_order_release);
                 for (size_t c = 0; c < clusters.size(); c++) {
                     FatalAssert(clusters[c].num_points > 0, LOG_TAG_BASIC,
                                 "Cluster has no points assigned to it!");
@@ -691,6 +693,7 @@ protected:
                     DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%zu/%zu iteration completed. converged: %s",
                             i + 2, max_iterations, converged->load(std::memory_order_acquire) ? "true" : "false");
                 }
+                converged->store(true, std::memory_order_release);
             }
             BARRIER(*sync_point, String("ParallelBuild -> iteration %zu/%zu Completed, Iterating till convergence: %s",
                                         i + 2, max_iterations,
@@ -705,16 +708,16 @@ protected:
                 FatalAssert(clusters[c].num_points > 0, LOG_TAG_BASIC,
                             "Cluster has no points assigned to it!");
                 VTYPE* final_centroid = new VTYPE[dim];
-                String centroid_data = "[";
+                String centroid_data("(conv:%s)[", conv ? "t" : "f");
                 for (size_t d = 0; d < dim; d++) {
-                    if (conv) {
+                    if (!conv) {
                         final_centroid[d] = static_cast<VTYPE>(clusters[c].centroid_tmp[d]);
                     } else {
                         final_centroid[d] = static_cast<VTYPE>(clusters[c].centroid_tmp[d] /
                                                                static_cast<MVTYPE>(clusters[c].num_points));
                     }
-                    centroid_data += String(VTYPE_FMT "%s", final_centroid[d],
-                                           (d + 1 == dim) ? "]" : ", ");
+                    centroid_data += String(VTYPE_FMT "(" MVTYPE_FMT ")%s", final_centroid[d],
+                                            clusters[c].centroid_tmp[d], (d + 1 == dim) ? "]" : ", ");
                 }
                 delete[] clusters[c].centroid_tmp;
                 clusters[c].centroid = final_centroid;

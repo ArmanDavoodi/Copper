@@ -827,6 +827,11 @@ inline constexpr bool ALIGNED(void* ptr, size_t align_bytes = CACHE_LINE_SIZE) {
     return (reinterpret_cast<uintptr_t>(ptr) % align_bytes == 0);
 }
 
+inline constexpr bool ALIGNED(size_t size, size_t align_bytes = CACHE_LINE_SIZE) {
+    FatalAssert(align_bytes != 0, LOG_TAG_BASIC, "Alignment bytes cannot be zero.");
+    return (reinterpret_cast<uintptr_t>(size) % align_bytes == 0);
+}
+
 inline constexpr void* ALIGNED_PTR(void* ptr, size_t align_bytes = CACHE_LINE_SIZE) {
     FatalAssert(align_bytes != 0, LOG_TAG_BASIC, "Alignment bytes cannot be zero.");
     return (reinterpret_cast<uintptr_t>(ptr) % align_bytes == 0) ? ptr :
