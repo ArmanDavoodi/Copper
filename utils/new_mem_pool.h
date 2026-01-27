@@ -28,10 +28,11 @@ enum class PageState : uint8_t {
     INVALID = 0,
     FREE = 1,
     ALLOCATED = 2,
-    UPDATING = 3, /* an intermediate state used during allocation or merge */
-    RIGHT_COALESCING = 4, /* an intermediate state used during merge */
-    DEALLOCATING = 5, /* an intermediate state used during free */
-    LOCKED = 6 /* an intermediate state used during read */
+    ALLOCATING = 3, /* an intermediate state used during allocation or merge */
+    RIGHT_COALESCING = 4, /* an intermediate state used during free */
+    LEFT_COALESCING = 5, /* an intermediate state used during free */
+    DANGLING = 6, /* an intermediate state used during free */
+    LOCKED = 7 /* an intermediate state used during read */
 };
 
 inline constexpr size_t INVALID_FREE_LIST_INDEX = SIZE_MAX;
@@ -43,7 +44,7 @@ struct alignas(CACHE_LINE_SIZE) PageHeader {
     std::atomic<PageState> state = PageState::INVALID;
     std::atomic<size_t> readers_count = 0;
 
-    // std::atomic<FreePageList*> list_head = nullptr;
+    std::atomic<Page*>* list_head = nullptr;
     std::atomic<Page*> next_free_page = nullptr;
     std::atomic<Page*> prev_free_page = nullptr;
 
@@ -120,41 +121,14 @@ struct alignas(CACHE_LINE_SIZE) Page {
     }
 };
 
-struct FreePageList {
-    std::atomic<Page*> head = nullptr;
-    std::atomic<uint32_t> num_accesses = 0;
-
-    Page* GetHead() {
-        Page* page = head.load(std::memory_order_acquire);
-        while (page != nullptr) {
-            PageState expected = PageState::FREE;
-            Page* next_page = page->header.next_free_page.load(std::memory_order_acquire);
-            if (!page->header.state.compare_exchange_strong(expected, PageState::UPDATING)) {
-                DIVFTREE_YIELD();
-                page = head.load(std::memory_order_acquire);
-                continue;
-            }
-
-            while (page->header.readers_count.load(std::memory_order_acquire) > 0) {
-                DIVFTREE_YIELD();
-            }
-
-            head.compare_exchange_strong(page, next_page);
-            next_page->header.prev_free_page.compare_exchange_strong(page, nullptr);
-            page->header.next_free_page.store(nullptr, std::memory_order_release);
-            page->header.prev_free_page.store(nullptr, std::memory_order_release);
-            return page;
-        }
-        return nullptr;
-    }
-};
-
 class Allocator {
 public:
     Allocator(void* base_ptr, size_t total_size_bytes, size_t min_alloc_size_bytes);
     Allocator(size_t total_size_bytes, size_t min_alloc_size_bytes);
     ~Allocator();
 
+    /* todo batch allocate and batch free */
+    /* todo: page index should be uint32_t */
     /* todo: memory allocation and free sanity checks + get stats for how much fragmentation and other stuff we have and implement the remove empty lists that are not accessed frequently logic if needed */
     void* allocate(size_t requested_size_bytes) {
         if (requested_size_bytes == 0) {
@@ -181,8 +155,8 @@ public:
                     LOG_TAG_MEMORY, "Allocated page is still in free list");
         FatalAssert(page->header.prev_free_page.load(std::memory_order_acquire) == nullptr,
                     LOG_TAG_MEMORY, "Allocated page is still in free list");
-        FatalAssert(page->header.state.load(std::memory_order_acquire) == PageState::UPDATING,
-                    LOG_TAG_MEMORY, "Allocated page is not in UPDATING state");
+        FatalAssert(page->header.state.load(std::memory_order_acquire) == PageState::ALLOCATING,
+                    LOG_TAG_MEMORY, "Allocated page is not in ALLOCATING state");
         page->header.state.store(PageState::ALLOCATED, std::memory_order_release);
         FatalAssert(ALIGNED(page) && ALIGNED(page->data), LOG_TAG_MEMORY, "Allocated page is not aligned");
         return reinterpret_cast<void*>(page->data);
@@ -198,7 +172,7 @@ public:
         FatalAssert(page->data == ptr, LOG_TAG_MEMORY, "Pointer to free does not match page data pointer");
         FatalAssert(page->header.state.load(std::memory_order_acquire) == PageState::ALLOCATED,
                     LOG_TAG_MEMORY, "Page to free is not in ALLOCATED state");
-        page->header.state.store(PageState::DEALLOCATING, std::memory_order_release);
+        page->header.state.store(PageState::RIGHT_COALESCING, std::memory_order_release);
         FreePage(page);
     }
 
@@ -206,8 +180,7 @@ protected:
     void* const base;
     const size_t total_size;
     const size_t min_alloc_size;
-    std::atomic<uint32_t> num_total_accesses;
-    BPlusTree<size_t, FreePageList*> free_page_lists;
+    BPlusTree<uint32_t, Page> free_page_lists;
     SXLock allocator_lock;
 
     inline constexpr size_t GetFreeListIndex(size_t requested_size_bytes) {
@@ -220,19 +193,46 @@ protected:
         return page_size / min_alloc_size;
     }
 
+    Page* GetHead(std::atomic<Page*>& head) {
+        Page* page = head.load(std::memory_order_acquire);
+        while (page != nullptr) {
+            PageState expected = PageState::FREE;
+            Page* next_page = page->header.next_free_page.load(std::memory_order_acquire);
+            if (!page->header.state.compare_exchange_strong(expected, PageState::ALLOCATING)) {
+                DIVFTREE_YIELD();
+                page = head.load(std::memory_order_acquire);
+                continue;
+            }
+
+            while (page->header.readers_count.load(std::memory_order_acquire) > 0) {
+                DIVFTREE_YIELD();
+            }
+
+            head.compare_exchange_strong(page, next_page);
+            FatalAssert(page->header.list_head == &head,
+                        LOG_TAG_MEMORY, "Page's free list head does not match the current free list");
+            next_page->header.prev_free_page.compare_exchange_strong(page, nullptr);
+            page->header.list_head = nullptr;
+            page->header.next_free_page.store(nullptr, std::memory_order_release);
+            page->header.prev_free_page.store(nullptr, std::memory_order_release);
+            return page;
+        }
+        return nullptr;
+    }
+
     inline Page* GetFirstFit(size_t index) {
         auto it = free_page_lists.Get(index);
         auto end = free_page_lists.end();
 
         while (true) {
-            while ((it != end) && ((*it)->head.load(std::memory_order_acquire) == nullptr)) {
+            while ((it != end) && ((*it).load(std::memory_order_acquire) == nullptr)) {
                 ++it;
             }
             if (it == end) {
                 return nullptr;
             }
 
-            Page* page = (*it)->GetHead();
+            Page* page = GetHead(*it);
             if (page != nullptr) {
                 return page;
             };
@@ -240,14 +240,219 @@ protected:
         }
     }
 
+    /* todo: this can cause issues! */
+    bool RemoveFromList(Page* page, PageState& page_state) {
+        CHECK_NOT_NULLPTR(page, LOG_TAG_MEMORY);
+        FatalAssert(ALIGNED(page) && ALIGNED(page->data), LOG_TAG_MEMORY, "Page is not aligned");
+        PageState expected = PageState::FREE;
+        while (true) {
+            if (!(page->header.state.compare_exchange_strong(expected, PageState::DANGLING))) {
+                if (expected == PageState::LOCKED) {
+                    expected = PageState::FREE;
+                    DIVFTREE_YIELD();
+                    continue;
+                }
+                page_state = expected;
+                return false;
+            }
+            break;
+        }
+        page_state = PageState::DANGLING;
+
+        while (page->header.readers_count.load(std::memory_order_acquire) > 0) {
+            DIVFTREE_YIELD();
+        }
+
+        Page* next_page = page->header.next_free_page.load(std::memory_order_acquire);
+        expected = PageState::FREE;
+        while (next_page != nullptr &&
+               !(next_page->header.state.compare_exchange_strong(expected, PageState::LOCKED))) {
+            DIVFTREE_YIELD();
+            next_page = page->header.next_free_page.load(std::memory_order_acquire);
+            expected = PageState::FREE;
+        }
+
+        Page* prev_page = page->header.prev_free_page.load(std::memory_order_acquire);
+        if (prev_page == nullptr) {
+            /* this page is head */
+            FatalAssert(page->header.list_head != nullptr,
+                        LOG_TAG_MEMORY, "Page's free list head is null");
+            FatalAssert(page->header.list_head->load(std::memory_order_acquire) == page,
+                        LOG_TAG_MEMORY, "Page is not the head of its free list");
+            page->header.list_head->store(next_page, std::memory_order_release);
+        } else {
+            prev_page->header.next_free_page.store(next_page, std::memory_order_release);
+        }
+
+        if (next_page != nullptr) {
+            next_page->header.prev_free_page.store(prev_page, std::memory_order_release);
+            next_page->header.state.store(PageState::FREE, std::memory_order_release);
+        }
+
+        page->header.list_head = nullptr;
+        page->header.next_free_page.store(nullptr, std::memory_order_release);
+        page->header.prev_free_page.store(nullptr, std::memory_order_release);
+        return true;
+    }
+
+    inline bool CoalesceWithRight(Page* page, PageState next_state) {
+        CHECK_NOT_NULLPTR(page, LOG_TAG_MEMORY);
+        FatalAssert(ALIGNED(page) && ALIGNED(page->data), LOG_TAG_MEMORY, "Page is not aligned");
+        FatalAssert(page->header.state.load(std::memory_order_acquire) == PageState::RIGHT_COALESCING,
+                    LOG_TAG_MEMORY, "Page is not in RIGHT_COALESCING state during coalesce");
+
+        Page* right_page = page->GetPageAfter();
+        CHECK_NOT_NULLPTR(right_page, LOG_TAG_MEMORY);
+        FatalAssert(ALIGNED(right_page) && ALIGNED(right_page->data), LOG_TAG_MEMORY, "Right page is not aligned");
+        if (right_page >= reinterpret_cast<Page*>(reinterpret_cast<uint8_t*>(base) + total_size)) {
+            page->header.state.store(next_state, std::memory_order_release);
+            return false;
+        }
+
+        PageState right_state = right_page->header.state.load(std::memory_order_acquire);
+        PageState expected = PageState::DANGLING;
+
+        while (!right_page->header.state.compare_exchange_strong(expected, PageState::LEFT_COALESCING)) {
+            DIVFTREE_YIELD();
+            right_state = right_page->header.state.load(std::memory_order_acquire);
+            if (right_state == PageState::FREE) {
+                (void)RemoveFromList(right_page, right_state);
+            }
+
+            if (right_state == PageState::INVALID ||
+                right_state == PageState::ALLOCATED ||
+                right_state == PageState::ALLOCATING) {
+                page->header.state.store(next_state, std::memory_order_release);
+                if (right_state == PageState::INVALID ||
+                    right_state == PageState::ALLOCATED ||
+                    right_state == PageState::ALLOCATING) {
+                        return false;
+                }
+                page->header.state.store(PageState::RIGHT_COALESCING, std::memory_order_release);
+            }
+            expected = PageState::DANGLING;
+        }
+
+        FatalAssert(right_page->header.state.load(std::memory_order_acquire) == PageState::LEFT_COALESCING,
+                    LOG_TAG_MEMORY, "Invalid state!");
+
+        size_t new_page_index = page->header.page_index + right_page->header.page_index;
+        size_t new_page_total_bytes = page->header.page_total_bytes + right_page->header.page_total_bytes;
+        page->header.page_index = new_page_index;
+        page->header.page_total_bytes = new_page_total_bytes;
+        page->header.data_size_bytes = Page::GetDataBytes(new_page_total_bytes);
+        PageFooter* page_footer = right_page->GetSelfFooter();
+        page_footer->start.store(page, std::memory_order_release);
+        right_page->header.state.store(PageState::INVALID, std::memory_order_release);
+        page->header.state.store(next_state, std::memory_order_release);
+        return true;
+    }
+
+    inline bool CoalesceWithLeft(Page*& page) {
+        CHECK_NOT_NULLPTR(page, LOG_TAG_MEMORY);
+        FatalAssert(ALIGNED(page) && ALIGNED(page->data), LOG_TAG_MEMORY, "Page is not aligned");
+        FatalAssert(page->header.state.load(std::memory_order_acquire) == PageState::LEFT_COALESCING,
+                    LOG_TAG_MEMORY, "Page is not in RIGHT_COALESCING state during coalesce");
+        if (page == reinterpret_cast<Page*>(base)) {
+            return false;
+        }
+
+        Page* left_page = nullptr;
+        while (left_page == nullptr) {
+            PageFooter* left_footer = page->GetPageFooterBefore();
+            CHECK_NOT_NULLPTR(left_footer, LOG_TAG_MEMORY);
+            left_page = left_footer->start.load(std::memory_order_acquire);
+            CHECK_NOT_NULLPTR(left_page, LOG_TAG_MEMORY);
+            FatalAssert(ALIGNED(left_page) && ALIGNED(left_page->data), LOG_TAG_MEMORY, "Left page is not aligned");
+            PageState left_state = left_page->header.state.load(std::memory_order_acquire);
+            if (left_state == PageState::FREE) {
+                RemoveFromList(left_page, left_state);
+            }
+
+            if (left_state == PageState::INVALID ||
+                left_state == PageState::LOCKED ||
+                left_state == PageState::LEFT_COALESCING) {
+                left_page = nullptr;
+                DIVFTREE_YIELD();
+                continue;
+            }
+
+            if (left_state == PageState::ALLOCATED ||
+                left_state == PageState::ALLOCATING) {
+                return false;
+            }
+
+            if (left_state == PageState::RIGHT_COALESCING) {
+                page->header.state.store(PageState::DANGLING, std::memory_order_release);
+                DIVFTREE_YIELD();
+                if (page->)
+            }
+        }
+        CHECK_NOT_NULLPTR(left_page, LOG_TAG_MEMORY);
+        FatalAssert(ALIGNED(left_page) && ALIGNED(left_page->data), LOG_TAG_MEMORY, "Right page is not aligned");
+        if (left_page >= reinterpret_cast<Page*>(reinterpret_cast<uint8_t*>(base) + total_size)) {
+            return false;
+        }
+
+        PageState right_state = left_page->header.state.load(std::memory_order_acquire);
+        PageState expected = PageState::DANGLING;
+        if (right_state == PageState::FREE) {
+            (void)RemoveFromList(left_page, right_state);
+        }
+
+        if (right_state == PageState::INVALID ||
+            right_state == PageState::ALLOCATED ||
+            right_state == PageState::ALLOCATING) {
+            return false;
+        }
+
+        while (!left_page->header.state.compare_exchange_strong(expected, PageState::LEFT_COALESCING)) {
+            DIVFTREE_YIELD();
+            right_state = left_page->header.state.load(std::memory_order_acquire);
+            if (right_state == PageState::FREE) {
+                (void)RemoveFromList(left_page, right_state);
+            }
+
+            if (right_state == PageState::INVALID ||
+                right_state == PageState::ALLOCATED ||
+                right_state == PageState::ALLOCATING) {
+                return false;
+            }
+            expected = PageState::DANGLING;
+        }
+
+        FatalAssert(left_page->header.state.load(std::memory_order_acquire) == PageState::LEFT_COALESCING,
+                    LOG_TAG_MEMORY, "Invalid state!");
+
+        size_t new_page_index = page->header.page_index + left_page->header.page_index;
+        size_t new_page_total_bytes = page->header.page_total_bytes + left_page->header.page_total_bytes;
+        page->header.page_index = new_page_index;
+        page->header.page_total_bytes = new_page_total_bytes;
+        page->header.data_size_bytes = Page::GetDataBytes(new_page_total_bytes);
+        PageFooter* page_footer = left_page->GetSelfFooter();
+        page_footer->start.store(page, std::memory_order_release);
+        left_page->header.state.store(PageState::INVALID, std::memory_order_release);
+        return true;
+    }
+
     inline void FreePage(Page* page, bool check_left_coalesce = true) {
         CHECK_NOT_NULLPTR(page, LOG_TAG_MEMORY);
         FatalAssert(ALIGNED(page) && ALIGNED(page->data), LOG_TAG_MEMORY, "Page is not aligned");
         FatalAssert(page->header.readers_count.load(std::memory_order_acquire) == 0,
                     LOG_TAG_MEMORY, "Page has active readers during free");
-        FatalAssert(page->header.state.load(std::memory_order_acquire) == PageState::DEALLOCATING,
-                    LOG_TAG_MEMORY, "Page is not in DEALLOCATING state during free");
-        /* todo */
+        FatalAssert(page->header.state.load(std::memory_order_acquire) == PageState::RIGHT_COALESCING,
+                    LOG_TAG_MEMORY, "Page is not in RIGHT_COALESCING state during free");
+        Page* right_page = page->GetPageAfter();
+        CHECK_NOT_NULLPTR(right_page, LOG_TAG_MEMORY);
+        FatalAssert(ALIGNED(right_page) && ALIGNED(right_page->data), LOG_TAG_MEMORY, "Right page is not aligned");
+        if (right_page < reinterpret_cast<Page*>(reinterpret_cast<uint8_t*>(base) + total_size)) {
+            PageState right_state = right_page->header.state.load(std::memory_order_acquire);
+            while (right_state == PageState::RIGHT_COALESCING) {
+                DIVFTREE_YIELD();
+                right_state = right_page->header.state.load(std::memory_order_acquire);
+            }
+        }
+        page->header.state.store(PageState::LEFT_COALESCING, std::memory_order_release);
     }
 
     inline void SplitPage(Page* target, size_t desired_num_blocks) {
@@ -255,8 +460,8 @@ protected:
         FatalAssert(ALIGNED(target) && ALIGNED(target->data), LOG_TAG_MEMORY, "Target page is not aligned");
         FatalAssert(target->header.page_index > desired_num_blocks,
                     LOG_TAG_MEMORY, "Target page is smaller than desired size");
-        FatalAssert(target->header.state.load(std::memory_order_acquire) == PageState::UPDATING,
-                    LOG_TAG_MEMORY, "Target page is not in UPDATING state");
+        FatalAssert(target->header.state.load(std::memory_order_acquire) == PageState::ALLOCATING,
+                    LOG_TAG_MEMORY, "Target page is not in ALLOCATING state");
 
         size_t target_size_bytes = desired_num_blocks * min_alloc_size;
         size_t leftover_index = target->header.page_index - desired_num_blocks;
@@ -267,7 +472,7 @@ protected:
         leftover->header.page_index = leftover_index;
         leftover->header.page_total_bytes = leftover_index * min_alloc_size;
         leftover->header.data_size_bytes = Page::GetDataBytes(leftover->header.page_total_bytes);
-        leftover->header.state.store(PageState::DEALLOCATING, std::memory_order_release);
+        leftover->header.state.store(PageState::RIGHT_COALESCING, std::memory_order_release);
         leftover->header.readers_count.store(0, std::memory_order_release);
         PageFooter* leftover_footer = leftover->GetSelfFooter();
         leftover_footer->start.store(leftover, std::memory_order_release);
@@ -309,8 +514,8 @@ protected:
         FatalAssert(page->header.prev_free_page.load(std::memory_order_acquire) == nullptr,
                     LOG_TAG_MEMORY, "Page prev free page is not null during free");
         FatalAssert(page->header.state.load(std::memory_order_acquire) == PageState::DEALLOCATING ||
-                    page->header.state.load(std::memory_order_acquire) == PageState::UPDATING,
-                    LOG_TAG_MEMORY, "Page is not in UPDATING state during free");
+                    page->header.state.load(std::memory_order_acquire) == PageState::ALLOCATING,
+                    LOG_TAG_MEMORY, "Page is not in ALLOCATING state during free");
         page->header.readers_count.store(1, std::memory_order_release); // prevent others from reading during insertion
         page->header.state.store(PageState::FREE, std::memory_order_release);
         page->header.prev_free_page.store(nullptr, std::memory_order_release);
@@ -344,57 +549,11 @@ protected:
         }
     }
 
-    /* todo: this can cause issues! */
-    bool RemoveFromList(Page* page) {
-        CHECK_NOT_NULLPTR(page, LOG_TAG_MEMORY);
-        FatalAssert(ALIGNED(page) && ALIGNED(page->data), LOG_TAG_MEMORY, "Page is not aligned");
-        FatalAssert(page->header.page_index != INVALID_FREE_LIST_INDEX &&
-                    page->header.page_index < free_page_lists.size(),
-                    LOG_TAG_MEMORY, "Page free list index is invalid");
-        PageState expected = PageState::FREE;
-        while (true) {
-            if (!(page->header.state.compare_exchange_strong(expected, PageState::UPDATING))) {
-                if (expected == PageState::LOCKED) {
-                    expected = PageState::FREE;
-                    DIVFTREE_YIELD();
-                    continue;
-                }
-                return false;
-            }
-            break;
-        }
-
-        while (page->header.readers_count.load(std::memory_order_acquire) > 0) {
-            DIVFTREE_YIELD();
-        }
-
-        Page* prev_page = page->header.prev_free_page.load(std::memory_order_acquire);
-        Page* next_page = page->header.next_free_page.load(std::memory_order_acquire);
-        Page* page_cpy = page;
-        if (prev_page != nullptr) {
-            if (!prev_page->header.next_free_page.compare_exchange_strong(page, next_page)) {
-                page = page_cpy; // restore page pointer
-            }
-        } else {
-            if (!free_page_lists[page->header.page_index].compare_exchange_strong(page, next_page)) {
-                page = page_cpy; // restore page pointer
-            }
-        }
-
-        if (next_page != nullptr) {
-            next_page->header.prev_free_page.compare_exchange_strong(page, prev_page);
-        }
-
-        page->header.next_free_page.store(nullptr, std::memory_order_release);
-        page->header.prev_free_page.store(nullptr, std::memory_order_release);
-        return true;
-    }
-
     Page* FitPageAndReturnLeftOver(Page* target, size_t desired_num_blocks) {
         CHECK_NOT_NULLPTR(target, LOG_TAG_MEMORY);
         FatalAssert(ALIGNED(target) && ALIGNED(target->data), LOG_TAG_MEMORY, "Target page is not aligned");
-        FatalAssert(target->header.state.load(std::memory_order_acquire) == PageState::UPDATING,
-                    LOG_TAG_MEMORY, "Target page is not in UPDATING state");
+        FatalAssert(target->header.state.load(std::memory_order_acquire) == PageState::ALLOCATING,
+                    LOG_TAG_MEMORY, "Target page is not in ALLOCATING state");
         FatalAssert(target->header.next_free_page.load(std::memory_order_acquire) == nullptr,
                     LOG_TAG_MEMORY, "Target page next free page is not null during split");
         FatalAssert(target->header.prev_free_page.load(std::memory_order_acquire) == nullptr,
@@ -412,8 +571,8 @@ protected:
                     target->header.page_index > 0 &&
                     GetContainerFreeListIndex(target->header.page_total_bytes) == target->header.page_index,
                     LOG_TAG_MEMORY, "Target page invalid index");
-        FatalAssert(target->header.state.load(std::memory_order_acquire) == PageState::UPDATING,
-                    LOG_TAG_MEMORY, "Target page is not in UPDATING state");
+        FatalAssert(target->header.state.load(std::memory_order_acquire) == PageState::ALLOCATING,
+                    LOG_TAG_MEMORY, "Target page is not in ALLOCATING state");
         if (target->header.page_total_bytes / min_alloc_size == desired_num_blocks) {
             return nullptr;
         }
@@ -445,7 +604,7 @@ protected:
         free_page->header.data_size_bytes = left_over_data_size_bytes;
         free_page->header.page_index = left_over_index;
         free_page->header.readers_count.store(0, std::memory_order_release);
-        free_page->header.state.store(PageState::UPDATING, std::memory_order_release);
+        free_page->header.state.store(PageState::ALLOCATING, std::memory_order_release);
         FatalAssert(free_page->GetSelfFooter() == target->GetSelfFooter(),
                     LOG_TAG_MEMORY, "Page footer mismatch after split");
         free_page->GetSelfFooter()->start.store(free_page, std::memory_order_release);

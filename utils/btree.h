@@ -8,9 +8,9 @@ namespace divftree {
 class BPlusTreeNode {
 public:
     const bool is_leaf;
+    uint8_t num_keys;
     std::atomic<bool> locked_exclusive;
     std::atomic<uint8_t> num_readers;
-    uint8_t num_keys;
 
     BPlusTreeNode(bool is_leaf) : is_leaf(is_leaf), locked_exclusive(false), num_readers(0), num_keys(0) {}
 
@@ -94,30 +94,29 @@ public:
 
 template<typename K>
 inline constexpr size_t BPLUSTREE_INTERNAL_DEGREE() {
-    static_assert(sizeof(K) <= CACHE_LINE_SIZE - sizeof(BPlusTreeNodeHeader) - 2 * sizeof(uintptr_t),
-                  "Key size is too large for BPlusTreeNodeHeader");
+    static_assert(sizeof(K) <= CACHE_LINE_SIZE - sizeof(BPlusTreeNode) - 2 * sizeof(uintptr_t),
+                  "Key size is too large for BPlusTreeNode");
     /* Internal nodes have one more pointer than keys and leaf nodes have a pointer to next leaf */
-    size_t t = (CACHE_LINE_SIZE - sizeof(BPlusTreeNodeHeader) - sizeof(uintptr_t)) / (sizeof(K) + sizeof(uintptr_t));
+    size_t t = (CACHE_LINE_SIZE - sizeof(BPlusTreeNode) - sizeof(uintptr_t)) / (sizeof(K) + sizeof(uintptr_t));
     return (t + 1) / 2; // an internal node can have at most 2t children
 }
 
-template<typename K>
+template<typename K, typename V>
 inline constexpr size_t BPLUSTREE_LEAF_DEGREE() {
-    static_assert(sizeof(K) <= CACHE_LINE_SIZE - sizeof(BPlusTreeNodeHeader) - 2 * sizeof(uintptr_t),
-                  "Key size is too large for BPlusTreeNodeHeader");
-    size_t max_keys_supported = 31;
-    size_t size = max_keys_supported * (sizeof(K) + sizeof(uintptr_t)) + sizeof(BPlusTreeNodeHeader) + sizeof(uintptr_t);
-    max_keys_supported = (size / CACHE_LINE_SIZE) + (size % CACHE_LINE_SIZE != 0 ? 1 : 0);
-    max_keys_supported -= (max_keys_supported % 2 == 0 ? 1 : 0); // make it odd
-    return (max_keys_supported + 1) / 2;
+    // size_t max_keys_supported = 31;
+    // size_t size =
+    //     ALIGNED_SIZE(sizeof(BPlusTreeNode) + sizeof(uintptr_t) + (max_keys_supported * sizeof(K)), alignof(V)) +
+    //     max_keys_supported * sizeof(V);
+    // max_keys_supported = (size / CACHE_LINE_SIZE) + (size % CACHE_LINE_SIZE != 0 ? 1 : 0);
+    // max_keys_supported -= (max_keys_supported % 2 == 0 ? 1 : 0); // make it odd
+    // return (max_keys_supported + 1) / 2;
+    return 16;
 }
 
 template<typename K, typename V>
 class BPlusTreeLeafNode : public BPlusTreeNode {
 public:
-    static_assert(sizeof(V) <= sizeof(uintptr_t),
-                  "Value size is too large for BPlusTreeNode leaf value storage");
-    static inline constexpr uint8_t degree = static_cast<uint8_t>(BPLUSTREE_LEAF_DEGREE<K>());
+    static inline constexpr uint8_t degree = static_cast<uint8_t>(BPLUSTREE_LEAF_DEGREE<K, V>());
     static inline constexpr uint8_t MaxKeys = degree * 2 - 1;
     static inline constexpr uint8_t MinKeys = degree - 1;
     static_assert(MaxKeys > 0, "BPlusTreeLeafNode must be able to hold at least one key");
@@ -125,7 +124,7 @@ public:
 
     BPlusTreeLeafNode<K, V>* next_leaf;
     K keys[MaxKeys];
-    V values[MaxKeys];
+    std::atomic<V*> values[MaxKeys];
 
 
     BPlusTreeLeafNode() : BPlusTreeNode(true) {}
@@ -138,18 +137,58 @@ public:
         return MinKeys;
     }
 
-    uint8_t InsertNonFull(const K& key, const V& value) {
+    uint8_t InsertNonFull(const K& key, V* const value) {
         FatalAssert(num_keys < MaxKeys, LOG_TAG_BASIC, "Node is full, cannot insert key");
         for (int8_t i = num_keys - 1; i >= 0; --i) {
             if (keys[i] > key) {
                 keys[i + 1] = keys[i];
-                values[i + 1] = values[i];
+                values[i + 1].store(values[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
             } else {
                 keys[i + 1] = key;
-                values[i + 1] = value;
+                values[i + 1].store(value, std::memory_order_relaxed);
                 num_keys++;
                 return static_cast<uint8_t>(i + 1);
             }
+        }
+        keys[0] = key;
+        values[0].store(value, std::memory_order_relaxed);
+        num_keys++;
+        return 0;
+    }
+
+    uint8_t Replace(const K& key, const V& value, uint8_t to_be_deleted_index) {
+        FatalAssert(num_keys == MaxKeys, LOG_TAG_BASIC, "Node is not full, cannot replace key");
+        FatalAssert(to_be_deleted_index < num_keys, LOG_TAG_BASIC,
+                    "To be deleted index is out of bounds for replacement");
+        FatalAssert(keys[to_be_deleted_index] != key, LOG_TAG_BASIC, "Key to be inserted already exists in node");
+        if (keys[to_be_deleted_index] > key) {
+            for (int8_t i = to_be_deleted_index - 1; i >= 0; --i) {
+                if (keys[i] > key) {
+                    keys[i + 1] = keys[i];
+                    values[i + 1].store(values[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+                } else {
+                    keys[i + 1] = key;
+                    values[i + 1].store(value, std::memory_order_relaxed);
+                    return static_cast<uint8_t>(i + 1);
+                }
+            }
+            keys[0] = key;
+            values[0].store(value, std::memory_order_relaxed);
+            return 0;
+        } else {
+            for (uint8_t i = to_be_deleted_index + 1; i < num_keys; ++i) {
+                if (keys[i] < key) {
+                    keys[i - 1] = keys[i];
+                    values[i - 1].store(values[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+                } else {
+                    keys[i - 1] = key;
+                    values[i - 1].store(value, std::memory_order_relaxed);
+                    return static_cast<uint8_t>(i - 1);
+                }
+            }
+            keys[num_keys - 1] = key;
+            values[num_keys - 1].store(value, std::memory_order_relaxed);
+            return static_cast<uint8_t>(num_keys - 1);
         }
         FatalAssert(false, LOG_TAG_BASIC, "Key insertion failed");
         return MaxKeys + 1; // Should not reach here
@@ -158,10 +197,10 @@ public:
     void Remove(uint8_t index, V& value) {
         FatalAssert(is_leaf, LOG_TAG_BASIC, "RemoveFromLeaf called on non-leaf node");
         FatalAssert(index < num_keys, LOG_TAG_BASIC, "Index out of bounds for removal");
-        value = values[index];
+        value = values[index].load(std::memory_order_relaxed);
         for (uint8_t i = index; i < num_keys - 1; ++i) {
             keys[i] = keys[i + 1];
-            values[i] = values[i + 1];
+            values[i].store(values[i + 1].load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
         num_keys--;
     }
@@ -244,11 +283,14 @@ public:
             // Shift child's keys and children to the right
             for (int8_t i = child_leaf->num_keys - 1; i >= 0; --i) {
                 child_leaf->keys[i + 1] = child_leaf->keys[i];
-                child_leaf->values[i + 1] = child_leaf->values[i];
+                child_leaf->values[i + 1].store(child_leaf->values[i].load(std::memory_order_relaxed),
+                                                    std::memory_order_relaxed);
             }
             // Move key from parent to child
             child_leaf->keys[0] = keys[child_idx - 1];
-            child_leaf->values[0] = left_sibling_leaf->values[left_sibling_leaf->num_keys - 1];
+            child_leaf->values[0].store(
+                left_sibling_leaf->values[left_sibling_leaf->num_keys - 1].load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
             // Move key from left sibling to parent
             keys[child_idx - 1] = left_sibling_leaf->keys[left_sibling_leaf->num_keys - 1];
             left_sibling_leaf->num_keys--;
@@ -305,14 +347,17 @@ public:
 
             // Move key from parent to child
             child_leaf->keys[child_leaf->num_keys] = keys[child_idx];
-            child_leaf->values[child_leaf->num_keys] = right_sibling_leaf->values[0];
+            child_leaf->values[child_leaf->num_keys].store(
+                right_sibling_leaf->values[0].load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
             child_leaf->num_keys++;
             // Move key from right sibling to parent
             keys[child_idx] = right_sibling_leaf->keys[0];
             // Shift right sibling's keys and children to the left
             for (uint8_t i = 0; i < right_sibling_leaf->num_keys - 1; ++i) {
                 right_sibling_leaf->keys[i] = right_sibling_leaf->keys[i + 1];
-                right_sibling_leaf->values[i] = right_sibling_leaf->values[i + 1];
+                right_sibling_leaf->values[i].store(right_sibling_leaf->values[i + 1].load(std::memory_order_relaxed),
+                                                    std::memory_order_relaxed);
             }
             right_sibling_leaf->num_keys--;
         } else {
@@ -368,7 +413,8 @@ public:
 
             for (uint8_t i = 0; i < right_leaf->num_keys; ++i) {
                 left_leaf->keys[left_leaf->num_keys] = right_leaf->keys[i];
-                left_leaf->values[left_leaf->num_keys] = right_leaf->values[i];
+                left_leaf->values[left_leaf->num_keys].store(right_leaf->values[i].load(std::memory_order_relaxed),
+                                                            std::memory_order_relaxed);
                 left_leaf->num_keys++;
             }
             left_leaf->next_leaf = right_leaf->next_leaf;
@@ -556,7 +602,7 @@ public:
             return !(*this == other);
         }
 
-        inline V& operator*() {
+        inline std::atomic<V*>& operator*() {
             FatalAssert(current_leaf != nullptr, LOG_TAG_BASIC, "Dereferencing end iterator");
             FatalAssert(index < current_leaf->num_keys, LOG_TAG_BASIC, "Index out of bounds in iterator dereference");
             threadSelf->SanityCheckLockHeldInModeByMe(current_leaf, SX_SHARED);
@@ -711,7 +757,7 @@ public:
             return !(*this == other);
         }
 
-        inline const V& operator*() const {
+        inline const std::atomic<V*>& operator*() const {
             FatalAssert(current_leaf != nullptr, LOG_TAG_BASIC, "Dereferencing end iterator");
             FatalAssert(index < current_leaf->num_keys, LOG_TAG_BASIC, "Index out of bounds in iterator dereference");
             threadSelf->SanityCheckLockHeldInModeByMe(current_leaf, SX_SHARED);
@@ -730,10 +776,10 @@ public:
         uint8_t index;
     };
 
-    Iterator GetAndInsertIfNeeded(const K& key, const V& value) {
+    Iterator GetAndInsertIfNeeded(const K& key, const V& value, const V* can_be_deleted = nullptr) {
         BPlusTreeLeafNode<K, V>* leaf = nullptr;
         uint8_t index = 0;
-        InsertionResult result = GetAndInsertIfNeededOptimistic(key, value, leaf, index);
+        InsertionResult result = GetAndInsertIfNeededOptimistic(key, value, leaf, index, can_be_deleted);
         if (result == InsertionResult::SPLIT_REQUIRED) {
             result = GetAndInsertIfNeededPessimistic(key, value, leaf, index);
         }
@@ -821,8 +867,6 @@ public:
 
     bool Remove(const K& key, V& value) {
         K key_to_remove = key;
-        std::vector<BPlusTreeNode*> path;
-        path.reserve(32);
         BPlusTreeNode* current = GetRoot(SX_EXCLUSIVE);
 
         while (!current->is_leaf) {
@@ -834,9 +878,10 @@ public:
             }
 
             if (i < current_internal->num_keys && key_to_remove == current_internal->keys[i]) {
-                path.push_back(current);
-                current = current_internal->RemoveKey(i, key_to_remove);
-                current->Lock(SX_EXCLUSIVE);
+                BPlusTreeNode* new_current = current_internal->RemoveKey(i, key_to_remove);
+                new_current->Lock(SX_EXCLUSIVE);
+                current->Unlock(SX_EXCLUSIVE);
+                current = new_current;
                 continue;
             }
 
@@ -852,9 +897,10 @@ public:
             if (node_fully_traversed && i > current_internal->num_keys) {
                 i--;
             }
-            path.push_back(current);
+
+            current_internal->children[i]->Lock(SX_EXCLUSIVE);
+            current->Unlock(SX_EXCLUSIVE);
             current = current_internal->children[i];
-            current->Lock(SX_EXCLUSIVE);
         }
         CHECK_NOT_NULLPTR(current, LOG_TAG_BASIC);
         FatalAssert(current->is_leaf, LOG_TAG_BASIC, "Current node must be a leaf");
@@ -869,17 +915,13 @@ public:
         bool removed;
         if (i < current_leaf->num_keys && key_to_remove == current_leaf->keys[i]) {
             current_leaf->Remove(i, value);
-            tree_size--;
+            tree_size.fetch_sub(1, std::memory_order_acq_rel);
             removed = true;
         } else {
             removed = false;
         }
 
         current_leaf->Unlock(SX_EXCLUSIVE);
-        for (auto it = path.rbegin(); it != path.rend(); ++it) {
-            BPlusTreeNode* node = *it;
-            node->Unlock(SX_EXCLUSIVE);
-        }
         return removed;
     }
 
@@ -944,7 +986,9 @@ protected:
             sibling_leaf->num_keys = BPlusTreeLeafNode<K, V>::MinKeys;
             for (uint8_t j = 0; j < BPlusTreeLeafNode<K, V>::MinKeys; j++) {
                 sibling_leaf->keys[j] = child_leaf->keys[j + BPlusTreeLeafNode<K, V>::MinKeys + 1];
-                sibling_leaf->values[j] = child_leaf->values[j + BPlusTreeLeafNode<K, V>::MinKeys + 1];
+                sibling_leaf->values[j].store(
+                    child_leaf->values[j + BPlusTreeLeafNode<K, V>::MinKeys + 1].load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
             }
             sibling_leaf->next_leaf = child_leaf->next_leaf;
             child_leaf->next_leaf = sibling_leaf;
@@ -980,7 +1024,8 @@ protected:
     }
 
     InsertionResult GetAndInsertIfNeededOptimistic(const K& key, const V& value,
-                                                   BPlusTreeLeafNode<K, V>*& container_leaf, uint8_t& index) {
+                                                   BPlusTreeLeafNode<K, V>*& container_leaf, uint8_t& index,
+                                                   V* const can_remove = nullptr) {
         FatalAssert(container_leaf == nullptr, LOG_TAG_BASIC,
                     "Container leaf must be null for optimistic insertion");
         BPlusTreeNode* parent = nullptr;
@@ -1009,7 +1054,11 @@ protected:
         BPlusTreeLeafNode<K, V>* leaf_node = static_cast<BPlusTreeLeafNode<K, V>*>(current);
 
         uint8_t i = 0;
+        uint8_t can_remove_idx = leaf_node->num_keys;
         while (i < leaf_node->num_keys && key > leaf_node->keys[i]) {
+            if (can_remove != nullptr && leaf_node->values[i].load(std::memory_order_relaxed) == can_remove) {
+                can_remove_idx = i;
+            }
             i++;
         }
 
@@ -1023,11 +1072,23 @@ protected:
         }
 
         if (leaf_node->num_keys == BPlusTreeLeafNode<K, V>::MaxKeys) {
-            if (parent != nullptr) {
-                parent->Unlock(SX_SHARED);
+            if ((can_remove != nullptr) && (can_remove_idx == leaf_node->num_keys) && (i < leaf_node->num_keys)) {
+                while (i < leaf_node->num_keys) {
+                    if (leaf_node->values[i] == *can_remove) {
+                        can_remove_idx = i;
+                        break;
+                    }
+                    i++;
+                }
             }
-            leaf_node->Unlock(SX_SHARED);
-            return InsertionResult::SPLIT_REQUIRED;
+
+            if (can_remove_idx == leaf_node->num_keys) {
+                if (parent != nullptr) {
+                    parent->Unlock(SX_SHARED);
+                }
+                leaf_node->Unlock(SX_SHARED);
+                return InsertionResult::SPLIT_REQUIRED;
+            }
         }
 
         if (!leaf_node->UpgradeLock()) {
@@ -1036,7 +1097,11 @@ protected:
             leaf_node->Lock(SX_EXCLUSIVE);
 
             uint8_t i = 0;
+            uint8_t can_remove_idx = leaf_node->num_keys;
             while (i < leaf_node->num_keys && key > leaf_node->keys[i]) {
+                if (can_remove != nullptr && leaf_node->values[i] == *can_remove) {
+                    can_remove_idx = i;
+                }
                 i++;
             }
 
@@ -1051,20 +1116,39 @@ protected:
             }
 
             if (leaf_node->num_keys == BPlusTreeLeafNode<K, V>::MaxKeys) {
-                if (parent != nullptr) {
-                    parent->Unlock(SX_SHARED);
+                if ((can_remove != nullptr) && (can_remove_idx == leaf_node->num_keys) && (i < leaf_node->num_keys)) {
+                    while (i < leaf_node->num_keys) {
+                        if (leaf_node->values[i] == *can_remove) {
+                            can_remove_idx = i;
+                            break;
+                        }
+                        i++;
+                    }
                 }
-                leaf_node->Unlock(SX_EXCLUSIVE);
-                return InsertionResult::SPLIT_REQUIRED;
+
+                if (can_remove_idx == leaf_node->num_keys) {
+                    if (parent != nullptr) {
+                        parent->Unlock(SX_SHARED);
+                    }
+                    leaf_node->Unlock(SX_EXCLUSIVE);
+                    return InsertionResult::SPLIT_REQUIRED;
+                }
             }
         }
 
-        index = leaf_node->InsertNonFull(key, value);
+        if (leaf_node->num_keys == BPlusTreeLeafNode<K, V>::MaxKeys) {
+            FatalAssert(can_remove_idx < leaf_node->num_keys, LOG_TAG_BASIC,
+                        "Can remove index must be valid before removal");
+            index = leaf_node->Replace(key, value, can_remove_idx);
+        } else {
+            index = leaf_node->InsertNonFull(key, value);
+            tree_size.fetch_add(1, std::memory_order_acq_rel);
+        }
+
         if (parent != nullptr) {
             parent->Unlock(SX_SHARED);
         }
         leaf_node->DowngradeLock();
-        tree_size.fetch_add(1, std::memory_order_acq_rel);
         container_leaf = leaf_node;
         return InsertionResult::INSERTED;
     }
@@ -1073,8 +1157,7 @@ protected:
                                                     BPlusTreeNode<K, V>*& container_leaf, uint8_t& index) {
         FatalAssert(container_leaf == nullptr, LOG_TAG_BASIC,
                     "Container leaf must be null for pessimistic insertion");
-        std::vector<BPlusTreeNode*> path;
-        path.reserve(32);
+        BPlusTreeNode* parent = nullptr;
         BPlusTreeNode* current = GetRoot(SX_EXCLUSIVE);
 
         if (current->num_keys == current->GetMaxKeys()) {
@@ -1106,7 +1189,10 @@ protected:
                 SplitChild(internal_node, i);
                 continue;
             }
-            path.push_back(current);
+            if (parent != nullptr) {
+                parent->Unlock(SX_EXCLUSIVE);
+            }
+            parent = internal_node;
             current = internal_node->children[i];
             current->Lock(SX_EXCLUSIVE);
         }
@@ -1116,6 +1202,9 @@ protected:
                         "Internal node has no keys during insertion traversal");
         FatalAssert(current->num_keys < BPlusTreeLeafNode<K, V>::MaxKeys,
                     LOG_TAG_BASIC, "Internal node is full during insertion traversal");
+        if (parent != nullptr) {
+            parent->Unlock(SX_EXCLUSIVE);
+        }
         threadSelf->SanityCheckLockHeldInModeByMe(current, SX_EXCLUSIVE);
         BPlusTreeLeafNode<K, V>* leaf_node = static_cast<BPlusTreeLeafNode<K, V>*>(current);
 
@@ -1128,16 +1217,7 @@ protected:
             leaf_node->DowngradeLock();
             index = i;
             container_leaf = leaf_node;
-            for (auto it = path.rbegin(); it != path.rend(); ++it) {
-                BPlusTreeNode* node = *it;
-                node->Unlock(SX_EXCLUSIVE);
-            }
             return InsertionResult::EXISTS;
-        }
-
-        for (auto it = path.rbegin(); it != path.rend(); ++it) {
-            BPlusTreeNode* node = *it;
-            node->Unlock(SX_EXCLUSIVE);
         }
 
         index = leaf_node->InsertNonFull(key, value);
