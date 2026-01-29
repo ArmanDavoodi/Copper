@@ -14,6 +14,7 @@
 #include "utils/string.h"
 #include "utils/thread.h"
 #include "utils/synchronization.h"
+#include "utils/sorted_list.h
 
 #include "debug.h"
 
@@ -872,6 +873,31 @@ String ANNVectorInfoToString(const ANNVectorInfo& target) {
     return String("{dist=" DTYPE_FMT ", id=" VECTORID_LOG_FMT ", Version=%s}",
                  target.distance_to_query, VECTORID_LOG(target.id), target.version.ToString().ToCStr());
 }
+
+struct L2DTYPEIDPairCMP {
+    inline int operator()(const std::pair<DTYPE, IVFVectorID>& a,
+                          const std::pair<DTYPE, IVFVectorID>& b) const {
+        return L2::MoreSimilar(a.first, b.first);
+    }
+
+    inline int operator()(const std::pair<DTYPE, VectorID>& a,
+                          const std::pair<DTYPE, VectorID>& b) const {
+        return L2::MoreSimilar(a.first, b.first);
+    }
+};
+
+struct IVFSearchTask {
+    const VTYPE* query_vector;
+    size_t top_k;
+    size_t cluster_partition_size;
+    void* cluster_partition_address;
+    bool is_leaf;
+    SXLock* neighbour_list_lock;
+    union {
+        SortedList<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP>* top_vectors;
+        SortedList<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP>* top_centroids;
+    };
+};
 
 // enum DataType : int8_t {
 //     Invalid = -1,

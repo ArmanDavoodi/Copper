@@ -14,18 +14,6 @@
 
 namespace divftree {
 
-struct L2DTYPEIDPairCMP {
-    inline int operator()(const std::pair<DTYPE, IVFVectorID>& a,
-                          const std::pair<DTYPE, IVFVectorID>& b) const {
-        return L2::MoreSimilar(a.first, b.first);
-    }
-
-    inline int operator()(const std::pair<DTYPE, VectorID>& a,
-                          const std::pair<DTYPE, VectorID>& b) const {
-        return L2::MoreSimilar(a.first, b.first);
-    }
-};
-
 struct IVFCluster {
     VectorID centroid_id = INVALID_VECTOR_ID;
     union {
