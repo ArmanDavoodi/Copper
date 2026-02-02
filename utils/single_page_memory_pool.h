@@ -40,6 +40,9 @@ public:
         FatalAssert(pool_size % page_size == 0,
                     LOG_TAG_MEMORY, "pool_size must be multiple of page_size");
 
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_MEMORY,
+                "Creating MemoryPool with page size %lu and pool size %lu", page_size, pool_size);
+
 #ifdef USE_HUGETLB
         base = mmap64(nullptr, poolSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
 #else
@@ -64,6 +67,9 @@ public:
             void* page_ptr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(base) + offset);
             freePages.Push(page_ptr);
         }
+
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_MEMORY,
+                "MemoryPool created successfully with %zu pages", poolSize / pageSize);
     }
 
     ~MemoryPool() {
@@ -221,6 +227,22 @@ public:
         bool res = freePages.BatchPush(reinterpret_cast<void**>(ptr_array), count);
         FatalAssert(res, LOG_TAG_MEMORY, "Failed to free pages back to MemoryPool");
         UNUSED_VARIABLE(res);
+    }
+
+    void* GetBaseAddress() {
+        return base;
+    }
+
+    size_t GetPageSize() const {
+        FatalAssert(pageSize < UINT32_MAX, LOG_TAG_MEMORY,
+                    "Page size exceeds UINT32_MAX in MemoryPool::GetPageSize()");
+        FatalAssert(pageSize > 0, LOG_TAG_MEMORY,
+                    "Page size is zero in MemoryPool::GetPageSize()");
+        return pageSize;
+    }
+
+    size_t GetPoolSize() const {
+        return poolSize;
     }
 
 protected:

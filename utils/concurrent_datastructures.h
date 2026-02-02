@@ -14,6 +14,123 @@ namespace divftree {
 
 /* Todo better implementations -> lockfree */
 
+template<typename K, typename V, typename Hash>
+class ConcurrentMultiMap {
+public:
+    ConcurrentMultiMap(size_t num_buckets, Hash hash = Hash()) : _num_buckets(num_buckets),
+                                                            _hash(hash),
+                                                            _total_size(0) {
+        FatalAssert(_num_buckets > 0, LOG_TAG_BASIC, "Number of buckets must be greater than 0");
+        _data = new std::unordered_map<K, std::vector<V>>[_num_buckets];
+        _locks = new SXSpinLock[_num_buckets];
+    }
+
+    ~ConcurrentMultiMap() {
+        delete[] _data;
+        delete[] _locks;
+    }
+
+    void Insert(const K& key, const V& value) {
+        size_t hash_value = _hash(key);
+        size_t bucket_idx = hash_value % _num_buckets;
+
+        _locks[bucket_idx].Lock(SX_EXCLUSIVE);
+        _data[bucket_idx][key].push_back(value);
+        _locks[bucket_idx].Unlock();
+    }
+
+    void BatchInsert(const K& key, const std::vector<V>& values) {
+        size_t hash_value = _hash(key);
+        size_t bucket_idx = hash_value % _num_buckets;
+
+        _locks[bucket_idx].Lock(SX_EXCLUSIVE);
+        auto& vec = _data[bucket_idx][key];
+        vec.insert(vec.end(), values.begin(), values.end());
+        _locks[bucket_idx].Unlock();
+    }
+
+    void BatchInsert(const K& key, std::vector<V>&& values) {
+        size_t hash_value = _hash(key);
+        size_t bucket_idx = hash_value % _num_buckets;
+
+        _locks[bucket_idx].Lock(SX_EXCLUSIVE);
+        auto& vec = _data[bucket_idx][key];
+        if (vec.empty()) {
+            vec = std::move(values);
+        } else {
+            vec.insert(vec.end(), values.begin(), values.end());
+        }
+        _locks[bucket_idx].Unlock();
+    }
+
+    bool Erase(const K& key, std::vector<V>& out_value) {
+        size_t hash_value = _hash(key);
+        size_t bucket_idx = hash_value % _num_buckets;
+
+        _locks[bucket_idx].Lock(SX_EXCLUSIVE);
+        auto it = _data[bucket_idx].find(key);
+        if (it == _data[bucket_idx].end()) {
+            _locks[bucket_idx].Unlock();
+            return false;
+        }
+        if (out_value.empty()) {
+            out_value = std::move(it->second);
+        } else {
+            out_value.reserve(out_value.size() + it->second.size());
+            std::move(it->second.begin(), it->second.end(), std::back_inserter(out_value));
+        }
+        _data[bucket_idx].erase(it);
+        _locks[bucket_idx].Unlock();
+        return true;
+    }
+
+    std::vector<V> Erase(const K& key) {
+        size_t hash_value = _hash(key);
+        size_t bucket_idx = hash_value % _num_buckets;
+
+        _locks[bucket_idx].Lock(SX_EXCLUSIVE);
+        auto it = _data[bucket_idx].find(key);
+        if (it == _data[bucket_idx].end()) {
+            _locks[bucket_idx].Unlock();
+            return std::vector<V>();
+        }
+        std::vector<V> out_value = std::move(it->second);
+        _data[bucket_idx].erase(it);
+        _locks[bucket_idx].Unlock();
+        return out_value;
+    }
+
+    bool Contains(const K& key) {
+        size_t hash_value = _hash(key);
+        size_t bucket_idx = hash_value % _num_buckets;
+
+        _locks[bucket_idx].Lock(SX_SHARED);
+        auto it = _data[bucket_idx].find(key);
+        bool found = ((it != _data[bucket_idx].end()) && (!it->second.empty()));
+        _locks[bucket_idx].Unlock();
+        return found;
+    }
+
+    bool IsEmpty() {
+        for (size_t i = 0; i < _num_buckets; ++i) {
+            _locks[i].Lock(SX_SHARED);
+            if (!_data[i].empty()) {
+                _locks[i].Unlock();
+                return false;
+            }
+            _locks[i].Unlock();
+        }
+        return true;
+    }
+
+protected:
+    const size_t _num_buckets;
+    Hash _hash;
+
+    std::unordered_map<K, std::vector<V>>* _data;
+    SXSpinLock* _locks;
+};
+
 template<typename T, typename Compare = std::less<T>, typename Alloc = std::allocator<T>>
 class ConcurrentSet {
 public:

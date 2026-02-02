@@ -11,24 +11,11 @@
 #include <unistd.h>
 
 #include "utils/concurrent_datastructures.h"
+#include "disaggregated/disaggregated_common.h"
 
 namespace divftree {
 
-#define MEMROY_NODE_ID 0
-
-#define MEMROY_NODE_IDX 0
-#define COMPUTE_NODE_IDX 1
-#define NUM_NODE_TYPES 2
-
-#ifndef MAX_MNODE_COUNT
-#define MAX_MNODE_COUNT 1
-#endif
-#ifndef MAX_CNODE_COUNT
-#define MAX_CNODE_COUNT 1
-#endif
-#ifndef MAX_CONN_PER_NODE
-#define MAX_CONN_PER_NODE 4
-#endif
+inline constexpr size_t MAX_MESSAGE_SIZE = 4096;
 
 /* todo: maybe I need to pass this as a runtime arg?! needs tuning */
 static constexpr uint32_t MAX_SEND_WR[NUM_NODE_TYPES] = {
@@ -79,57 +66,6 @@ static constexpr uint8_t GET_NODE_TYPE_IDX(bool is_memory_node) {
     return is_memory_node ? MEMROY_NODE_IDX : COMPUTE_NODE_IDX;
 }
 
-
-union NodeID {
-    struct {
-        uint8_t is_mnode : 1;
-        uint8_t id : 7;
-    };
-    uint8_t raw;
-
-    constexpr NodeID() {}
-
-    constexpr NodeID(bool is_memory_node, uint8_t node_id) {
-        FatalAssert(node_id < (is_memory_node ? MAX_MNODE_COUNT : MAX_CNODE_COUNT),
-                    LOG_TAG_BASIC, "Node ID exceeds the maximum allowed count!");
-        is_mnode = is_memory_node ? 1 : 0;
-        id = node_id;
-    }
-
-    constexpr NodeID(uint8_t raw_id) : raw(raw_id) {
-        FatalAssert(id < (IsMemoryNode() ? MAX_MNODE_COUNT : MAX_CNODE_COUNT),
-                    LOG_TAG_BASIC, "Node ID exceeds the maximum allowed count!");
-    }
-
-    constexpr bool IsComputeNode() const {
-        return is_mnode == 0;
-    }
-
-    constexpr bool IsMemoryNode() const {
-        return is_mnode == 1;
-    }
-
-    constexpr uint8_t GetID() const {
-        return id;
-    }
-
-    constexpr uint8_t ToRaw() const {
-        return raw;
-    }
-
-    constexpr bool operator==(const NodeID& other) const {
-        return raw == other.raw;
-    }
-
-    constexpr bool operator!=(const NodeID& other) const {
-        return raw != other.raw;
-    }
-
-    inline String ToString() const {
-        return String("%sNode-%u", IsMemoryNode() ? "M" : "C", id);
-    }
-};
-
 union TaskID {
     struct {
         uint64_t task_seq_num : 48;
@@ -147,12 +83,6 @@ struct TaskIDHash {
 
 inline constexpr uint64_t MAX_TASK_SEQ_NUM = 0x0000FFFFFFFFFFFF;
 
-struct NodeIDHash {
-    inline size_t operator()(const NodeID& id) const {
-        return splitmix32(static_cast<uint32_t>(id.raw));
-    }
-};
-
 struct NodeInfo {
     NodeID node_id;
     in_addr_t ip_address;
@@ -167,47 +97,8 @@ struct ConnectionInfo {
     struct ibv_cq *cq = nullptr;
     std::atomic<uint64_t> next_task_id = 0;
     std::atomic<uint16_t> num_pending_requests = 0;
-    SXLock pending_tasks_lock;
-    size_t num_completed_task_ids = 0;
-    TaskID* completed_task_ids = nullptr;
-    std::unordered_map<TaskID, std::pair<IVFSearchTask**, size_t>, TaskIDHash> pending_tasks;
-
-    // ConnectionInfo() = default;
-    // ConnectionInfo(ConnectionInfo&& other) noexcept :
-    //     remote_qp_num(other.remote_qp_num),
-    //     local_psn(other.local_psn),
-    //     remote_psn(other.remote_psn),
-    //     qp(other.qp),
-    //     cq(other.cq),
-    //     next_task_id(other.next_task_id.load()),
-    //     num_pending_requests(other.num_pending_requests.load()),
-    //     num_completed_task_ids(other.num_completed_task_ids),
-    //     completed_task_ids(other.completed_task_ids),
-    //     pending_tasks(std::move(other.pending_tasks)) {
-    //         other.qp = nullptr;
-    //         other.cq = nullptr;
-    //         other.completed_task_ids = nullptr;
-    //     }
-
-    // inline ConnectionInfo& operator=(ConnectionInfo&& other) noexcept {
-    //     if (this != &other) {
-    //         remote_qp_num = other.remote_qp_num;
-    //         local_psn = other.local_psn;
-    //         remote_psn = other.remote_psn;
-    //         qp = other.qp;
-    //         cq = other.cq;
-    //         next_task_id.store(other.next_task_id.load());
-    //         num_pending_requests.store(other.num_pending_requests.load());
-    //         num_completed_task_ids = other.num_completed_task_ids;
-    //         completed_task_ids = other.completed_task_ids;
-    //         pending_tasks = std::move(other.pending_tasks);
-
-    //         other.qp = nullptr;
-    //         other.cq = nullptr;
-    //         other.completed_task_ids = nullptr;
-    //     }
-    //     return *this;
-    // }
+    // size_t num_completed_task_ids = 0;
+    // TaskID* completed_task_ids = nullptr;
 };
 
 struct ConnectionContext {
@@ -275,14 +166,14 @@ public:
                                 const char** mnode_ips, uint16_t* mnode_ports,
                                 uint8_t* cnode_ids, const char** cnode_ips, uint16_t* cnode_ports,
                                 const char* target_rdma_device_name, uint8_t rdma_port, int gid_index,
-                                bool is_memory_node, uint8_t self_idx) {
+                                bool is_memory_node, uint8_t self_idx, size_t num_threads) {
         FatalAssert(instance == nullptr, LOG_TAG_RDMA,
                     "RDMA_Manager is already initialized!");
         instance = new RDMA_Manager(num_mnodes, num_cnodes, mnode_ids,
                                     mnode_ips, mnode_ports,
                                     cnode_ids, cnode_ips, cnode_ports,
                                     target_rdma_device_name, rdma_port, gid_index,
-                                    is_memory_node, self_idx);
+                                    is_memory_node, self_idx, num_threads);
         return RetStatus::Success();
     }
 
@@ -292,13 +183,13 @@ public:
         return instance;
     }
 
-    static void DestroyInstance(BlockingQueue<IVFSearchTask*>* search_task_queue) {
+    static void DestroyInstance(std::vector<VectorID>& completed_tasks) {
         FatalAssert(instance != nullptr, LOG_TAG_RDMA,
                     "RDMA_Manager is not initialized!");
         instance->ready.store(false, std::memory_order_release);
         if (instance->cq != nullptr) {
-            CHECK_NOT_NULLPTR(search_task_queue, LOG_TAG_RDMA);
-            instance->PushCompletedReadsToTaskQueue(search_task_queue, true);
+            sleep(5); /* wait for pending operations to complete */
+            instance->PushCompletedReadsToTaskQueue(completed_tasks, true);
         }
         delete instance;
         instance = nullptr;
@@ -368,11 +259,6 @@ public:
             goto EXIT;
         }
 
-        rs = CloseTCPConnections();
-        if (!rs.IsOK()) {
-            error_msg = String("Failed to close TCP connections. %s", rs.Msg());
-            goto EXIT;
-        }
 EXIT:
         FatalAssert(rs.IsOK(), LOG_TAG_RDMA,
                     "Failed to establish RDMA connections. Error: %s", rs.Msg());
@@ -385,7 +271,7 @@ EXIT:
     }
 
     RetStatus RDMARead(NodeID target_node, void** local_buffers, uintptr_t* remote_addresses, uint32_t* sizes,
-                       IVFSearchTask** tasks, size_t num_clusters) {
+                       size_t num_clusters, std::vector<VectorID>&& cluster_ids) {
         FatalAssert(instance == this, LOG_TAG_RDMA,
                     "RDMA_Manager instance mismatch!");
         FatalAssert(cq != nullptr, LOG_TAG_RDMA,
@@ -407,21 +293,17 @@ EXIT:
         FatalAssert(it != memory_nodes.end(), LOG_TAG_RDMA,
                     "Target memory node not found!");
         ConnectionContext& ctx = it->second;
-        TaskID task_id{.node_raw = target_node.ToRaw(),
-                       .connection_idx = connection_idx,
-                       .task_seq_num = ctx.connections[connection_idx].next_task_id.fetch_add(1) & MAX_TASK_SEQ_NUM};
-        CHECK_NOT_NULLPTR(tasks, LOG_TAG_RDMA);
-        ctx.connections[connection_idx].pending_tasks_lock.Lock(SX_EXCLUSIVE);
-        ctx.connections[connection_idx].pending_tasks.emplace(task_id, tasks, num_clusters);
-        ctx.connections[connection_idx].pending_tasks_lock.Unlock();
+        TaskID task_id = TaskID{.node_raw = target_node.ToRaw(),
+                         .connection_idx = connection_idx,
+                         .task_seq_num = ctx.connections[connection_idx].next_task_id.fetch_add(1) & MAX_TASK_SEQ_NUM};
+        pending_tasks.BatchInsert(task_id, std::move(cluster_ids));
         return RDMAReadInternal(target_node, connection_idx, task_id,
                                 local_buffers, remote_addresses, sizes,
                                 num_clusters);
     }
 
     RetStatus RDMASGRead(NodeID target_node, void*** local_buffers, uintptr_t* remote_addresses,
-                         uint32_t** sizes, uint32_t* num_sge, IVFSearchTask** tasks, size_t num_clusters,
-                         size_t num_reads) {
+                         uint32_t** sizes, uint32_t* num_sge, size_t num_clusters, std::vector<VectorID>&& cluster_ids) {
         FatalAssert(instance == this, LOG_TAG_RDMA,
                     "RDMA_Manager instance mismatch!");
         FatalAssert(cq != nullptr, LOG_TAG_RDMA,
@@ -443,20 +325,16 @@ EXIT:
         FatalAssert(it != memory_nodes.end(), LOG_TAG_RDMA,
                     "Target memory node not found!");
         ConnectionContext& ctx = it->second;
-        TaskID task_id{.node_raw = target_node.ToRaw(),
-                       .connection_idx = connection_idx,
-                       .task_seq_num = ctx.connections[connection_idx].next_task_id.fetch_add(1) & MAX_TASK_SEQ_NUM};
-        CHECK_NOT_NULLPTR(tasks, LOG_TAG_RDMA);
-        ctx.connections[connection_idx].pending_tasks_lock.Lock(SX_EXCLUSIVE);
-        ctx.connections[connection_idx].pending_tasks.emplace(task_id, tasks, num_reads);
-        ctx.connections[connection_idx].pending_tasks_lock.Unlock();
+        TaskID task_id = TaskID{.node_raw = target_node.ToRaw(),
+                         .connection_idx = connection_idx,
+                         .task_seq_num = ctx.connections[connection_idx].next_task_id.fetch_add(1) & MAX_TASK_SEQ_NUM};
+        pending_tasks.BatchInsert(task_id, std::move(cluster_ids));
         return RDMASGReadInternal(target_node, connection_idx, task_id,
                                   local_buffers, remote_addresses, sizes, num_sge,
                                   num_clusters);
     }
 
-    RetStatus PushCompletedReadsToTaskQueue(BlockingQueue<IVFSearchTask*>* search_task_queue, bool destroying = false) {
-        CHECK_NOT_NULLPTR(search_task_queue, LOG_TAG_RDMA);
+    RetStatus PushCompletedReadsToTaskQueue(std::vector<VectorID>& completed_tasks, bool destroying = false) {
         FatalAssert(instance == this, LOG_TAG_RDMA,
                     "RDMA_Manager instance mismatch!");
         FatalAssert(cq != nullptr, LOG_TAG_RDMA,
@@ -467,13 +345,15 @@ EXIT:
                     "Memory region is not registered for RDMA operations.");
         FatalAssert(selfInfo.node_id.IsComputeNode(), LOG_TAG_RDMA,
                     "Only compute nodes can push completed reads to task queue.");
-        if (destroying) {
-            FatalAssert(!ready.load(std::memory_order_acquire), LOG_TAG_RDMA,
-                        "RDMA_Manager must be marked not ready when destroying.");
-            poll_lock.Lock(SX_EXCLUSIVE);
-        } else if (!poll_lock.TryLock(SX_EXCLUSIVE)) {
-            return RetStatus::Success();
-        }
+        FatalAssert(completed_tasks.empty(), LOG_TAG_RDMA,
+                    "Completed tasks vector must be empty on input.");
+        // if (destroying) {
+        //     FatalAssert(!ready.load(std::memory_order_acquire), LOG_TAG_RDMA,
+        //                 "RDMA_Manager must be marked not ready when destroying.");
+        //     poll_lock.Lock(SX_EXCLUSIVE);
+        // } else if (!poll_lock.TryLock(SX_EXCLUSIVE)) {
+        //     return RetStatus::Success();
+        // }
 
         bool done = false;
         while (!done) {
@@ -483,7 +363,7 @@ EXIT:
                 String error_msg = String("Failed to poll Completion Queue for RDMA Read. num_comp=(%d)%s errno=(%d)%s",
                                         num_completions, strerror(-num_completions), errno, strerror(errno));
                 FatalAssert(false, LOG_TAG_RDMA, "%s", error_msg.ToCStr());
-                poll_lock.Unlock();
+                // poll_lock.Unlock();
                 return RetStatus::Fail(error_msg.ToCStr());
             }
 
@@ -493,7 +373,7 @@ EXIT:
                     String error_msg = String("RDMA Read failed. wc_status=%s(%d), wr_id=0x%016lx, byte_len=%u",
                                             ibv_wc_status_str(wc.status), wc.status, wc.wr_id, wc.byte_len);
                     FatalAssert(false, LOG_TAG_RDMA, "%s", error_msg.ToCStr());
-                    poll_lock.Unlock();
+                    // poll_lock.Unlock();
                     return RetStatus::Fail(error_msg.ToCStr());
                 }
 
@@ -504,51 +384,155 @@ EXIT:
                 FatalAssert(it != memory_nodes.end(), LOG_TAG_RDMA,
                             "Target memory node not found!");
                 ConnectionInfo& conn_info = it->second.connections[task_id.connection_idx];
-                conn_info.completed_task_ids[conn_info.num_completed_task_ids] = task_id;
-                ++conn_info.num_completed_task_ids;
-            }
-
-            for (auto& node_pair : memory_nodes) {
-                ConnectionContext& ctx = node_pair.second;
-                for (uint8_t conn_idx = 0; conn_idx < MAX_CONN_PER_NODE; ++conn_idx) {
-                    ConnectionInfo& conn_info = ctx.connections[conn_idx];
-                    if (conn_info.num_completed_task_ids == 0) {
-                        continue;
-                    }
-
-                    conn_info.pending_tasks_lock.Lock(SX_EXCLUSIVE);
-                    for (size_t i = 0; i < conn_info.num_completed_task_ids; ++i) {
-                        TaskID completed_task_id = conn_info.completed_task_ids[i];
-                        auto task_it = conn_info.pending_tasks.find(completed_task_id);
-                        FatalAssert(task_it != conn_info.pending_tasks.end(), LOG_TAG_RDMA,
-                                    "Completed task ID not found in pending tasks!");
-                        IVFSearchTask** tasks = task_it->second.first;
-                        size_t num_tasks = task_it->second.second;
-                        search_task_queue->BatchPush(tasks, num_tasks);
-                        conn_info.pending_tasks.erase(task_it);
-                    }
-                    uint16_t num_pending =
-                        conn_info.num_pending_requests.fetch_sub(conn_info.num_completed_task_ids) -
-                        conn_info.num_completed_task_ids;
-                    conn_info.num_completed_task_ids = 0;
-                    conn_info.pending_tasks_lock.Unlock();
-                    if (destroying && num_pending > 0) {
-                        done = false;
-                    }
+                bool erased = pending_tasks.Erase(task_id, completed_tasks);
+                FatalAssert(erased, LOG_TAG_RDMA,
+                            "Completed task ID not found in pending tasks!");
+                UNUSED_VARIABLE(erased);
+                uint16_t num_pending =
+                    conn_info.num_pending_requests.fetch_sub(1);
+                FatalAssert(num_pending > 0, LOG_TAG_RDMA,
+                            "Number of pending requests underflowed!");
+                if (destroying && ((num_pending - 1) > 0)) {
+                    done = false;
                 }
             }
 
             if (!done) {
-                FatalAssert(!destroying, LOG_TAG_RDMA,
-                            "Cannot be in destroying mode when there are pending requests.");
-                poll_lock.Unlock();
+                FatalAssert(destroying, LOG_TAG_RDMA,
+                            "Should be in destroying mode when there are pending requests.");
+                // poll_lock.Unlock();
                 usleep(10);  /* yield to let other threads run */
-                poll_lock.Lock(SX_EXCLUSIVE);
+                // poll_lock.Lock(SX_EXCLUSIVE);
             }
         }
 
-        poll_lock.Unlock();
+        // poll_lock.Unlock();
         return RetStatus::Success();
+    }
+
+    void SendMessage(NodeID target, const void* msg, size_t size) {
+        FatalAssert(this == instance, LOG_TAG_RDMA,
+                    "RDMA_Manager instance mismatch!");
+        FatalAssert(selfInfo.node_id.IsMemoryNode() == target.IsComputeNode(), LOG_TAG_RDMA,
+                    "Compute nodes can only send messages to memory nodes and vice versa.");
+        FatalAssert(size > 0, LOG_TAG_RDMA,
+                    "Cannot send a message of size 0.");
+        CHECK_NOT_NULLPTR(msg, LOG_TAG_RDMA);
+        if (!ready.load(std::memory_order_acquire)) {
+            FatalAssert(false, LOG_TAG_RDMA,
+                        "RDMA_Manager is not ready for RDMA operations.");
+            return;
+        }
+
+        std::unordered_map<NodeID, ConnectionContext, NodeIDHash>* node_map =
+            target.IsComputeNode() ? &compute_nodes : &memory_nodes;
+
+        auto it = node_map->find(target);
+        FatalAssert(it != node_map->end(), LOG_TAG_RDMA,
+                    "Target compute node not found!");
+        ConnectionContext& ctx = it->second;
+        FatalAssert(ctx.socket != -1, LOG_TAG_RDMA,
+                    "Socket to source node is not established.");
+        ssize_t ret = send(ctx.socket, &size, sizeof(size), 0);
+        FatalAssert(ret == sizeof(size), LOG_TAG_RDMA,
+                    "Failed to send message size to target node. sent_bytes=%zd, expected_bytes=%zu, errno=(%d)%s",
+                    ret, sizeof(size), errno, strerror(errno));
+        ssize_t sent = 0;
+        while (sent < static_cast<ssize_t>(size)) {
+            ret = send(ctx.socket, static_cast<const uint8_t*>(msg) + sent,
+                               std::min(static_cast<ssize_t>(MAX_MESSAGE_SIZE), static_cast<ssize_t>(size) - sent), 0);
+            FatalAssert(ret >= 0, LOG_TAG_RDMA,
+                        "Failed to send message to target node. sent_bytes=%zd, expected_bytes=%zu, errno=(%d)%s",
+                        ret, size - sent, errno, strerror(errno));
+            sent += ret;
+        }
+        FatalAssert(sent == static_cast<ssize_t>(size), LOG_TAG_RDMA,
+                    "Failed to send message to target node. sent_bytes=%zd, expected_bytes=%zu, errno=(%d)%s",
+                    sent, size, errno, strerror(errno));
+    }
+
+    void BroadcastMessage(const void* msg, size_t size) {
+        FatalAssert(this == instance, LOG_TAG_RDMA,
+                    "RDMA_Manager instance mismatch!");
+        FatalAssert(size > 0, LOG_TAG_RDMA,
+                    "Cannot send a message of size 0.");
+        CHECK_NOT_NULLPTR(msg, LOG_TAG_RDMA);
+        if (!ready.load(std::memory_order_acquire)) {
+            FatalAssert(false, LOG_TAG_RDMA,
+                        "RDMA_Manager is not ready for RDMA operations.");
+            return;
+        }
+
+        std::unordered_map<NodeID, ConnectionContext, NodeIDHash>* node_map =
+            selfInfo.node_id.IsComputeNode() ? &memory_nodes : &compute_nodes;
+
+        for (auto& node_pair : *node_map) {
+            NodeID node_id = node_pair.first;
+            SendMessage(node_id, msg, size);
+        }
+    }
+
+    void ReceiveMessage(NodeID source, void* buffer, size_t buffer_size) {
+        FatalAssert(this == instance, LOG_TAG_RDMA,
+                    "RDMA_Manager instance mismatch!");
+        FatalAssert(selfInfo.node_id.IsMemoryNode() == source.IsComputeNode(), LOG_TAG_RDMA,
+                    "Compute nodes can only send messages to memory nodes and vice versa.");
+        FatalAssert(buffer_size > 0, LOG_TAG_RDMA,
+                    "Cannot send a message of size 0.");
+        CHECK_NOT_NULLPTR(buffer, LOG_TAG_RDMA);
+        if (!ready.load(std::memory_order_acquire)) {
+            FatalAssert(false, LOG_TAG_RDMA,
+                        "RDMA_Manager is not ready for RDMA operations.");
+            return;
+        }
+
+        std::unordered_map<NodeID, ConnectionContext, NodeIDHash>* node_map =
+            source.IsComputeNode() ? &compute_nodes : &memory_nodes;
+        auto it = node_map->find(source);
+        FatalAssert(it != node_map->end(), LOG_TAG_RDMA,
+                    "Source memory node not found!");
+        ConnectionContext& ctx = it->second;
+        FatalAssert(ctx.socket != -1, LOG_TAG_RDMA,
+                    "Socket to source node is not established.");
+        size_t msg_size = 0;
+        ssize_t ret = recv(ctx.socket, &msg_size, sizeof(msg_size), 0);
+        FatalAssert(ret == sizeof(msg_size), LOG_TAG_RDMA,
+                    "Failed to receive message size from source node. recv_bytes=%zd, expected_bytes=%zu, errno=(%d)%s",
+                    ret, sizeof(msg_size), errno, strerror(errno));
+        FatalAssert(msg_size <= buffer_size, LOG_TAG_RDMA,
+                    "Received message size exceeds buffer size. msg_size=%zu, buffer_size=%zu",
+                    msg_size, buffer_size);
+
+        ssize_t recieved = 0;
+        while (recieved < static_cast<ssize_t>(msg_size)) {
+            ret = recv(ctx.socket, static_cast<uint8_t*>(buffer) + recieved,
+                       std::min(static_cast<ssize_t>(MAX_MESSAGE_SIZE), static_cast<ssize_t>(msg_size) - recieved), 0);
+            FatalAssert(ret >= 0, LOG_TAG_RDMA,
+                        "Failed to receive message from source node. recv_bytes=%zd, expected_bytes=%zu, errno=(%d)%s",
+                        ret, msg_size - recieved, errno, strerror(errno));
+            recieved += ret;
+        }
+        FatalAssert(recieved == static_cast<ssize_t>(msg_size), LOG_TAG_RDMA,
+                    "Failed to receive message from source node. recv_bytes=%zd, expected_bytes=%zu, errno=(%d)%s",
+                    recieved, msg_size, errno, strerror(errno));
+    }
+
+    size_t GetNumMemoryNodes() const {
+        return memory_nodes.size();
+    }
+
+    size_t GetNumComputeNodes() const {
+        return compute_nodes.size();
+    }
+
+    NodeID GetMemoryNodeID() const {
+        FatalAssert(instance == this, LOG_TAG_RDMA,
+                    "RDMA_Manager instance mismatch!");
+        FatalAssert(selfInfo.node_id.IsComputeNode(), LOG_TAG_RDMA,
+                    "Only compute nodes have memory node IDs.");
+        FatalAssert(memory_nodes.size() == 1, LOG_TAG_RDMA,
+                    "Currently, only one memory node is supported.");
+        return memory_nodes.begin()->first;
     }
 
 protected:
@@ -556,12 +540,12 @@ protected:
                  const char** mnode_ips, uint16_t* mnode_ports,
                  uint8_t* cnode_ids, const char** cnode_ips, uint16_t* cnode_ports,
                  const char* target_rdma_device_name, uint8_t rdma_port, int gid_index,
-                 bool is_memory_node, uint8_t self_idx) :
+                 bool is_memory_node, uint8_t self_idx, size_t num_threads) :
                     selfInfo{
                             .node_id = NodeID(is_memory_node, self_idx),
                             .ip_address = {0},
                             .port = is_memory_node ? mnode_ports[self_idx] : cnode_ports[self_idx],
-                        }, _rdma_port(rdma_port), _gid_index(gid_index),
+                        }, _rdma_port(rdma_port), _gid_index(gid_index), pending_tasks(num_threads * 2),
                         poll_list(is_memory_node ? nullptr : new ibv_wc[MAX_CQE[COMPUTE_NODE_IDX]]) {
         FatalAssert(num_mnodes <= MAX_MNODE_COUNT, LOG_TAG_RDMA,
                     "Number of memory nodes exceeds the maximum allowed count!");
@@ -739,7 +723,7 @@ protected:
         uint16_t* ports;
         const char** ips;
         uint8_t* ids;
-        if (is_memory_node) {
+        if (!is_memory_node) {
             target_map = &memory_nodes;
             num_nodes = num_mnodes;
             ports = mnode_ports;
@@ -754,7 +738,7 @@ protected:
         }
         num_valid_nodes = 0;
         for (uint8_t i = 0; i < num_nodes; ++i) {
-            NodeID node_id = NodeID(false, ids[i]);
+            NodeID node_id = NodeID(!is_memory_node, ids[i]);
             auto it = target_map->emplace(node_id, node_id, inet_addr(ips[i]), ports[i]);
             FatalAssert(it.second, LOG_TAG_RDMA,
                         "Duplicate compute node ID %hhu detected!", ids[i]);
@@ -790,6 +774,10 @@ ERROR_EXIT:
     }
 
     RetStatus Cleanup() {
+        FatalAssert(instance == this, LOG_TAG_RDMA,
+                    "RDMA_Manager instance mismatch!");
+        FatalAssert(pending_tasks.IsEmpty(), LOG_TAG_RDMA,
+                    "There are still pending tasks in the pending tasks queue.");
         for (auto& node_pair : compute_nodes) {
             ConnectionContext& ctx = node_pair.second;
             for (uint8_t conn_idx = 0; conn_idx < MAX_CONN_PER_NODE; ++conn_idx) {
@@ -798,18 +786,6 @@ ERROR_EXIT:
                             "There are still pending requests on connection to compute node %s. pending_requests=%zu",
                             node_pair.first.ToString().ToCStr(),
                             conn_info.num_pending_requests.load());
-                FatalAssert(conn_info.pending_tasks.empty(), LOG_TAG_RDMA,
-                            "There are still pending tasks on connection to compute node %s. pending_tasks=%zu",
-                            node_pair.first.ToString().ToCStr(),
-                            conn_info.pending_tasks.size());
-                FatalAssert(conn_info.num_completed_task_ids == 0, LOG_TAG_RDMA,
-                            "There are still completed but unprocessed tasks on connection to compute node %s. completed_tasks=%zu",
-                            node_pair.first.ToString().ToCStr(),
-                            conn_info.num_completed_task_ids);
-                if (conn_info.completed_task_ids != nullptr) {
-                    delete[] conn_info.completed_task_ids;
-                }
-                conn_info.completed_task_ids = nullptr;
                 conn_info.cq = nullptr;
                 if (conn_info.qp != nullptr) {
                     ibv_destroy_qp(conn_info.qp);
@@ -826,18 +802,6 @@ ERROR_EXIT:
                             "There are still pending requests on connection to memory node %s. pending_requests=%zu",
                             node_pair.first.ToString().ToCStr(),
                             conn_info.num_pending_requests.load());
-                FatalAssert(conn_info.pending_tasks.empty(), LOG_TAG_RDMA,
-                            "There are still pending tasks on connection to memory node %s. pending_tasks=%zu",
-                            node_pair.first.ToString().ToCStr(),
-                            conn_info.pending_tasks.size());
-                FatalAssert(conn_info.num_completed_task_ids == 0, LOG_TAG_RDMA,
-                            "There are still completed but unprocessed tasks on connection to memory node %s. completed_tasks=%zu",
-                            node_pair.first.ToString().ToCStr(),
-                            conn_info.num_completed_task_ids);
-                if (conn_info.completed_task_ids != nullptr) {
-                    delete[] conn_info.completed_task_ids;
-                }
-                conn_info.completed_task_ids = nullptr;
                 conn_info.cq = nullptr;
                 if (conn_info.qp != nullptr) {
                     ibv_destroy_qp(conn_info.qp);
@@ -1098,9 +1062,6 @@ ERROR_EXIT:
         for (uint8_t conn_id = 0; conn_id < MAX_CONN_PER_NODE; ++conn_id) {
             ctx.connections[conn_id].local_psn = threadSelf->UniformRange32(0, (uint32_t)(1 << 24) - 1);
             ctx.connections[conn_id].cq = cq;
-            if (type == COMPUTE_NODE_IDX) {
-                ctx.connections[conn_id].completed_task_ids = new TaskID[MAX_SEND_WR[type]];
-            }
 
             rs = CreateQP(&qp, ctx.connections[conn_id].cq, pd, type);
             if (!rs.IsOK() || qp == nullptr) {
@@ -1732,7 +1693,7 @@ EXIT:
     const int _gid_index;
     std::unordered_map<NodeID, ConnectionContext, NodeIDHash> compute_nodes;
     std::unordered_map<NodeID, ConnectionContext, NodeIDHash> memory_nodes;
-    SXSpinLock poll_lock;
+    ConcurrentMultiMap<TaskID, VectorID, TaskIDHash> pending_tasks;
     struct ibv_wc* poll_list = nullptr;
 
     struct ibv_context* ib_ctx = nullptr;

@@ -14,7 +14,7 @@
 #include "utils/string.h"
 #include "utils/thread.h"
 #include "utils/synchronization.h"
-#include "utils/sorted_list.h
+#include "utils/sorted_list.h"
 
 #include "debug.h"
 
@@ -476,6 +476,13 @@ struct VectorIDVersionPairHash {
     }
 };
 
+template <typename T>
+struct PtrHash {
+    inline size_t operator()(T* const& p) const {
+        return splitmix64(reinterpret_cast<uint64_t>(p));
+    }
+};
+
 typedef void* Address;
 typedef const void* AddressToConst;
 
@@ -888,15 +895,44 @@ struct L2DTYPEIDPairCMP {
 
 struct IVFSearchTask {
     const VTYPE* query_vector;
+    const size_t num_sibling_tasks;
     size_t top_k;
     size_t cluster_partition_size;
     void* cluster_partition_address;
     bool is_leaf;
+    std::atomic<size_t>* num_tasks_completed;
     SXLock* neighbour_list_lock;
     union {
         SortedList<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP>* top_vectors;
         SortedList<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP>* top_centroids;
     };
+};
+
+struct IVFSearchTaskFactory {
+    const VTYPE* query_vector;
+    size_t num_sibling_tasks;
+    size_t top_k;
+    bool is_leaf;
+    std::atomic<size_t>* num_tasks_completed;
+    SXLock* neighbour_list_lock;
+    union {
+        SortedList<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP>* top_vectors;
+        SortedList<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP>* top_centroids;
+    };
+
+    inline IVFSearchTask* CreateTask(size_t cluster_partition_size, void* cluster_partition_address) {
+        return new IVFSearchTask{
+            .query_vector = query_vector,
+            .num_sibling_tasks = num_sibling_tasks,
+            .top_k = top_k,
+            .cluster_partition_size = cluster_partition_size,
+            .cluster_partition_address = cluster_partition_address,
+            .is_leaf = is_leaf,
+            .num_tasks_completed = num_tasks_completed,
+            .neighbour_list_lock = neighbour_list_lock,
+            .top_vectors = top_vectors,
+        };
+    }
 };
 
 // enum DataType : int8_t {
