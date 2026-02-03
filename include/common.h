@@ -897,7 +897,7 @@ struct IVFSearchTask {
     const VTYPE* query_vector;
     const size_t num_sibling_tasks;
     size_t top_k;
-    size_t cluster_partition_size;
+    size_t cluster_partition_num_elements;
     void* cluster_partition_address;
     bool is_leaf;
     std::atomic<size_t>* num_tasks_completed;
@@ -920,12 +920,12 @@ struct IVFSearchTaskFactory {
         SortedList<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP>* top_centroids;
     };
 
-    inline IVFSearchTask* CreateTask(size_t cluster_partition_size, void* cluster_partition_address) {
+    inline IVFSearchTask* CreateTask(size_t cluster_partition_num_elements, void* cluster_partition_address) {
         return new IVFSearchTask{
             .query_vector = query_vector,
             .num_sibling_tasks = num_sibling_tasks,
             .top_k = top_k,
-            .cluster_partition_size = cluster_partition_size,
+            .cluster_partition_num_elements = cluster_partition_num_elements,
             .cluster_partition_address = cluster_partition_address,
             .is_leaf = is_leaf,
             .num_tasks_completed = num_tasks_completed,

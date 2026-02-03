@@ -10,157 +10,51 @@
 #include "utils/sorted_list.h"
 #include "utils/concurrent_datastructures.h"
 #include "utils/vector_directory.h"
-#include "utils/single_page_memory_pool.h"
-#include "utils/rdma_manager.h"
+
+
+#include "DIVF/compute_node/buffer.h"
 
 
 namespace divftree {
 
-struct IVFCluster {
-    VectorID centroid_id = INVALID_VECTOR_ID;
-    union {
-        VTYPE* centroid = nullptr;
-        MVTYPE* centroid_tmp;
-    };
-    size_t num_points = 0;
-    char* data = nullptr; /* data points stored in a flat array */
+struct DIVFIndexAttr {
+    uint8_t self_node_idx;
+    uint16_t dimension;
+    size_t num_user_threads;
+    size_t pool_size;
+    size_t page_size;
 };
-
 
 class DIVFIndex {
 public:
-    DIVFIndex(uint16_t dim, uint8_t self_node_idx) :
-             dim(dim), size(0) {
-        if (dim == 0) {
-            DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "IVFIndex dimension cannot be zero!");
-        }
-
-        
+    DIVFIndex(const DIVFIndexAttr& attr) : index_attr(attr) {
         DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
-                "IVFIndex created with dimension %hu, max vectors %zu, and %zu locks.",
-                dim, max_vectors, num_locks);
+                "Creating DIVFIndex with dimension %hu, page size %zu, pool size %zu, "
+                "and %zu user threads.",
+                index_attr.dimension, index_attr.page_size,
+                index_attr.pool_size, index_attr.num_user_threads);
+
+        RetStatus rs = BufferMgr::Init(
+            index_attr.page_size,
+            index_attr.pool_size,
+            &search_task_queue,
+            index_attr.dimension,
+            index_attr.self_node_idx,
+            index_attr.num_user_threads,
+            centroids,
+            centroid_data,
+            num_centroids
+        );
+        FatalAssert(rs.IsOK(), LOG_TAG_BASIC,
+                    "Failed to initialize BufferMgr in DIVFIndex constructor: %s",
+                    rs.Msg());
     }
 
-    ~DIVFIndex() {}
-
-
-    RetStatus Build(const VTYPE* data, size_t num_points, size_t num_clusters, bool insert_duplicates,
-                    IVFVectorID* out_vector_ids, size_t max_iterations, size_t num_threads = 0) {
-        if (data == nullptr || num_points == 0 || num_clusters < 2 ||
-            num_clusters > num_points || clusters.size() != 0 || out_vector_ids == nullptr ||
-            num_threads > num_points) {
-            FatalAssert(false, LOG_TAG_BASIC, "Invalid arguments to IVFIndex::Build()");
-            return RetStatus::Fail("Invalid arguments to IVFIndex::Build()");
-        }
-
-        if (num_threads == 0) {
-            num_threads = std::min((size_t)(std::thread::hardware_concurrency()), num_points / 8);
-            if (num_threads == 0) {
-                num_threads = 1;
-            }
-        }
-
-        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
-                "Starting IVFIndex::Build() with %zu data points, %zu clusters, %zu max iterations, "
-                "%s duplicate insertion, and %zu threads.",
-                num_points, num_clusters, max_iterations,
-                insert_duplicates ? "allowing" : "disallowing", num_threads);
-
-        clusters.resize(num_clusters);
-        DIVF_MEMSET(out_vector_ids, UINT8_MAX, num_points * sizeof(IVFVectorID));
-        size_t data_seen = 0;
-        bool duplicate = false;
-        bool* valid = new bool[num_points];
-        SXSpinLock* cluster_build_locks = new SXSpinLock[num_clusters];
-        MVTYPE* temp_storage = new MVTYPE[dim * clusters.size() * num_threads];
-        size_t* cluster_sizes = new size_t[clusters.size() * num_threads];
-
-        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Choosing the first centroids from the existing data points...");
-        for (size_t c = 0; c < num_clusters; c++) {
-            FatalAssert(data_seen < num_points, LOG_TAG_BASIC,
-                        "Not enough unique data points to initialize centroids!");
-            FatalAssert(clusters[c].centroid_tmp == nullptr, LOG_TAG_BASIC,
-                        "Centroid temporary storage should be null at this point!");
-            FatalAssert(out_vector_ids[data_seen] == INVALID_IVF_VECTOR_ID, LOG_TAG_BASIC,
-                        "Output vector IDs should be invalid at this point!");
-            out_vector_ids[data_seen] =
-                vectorDirectory.Insert(data + (data_seen * dim), insert_duplicates, &duplicate);
-            if (duplicate) {
-                FatalAssert(insert_duplicates == (out_vector_ids[data_seen] != INVALID_IVF_VECTOR_ID),
-                            LOG_TAG_BASIC, "Duplicate found when insert_duplicates is false!");
-                valid[data_seen] = false;
-                data_seen++;
-                c--;
-                duplicate = false;
-                continue;
-            }
-
-            valid[data_seen] = true;
-            IVFVectorInfo* info = vectorDirectory.Find(out_vector_ids[data_seen]);
-            CHECK_NOT_NULLPTR(info, LOG_TAG_BASIC);
-
-            clusters[c].centroid_id = VectorID::AsID(c);
-            clusters[c].centroid_tmp = new MVTYPE[dim];
-            for (size_t d = 0; d < dim; d++) {
-                clusters[c].centroid_tmp[d] = static_cast<MVTYPE>(data[(data_seen * dim) + d]);
-            }
-            clusters[c].num_points = 1;
-            clusters[c].data = nullptr;
-            info->centroid_id = clusters[c].centroid_id;
-            info->vector = const_cast<VTYPE*>(data + (data_seen * dim));
-
-            DIVFLOG(LOG_LEVEL_DEBUG, LOG_TAG_BASIC, "%zu-th vector was chosen as the %zu-th centroid.", data_seen, c);
-            data_seen++;
-        }
-
-        std::vector<Thread*> builder_threads;
-        std::atomic<size_t>* current_size = new std::atomic<size_t>[clusters.size()];
-        for (size_t c = 0; c < clusters.size(); c++) {
-            current_size[c].store(0, std::memory_order_relaxed);
-        }
-
-        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Starting clustering process...");
-        if (num_threads == 1) {
-            SequentialBuild(data, data_seen, num_points, valid,
-                            insert_duplicates, out_vector_ids, temp_storage, cluster_sizes, current_size,
-                            max_iterations);
-        } else {
-            builder_threads.reserve(num_threads - 1);
-            uint64_t thread_range = (num_points / num_threads);
-            size_t thread_step = std::max(1lu, thread_range / 8lu);
-            std::atomic<size_t> seen_idx(data_seen);
-            std::atomic<bool> converged(true);
-            std::barrier<> sync_point(num_threads);
-            for (size_t t = 1; t < num_threads; t++) {
-                builder_threads.emplace_back(new Thread(100));
-                Thread* thrd = builder_threads.back();
-                thrd->StartMemberFunction(&IVFIndex::ParallelBuilder, this, data, &seen_idx, num_points,
-                                         thread_step, valid, insert_duplicates,
-                                         out_vector_ids, cluster_build_locks,
-                                         &(temp_storage[t * dim * clusters.size()]),
-                                         &(cluster_sizes[t * clusters.size()]), &sync_point, &converged,
-                                         current_size, max_iterations);
-            }
-            ParallelBuild(data, seen_idx, num_points, thread_step,
-                          valid, insert_duplicates, out_vector_ids, cluster_build_locks,
-                          temp_storage, cluster_sizes, true, &sync_point, &converged, current_size, max_iterations);
-
-            for (Thread* t : builder_threads) {
-                delete t;
-            }
-            builder_threads.clear();
-        }
-
-        delete[] valid;
-        delete[] cluster_build_locks;
-        delete[] temp_storage;
-        delete[] cluster_sizes;
-        delete[] current_size;
-
-        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "IVFIndex::Build() completed successfully with %zu unique vectors and"
-                "%lu total size.", vectorDirectory.Size(true), vectorDirectory.Size());
-        size = vectorDirectory.Size();
-        return RetStatus::Success();
+    ~DIVFIndex() {
+        RetStatus rs = BufferMgr::Destroy();
+        FatalAssert(rs.IsOK(), LOG_TAG_BASIC,
+                    "Failed to destroy BufferMgr in DIVFIndex destructor: %s",
+                    rs.Msg());
     }
 
     RetStatus ANNSearch(const VTYPE* query, size_t k, size_t nprobe,
@@ -170,16 +64,16 @@ public:
             return RetStatus::Fail("Invalid arguments to IVFIndex::ANNSearch()");
         }
 
-        if (clusters.empty() || size == 0) {
+        if (num_centroids == 0) {
             FatalAssert(false, LOG_TAG_BASIC, "Index is not built yet!");
             return RetStatus::Fail("Index is not built yet!");
         }
 
-        if (nprobe > clusters.size()) {
+        if (nprobe > num_centroids) {
             DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_BASIC,
                     "nprobe (%zu) is greater than the number of clusters (%zu). Reducing nprobe to %zu.",
-                    nprobe, clusters.size(), clusters.size());
-            nprobe = clusters.size();
+                    nprobe, num_centroids, num_centroids);
+            nprobe = num_centroids;
         }
 
         if (neighbours.size() > 0) {
@@ -190,35 +84,66 @@ public:
 
         SortedList<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP> topk_list(L2DTYPEIDPairCMP(), std::move(neighbours));
         SortedList<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP> closest_centroids(L2DTYPEIDPairCMP(), nprobe);
-
-        for (size_t c = 0; c < clusters.size(); c++) {
-            closest_centroids.Insert(std::make_pair(Distance(query, clusters[c].centroid, dim, DistanceType::L2),
-                                                    clusters[c].centroid_id));
+        std::vector<VectorID> cluster_ids;
+        cluster_ids.reserve(nprobe);
+        for (size_t c = 0; c < num_centroids; c++) {
+            closest_centroids.Insert(std::make_pair(Distance(query, &centroid_data[c * index_attr.dimension],
+                                                             index_attr.dimension, DistanceType::L2),
+                                                    centroids[c].centroid_id));
             if (closest_centroids.Size() > nprobe) {
                 closest_centroids.PopBack();
             }
         }
 
         for (const auto& cent : closest_centroids) {
-            size_t cent_idx = cent.second._val;
-            FatalAssert(cent_idx < clusters.size(), LOG_TAG_BASIC,
-                        "Invalid centroid index found during ANNSearch()");
-            size_t num_points = clusters[cent_idx].num_points;
-            if (num_points == 0 || clusters[cent_idx].data == nullptr) {
-                continue;
+            cluster_ids.push_back(cent.second);
+        }
+
+        std::atomic<size_t> tasks_completed = 0;
+        SXLock neighbour_list_lock;
+
+        IVFSearchTaskFactory task_factory{
+            .query_vector = query,
+            .num_sibling_tasks = 0,
+            .top_k = k,
+            .is_leaf = true,
+            .num_tasks_completed = &tasks_completed,
+            .neighbour_list_lock = &neighbour_list_lock,
+            .top_vectors = &topk_list,
+        };
+
+        BufferMgr* bufferMgr = BufferMgr::GetInstance();
+        CHECK_NOT_NULLPTR(bufferMgr, LOG_TAG_BASIC);
+        RetStatus status =
+            bufferMgr->PrefetchClustersForSearch(cluster_ids.data(), cluster_ids.size(), &task_factory);
+        FatalAssert(status.IsOK(), LOG_TAG_BASIC,
+                    "Failed to prefetch clusters in DIVFIndex::ANNSearch(): %s",
+                    status.Msg());
+        FatalAssert(task_factory.num_sibling_tasks > 0, LOG_TAG_BASIC,
+                    "No search tasks were created in DIVFIndex::ANNSearch()");
+        SortedList<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP> temp_list(L2DTYPEIDPairCMP(), nprobe);
+        while (tasks_completed.load(std::memory_order_acquire) < task_factory.num_sibling_tasks) {
+            IVFSearchTask* task = nullptr;
+            if (threadSelf->UniformRange64(0, (index_attr.num_user_threads * poll_rate) - 1) == 0) {
+                status = bufferMgr->PollRemoteReads();
+                FatalAssert(status.IsOK(), LOG_TAG_BASIC,
+                            "Failed to poll remote reads in DIVFIndex::ANNSearch(): %s",
+                            status.Msg());
             }
 
-            for (size_t p = 0; p < num_points; p++) {
-                void* v_off =
-                    reinterpret_cast<void*>(clusters[cent_idx].data +
-                        (p * (sizeof(IVFVectorID) + (dim * sizeof(VTYPE)))));
-                IVFVectorID vid = *(reinterpret_cast<IVFVectorID*>(v_off));
-                VTYPE* vector = reinterpret_cast<VTYPE*>(v_off + sizeof(IVFVectorID));
-                DTYPE dist = Distance(query, vector, dim, DistanceType::L2);
-                topk_list.Insert(std::make_pair(dist, vid));
-                if (topk_list.Size() > k) {
-                    topk_list.PopBack();
-                }
+            if (search_task_queue.PopHead(task)) {
+                FatalAssert(task != nullptr, LOG_TAG_BASIC,
+                            "Received null task from search task queue in DIVFIndex::ANNSearch()");
+                RetStatus task_status = ProcessIVFSearchTask(task, temp_list);
+                FatalAssert(task_status.IsOK(), LOG_TAG_BASIC,
+                            "Failed to process IVF search task in DIVFIndex::ANNSearch(): %s",
+                            task_status.Msg());
+                delete task;
+            } else {
+                status = bufferMgr->PollRemoteReads();
+                FatalAssert(status.IsOK(), LOG_TAG_BASIC,
+                            "Failed to poll remote reads in DIVFIndex::ANNSearch(): %s",
+                            status.Msg());
             }
         }
 
@@ -227,10 +152,50 @@ public:
     }
 
 protected:
-    const uint16_t dim;
-    size_t size;
-    std::vector<IVFCluster> clusters;
+    static constexpr size_t poll_rate = 10;
+    const DIVFIndexAttr index_attr;
+    ClusterMeta* centroids = nullptr;
+    VTYPE* centroid_data = nullptr;
+    size_t num_centroids = 0;
+    BlockingQueue<IVFSearchTask*> search_task_queue;
 
+    RetStatus ProcessIVFSearchTask(IVFSearchTask* task,
+                                   SortedList<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP>& temp_list) {
+        if (task == nullptr) {
+            return RetStatus::Fail("Null task provided to ProcessIVFSearchTask()");
+        }
+
+        size_t vector_size = (task->is_leaf ? sizeof(IVFVectorID) : sizeof(VectorID)) +
+                             (sizeof(VTYPE) * index_attr.dimension);
+        size_t num_vectors = task->cluster_partition_num_elements;
+        const uint8_t* data_ptr = reinterpret_cast<const uint8_t*>(task->cluster_partition_address);
+
+        for (size_t i = 0; i < num_vectors; ++i) {
+            const uint8_t* vector_offset = data_ptr + (i * vector_size);
+            IVFVectorID vid = *(reinterpret_cast<const IVFVectorID*>(vector_offset));
+            const VTYPE* vector_data = reinterpret_cast<const VTYPE*>(vector_offset + (task->is_leaf ? sizeof(IVFVectorID) : sizeof(VectorID)));
+            DTYPE dist = Distance(task->query_vector, vector_data, index_attr.dimension, DistanceType::L2);
+
+            if (task->is_leaf) {
+                temp_list.Insert(std::make_pair(dist, vid));
+                if (temp_list.Size() > task->top_k) {
+                    temp_list.PopBack();
+                }
+            } else {
+                FatalAssert(false, LOG_TAG_BASIC,
+                            "ProcessIVFSearchTask called for non-leaf task, which is not supported.");
+                return RetStatus::Fail("Non-leaf tasks are not supported in ProcessIVFSearchTask()");
+            }
+        }
+
+        task->neighbour_list_lock->Lock(SX_EXCLUSIVE);
+        task->top_vectors->MergeWith(temp_list, task->top_k, true);
+        task->neighbour_list_lock->Unlock();
+        temp_list.Clear();
+
+        task->num_tasks_completed->fetch_add(1, std::memory_order_release);
+        return RetStatus::Success();
+    }
 };
 
 };

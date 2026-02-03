@@ -10,8 +10,9 @@
 #include "utils/sorted_list.h"
 #include "utils/concurrent_datastructures.h"
 #include "utils/vector_directory.h"
-#include "utils/single_page_memory_pool.h"
 #include "utils/rdma_manager.h"
+
+#include <sys/mman.h>
 
 
 namespace divftree {
@@ -29,22 +30,137 @@ struct IVFCluster {
 
 class IVFIndex {
 public:
-    IVFIndex(uint16_t dim, size_t max_vectors, size_t num_locks) :
-             dim(dim), size(0), vectorDirectory(max_vectors, dim, num_locks) {
+    IVFIndex(const VTYPE* data, size_t num_points, size_t num_clusters, bool insert_duplicates,
+             size_t max_iterations, uint16_t dim, uint8_t self_node_idx, size_t num_threads = 0) :
+             dim(dim), size(0),
+             vectorDirectory(num_points, dim, (num_threads == 0 ? std::thread::hardware_concurrency() :
+                                                                  num_threads) * 2) {
         if (dim == 0) {
             DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "IVFIndex dimension cannot be zero!");
         }
 
+        pool_size = ALIGNED_SIZE(num_points * ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID)), CACHE_LINE_SIZE) +
+                          num_clusters * CACHE_LINE_SIZE;
+
+#ifdef USE_HUGETLB
+        memory_pool = mmap64(nullptr, pool_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+#else
+        memory_pool = mmap64(nullptr, pool_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
+
+        if (memory_pool == MAP_FAILED) {
+            DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_MEMORY, "Failed to allocate memory for MemoryPool."
+                    "errno %d, errno msg: %s", errno, strerror(errno));
+        }
+
+        if (memory_pool == nullptr) {
+            DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_MEMORY, "MemoryPool mmap returned nullptr");
+        }
+
+        if (!ALIGNED(memory_pool)) {
+            DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_MEMORY,
+                    "MemoryPool memory_pool is not properly aligned. Requested alignment: %lu, memory_pool address: %p",
+                    CACHE_LINE_SIZE, memory_pool);
+        }
+
+        RetStatus status = RetStatus::Success();
+        network_config::self_idx = self_node_idx;
+        ReadNetworkConfigs();
+        status =
+            RDMA_Manager::Initialize(
+                network_config::num_memory_nodes,
+                network_config::num_compute_nodes,
+                network_config::memory_node_ids,
+                network_config::memory_node_ip_lists,
+                network_config::memory_node_ports,
+                network_config::compute_node_ids,
+                network_config::compute_node_ip_lists,
+                network_config::compute_node_ports,
+                network_config::rdma_device_name,
+                network_config::rdma_port,
+                network_config::gid_index,
+                IS_MEMORY_NODE(),
+                network_config::self_idx,
+                1
+            );
+
+        RDMA_Manager* rdma_mgr = RDMA_Manager::GetInstance();
+        CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BASIC);
+
+        status = rdma_mgr->RegisterMemory(memory_pool, pool_size);
+        FatalAssert(status.IsOK(), LOG_TAG_BASIC,
+                    "Failed to register memory in IVFIndex constructor: %s",
+                    status.Msg());
+        status = rdma_mgr->EstablishConnections();
+        FatalAssert(status.IsOK(), LOG_TAG_BASIC,
+                    "Failed to establish RDMA connections: %s",
+                    status.Msg());
+
+        IVFVectorID* out_vector_ids = new IVFVectorID[num_points];
+        status = Build(data, num_points, num_clusters, insert_duplicates,
+                       out_vector_ids, max_iterations, num_threads);
+
         DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
-                "IVFIndex created with dimension %hu, max vectors %zu, and %zu locks.",
-                dim, max_vectors, num_locks);
+                "IVFIndex created with dimension %hu, max vectors %zu, and %zu threads.",
+                dim, num_points, num_threads == 0 ? std::thread::hardware_concurrency() : num_threads);
+        delete[] out_vector_ids;
     }
 
-    ~IVFIndex() {}
+    ~IVFIndex() {
+        std::vector<VectorID> tasks;
+        RDMA_Manager::DestroyInstance(tasks);
+        FatalAssert(tasks.size() == 0, LOG_TAG_BASIC,
+                    "There should be no pending tasks when destroying IVFIndex!");
+        for (auto& cluster : clusters) {
+            if (cluster.centroid_tmp != nullptr) {
+                delete[] cluster.centroid_tmp;
+                cluster.centroid_tmp = nullptr;
+            }
+            if (cluster.data != nullptr) {
+                FatalAssert(cluster.data >= memory_pool &&
+                            (reinterpret_cast<uint8_t*>(cluster.data) <
+                             reinterpret_cast<uint8_t*>(memory_pool) + pool_size),
+                            LOG_TAG_BASIC,
+                            "Cluster data pointer is out of bounds of the memory pool!");
+                cluster.data = nullptr;
+            }
+        }
+        if (munmap(memory_pool, pool_size) != 0) {
+            DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_BASIC, "Failed to free memory for MemoryPool. "
+                    "errno %d, errno msg: %s", errno, strerror(errno));
+        }
+    }
 
+    void Start() {
+        std::vector<Thread*> listener_threads;
+        std::vector<NodeInfo> compute_nodes, memory_nodes;
+        RDMA_Manager* rdma_mgr = RDMA_Manager::GetInstance();
+        CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BASIC);
+        rdma_mgr->GetAllNodeInfos(compute_nodes, memory_nodes);
+        for (uint8_t cn_idx = 0; cn_idx < compute_nodes.size(); ++cn_idx) {
+            Thread* listener_thread = new Thread(100);
+            listener_threads.push_back(listener_thread);
+            listener_thread->StartMemberFunction(&IVFIndex::ListenerThread, this, compute_nodes[cn_idx].node_id);
+        }
+
+        for (auto& thrd : listener_threads) {
+            thrd->WaitForThreadToFinish();
+            delete thrd;
+        }
+    }
+
+protected:
+    const uint16_t dim;
+    size_t size;
+    std::vector<IVFCluster> clusters;
+    SXSpinLock vector_directory_lock;
+    VectorDirectory vectorDirectory;
+    void* memory_pool = nullptr;
+    size_t pool_size = 0;
+    std::atomic<size_t> next_memory_offset = 0;
 
     RetStatus Build(const VTYPE* data, size_t num_points, size_t num_clusters, bool insert_duplicates,
-                    IVFVectorID* out_vector_ids, size_t max_iterations, size_t num_threads = 0) {
+                    IVFVectorID* out_vector_ids, size_t max_iterations, size_t num_threads) {
         if (data == nullptr || num_points == 0 || num_clusters < 2 ||
             num_clusters > num_points || clusters.size() != 0 || out_vector_ids == nullptr ||
             num_threads > num_points) {
@@ -162,75 +278,13 @@ public:
         return RetStatus::Success();
     }
 
-    RetStatus ANNSearch(const VTYPE* query, size_t k, size_t nprobe,
-                        std::vector<std::pair<DTYPE, IVFVectorID>>& neighbours) {
-        if (query == nullptr || k == 0 || nprobe == 0) {
-            FatalAssert(false, LOG_TAG_BASIC, "Invalid arguments to IVFIndex::ANNSearch()");
-            return RetStatus::Fail("Invalid arguments to IVFIndex::ANNSearch()");
-        }
-
-        if (clusters.empty() || size == 0) {
-            FatalAssert(false, LOG_TAG_BASIC, "Index is not built yet!");
-            return RetStatus::Fail("Index is not built yet!");
-        }
-
-        if (nprobe > clusters.size()) {
-            DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_BASIC,
-                    "nprobe (%zu) is greater than the number of clusters (%zu). Reducing nprobe to %zu.",
-                    nprobe, clusters.size(), clusters.size());
-            nprobe = clusters.size();
-        }
-
-        if (neighbours.size() > 0) {
-            DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_BASIC,
-                    "Output neighbours vector is not empty. Clearing previous contents.");
-            neighbours.clear();
-        }
-
-        SortedList<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP> topk_list(L2DTYPEIDPairCMP(), std::move(neighbours));
-        SortedList<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP> closest_centroids(L2DTYPEIDPairCMP(), nprobe);
-
-        for (size_t c = 0; c < clusters.size(); c++) {
-            closest_centroids.Insert(std::make_pair(Distance(query, clusters[c].centroid, dim, DistanceType::L2),
-                                                    clusters[c].centroid_id));
-            if (closest_centroids.Size() > nprobe) {
-                closest_centroids.PopBack();
-            }
-        }
-
-        for (const auto& cent : closest_centroids) {
-            size_t cent_idx = cent.second._val;
-            FatalAssert(cent_idx < clusters.size(), LOG_TAG_BASIC,
-                        "Invalid centroid index found during ANNSearch()");
-            size_t num_points = clusters[cent_idx].num_points;
-            if (num_points == 0 || clusters[cent_idx].data == nullptr) {
-                continue;
-            }
-
-            for (size_t p = 0; p < num_points; p++) {
-                void* v_off =
-                    reinterpret_cast<void*>(clusters[cent_idx].data +
-                        (p * (sizeof(IVFVectorID) + (dim * sizeof(VTYPE)))));
-                IVFVectorID vid = *(reinterpret_cast<IVFVectorID*>(v_off));
-                VTYPE* vector = reinterpret_cast<VTYPE*>(v_off + sizeof(IVFVectorID));
-                DTYPE dist = Distance(query, vector, dim, DistanceType::L2);
-                topk_list.Insert(std::make_pair(dist, vid));
-                if (topk_list.Size() > k) {
-                    topk_list.PopBack();
-                }
-            }
-        }
-
-        topk_list.Extract(neighbours);
-        return RetStatus::Success();
+    inline void* AllocateMemory(size_t size_in_bytes) {
+        size_t aligned_size = ALIGNED_SIZE(size_in_bytes, CACHE_LINE_SIZE);
+        size_t offset = next_memory_offset.fetch_add(aligned_size, std::memory_order_acquire);
+        FatalAssert((offset + aligned_size) <= pool_size,
+                    LOG_TAG_MEMORY, "IVFIndex memory pool out of memory!");
+        return static_cast<void*>(static_cast<char*>(memory_pool) + offset);
     }
-
-protected:
-    const uint16_t dim;
-    size_t size;
-    std::vector<IVFCluster> clusters;
-    SXSpinLock vector_directory_lock;
-    VectorDirectory vectorDirectory;
 
     inline void ClearClusterData() {
         FatalAssert(clusters.size() >= 2, LOG_TAG_BASIC,
@@ -605,7 +659,9 @@ protected:
             }
             delete[] clusters[c].centroid_tmp;
             clusters[c].centroid = final_centroid;
-            clusters[c].data = new char[clusters[c].num_points * ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID))];
+            clusters[c].data =
+                reinterpret_cast<char*>(AllocateMemory(clusters[c].num_points *
+                                                       ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID))));
             DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
                     "Finalized centroid %zu with %zu points. Centroid data: %s",
                     c, clusters[c].num_points, centroid_data.ToCStr());
@@ -711,7 +767,10 @@ protected:
                 }
                 delete[] clusters[c].centroid_tmp;
                 clusters[c].centroid = final_centroid;
-                clusters[c].data = new char[clusters[c].num_points * ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID))];
+                clusters[c].data =
+                    reinterpret_cast<char*>(AllocateMemory(clusters[c].num_points *
+                                                           ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID))));
+                // clusters[c].data = new char[clusters[c].num_points * ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID))];
                 DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
                         "Finalized centroid %zu with %zu points. Centroid data: %s",
                         c, clusters[c].num_points, centroid_data.ToCStr());
@@ -745,6 +804,41 @@ protected:
                       insert_duplicates, out_vector_ids, cluster_build_locks,
                       temp_storage, cluster_sizes, false, sync_point, converged,
                       current_size, max_iterations);
+        self->DestroyDIVFThread();
+    }
+
+    inline void SendIndexInfoToNode(NodeID target_cn) {
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_DIVFTREE, "Sending index info to CN %u...", target_cn);
+
+        RDMA_Manager* rdma_mgr = RDMA_Manager::GetInstance();
+        CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BUFFER);
+        size_t num_centroids = clusters.size();
+        rdma_mgr->SendMessage(target_cn, &num_centroids, sizeof(num_centroids));
+
+        ClusterMeta* centroids = new ClusterMeta[num_centroids];
+        VTYPE* centroid_data = new VTYPE[num_centroids * dim];
+        for (size_t c = 0; c < num_centroids; ++c) {
+            centroids[c].centroid_id = clusters[c].centroid_id;
+            centroids[c].remote_addr = reinterpret_cast<uint64_t>(clusters[c].data);
+            centroids[c].remote_size = clusters[c].num_points * (sizeof(IVFVectorID) + (dim * sizeof(VTYPE)));
+            DIVF_MEMCOPY(
+                centroid_data + (c * dim),
+                clusters[c].centroid,
+                sizeof(VTYPE) * dim
+            );
+        }
+
+        rdma_mgr->SendMessage(target_cn, centroids, sizeof(ClusterMeta) * num_centroids);
+        rdma_mgr->SendMessage(target_cn, centroid_data, sizeof(VTYPE) * num_centroids * dim);
+
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_DIVFTREE, "Index info sent to CN %u successfully.", target_cn);
+    }
+
+    inline void ListenerThread(Thread* self, NodeID target_cn) {
+        CHECK_NOT_NULLPTR(self, LOG_TAG_DIVFTREE);
+        self->InitDIVFThread();
+        SendIndexInfoToNode(target_cn);
+        bool last_cn_disconnected = RDMA_Manager::ListenForMessages(target_cn);
         self->DestroyDIVFThread();
     }
 };

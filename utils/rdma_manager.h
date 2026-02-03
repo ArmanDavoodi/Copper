@@ -160,6 +160,11 @@ struct HandshakeInfo {
     uint32_t psn[MAX_CONN_PER_NODE];
 };
 
+enum class ConnectionMessage : uint8_t {
+    INVALID = 0,
+    CN_TO_MN_DISCONNECT = 1,
+    MN_TO_CN_DISCONNECT_RESP = 2
+};
 class RDMA_Manager {
 public:
     static RetStatus Initialize(uint8_t num_mnodes, uint8_t num_cnodes, uint8_t* mnode_ids,
@@ -191,12 +196,60 @@ public:
             sleep(5); /* wait for pending operations to complete */
             instance->PushCompletedReadsToTaskQueue(completed_tasks, true);
         }
+
+        if (IS_COMPUTE_NODE()) {
+            ConnectionMessage disconnect_msg = ConnectionMessage::CN_TO_MN_DISCONNECT;
+            ConnectionMessage resp;
+            for (auto& [node_id, conn_ctx] : instance->memory_nodes) {
+                resp = ConnectionMessage::INVALID;
+                instance->SendMessage(node_id, &disconnect_msg, sizeof(disconnect_msg));
+                instance->ReceiveMessage(node_id, &resp, sizeof(resp));
+                FatalAssert(resp == ConnectionMessage::MN_TO_CN_DISCONNECT_RESP, LOG_TAG_RDMA,
+                            "Failed to receive disconnect response from memory node %s",
+                            node_id.ToString().ToCStr());
+            }
+        }
         delete instance;
         instance = nullptr;
     }
 
+    static bool ListenForMessages(NodeID target_node_id) {
+        FatalAssert(instance != nullptr, LOG_TAG_RDMA,
+                    "RDMA_Manager is not initialized!");
+        FatalAssert(IS_MEMORY_NODE(), LOG_TAG_RDMA,
+                    "Only memory nodes can listen for messages.");
+        FatalAssert(target_node_id.IsComputeNode(), LOG_TAG_RDMA,
+                    "Target node must be a compute node.");
+        ConnectionMessage msg = ConnectionMessage::INVALID;
+        instance->ReceiveMessage(target_node_id, &msg, sizeof(msg));
+        FatalAssert(msg == ConnectionMessage::CN_TO_MN_DISCONNECT, LOG_TAG_RDMA,
+                    "Received invalid message from compute node %s",
+                    target_node_id.ToString().ToCStr());
+        ConnectionMessage resp = ConnectionMessage::MN_TO_CN_DISCONNECT_RESP;
+        instance->SendMessage(target_node_id, &resp, sizeof(resp));
+
+        instance->DisconnectFromComputeNode(target_node_id);
+
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_RDMA,
+                "Disconnected from compute node %s successfully.",
+                target_node_id.ToString().ToCStr());
+        size_t num_connected = instance->num_connected_nodes.fetch_sub(1) - 1;
+        return (num_connected == 0);
+    }
+
     static NodeInfo GetSelfNodeInfo() {
         return GetInstance()->selfInfo;
+    }
+
+    void GetAllNodeInfos(std::vector<NodeInfo>& mn_infos, std::vector<NodeInfo>& cn_infos) {
+        mn_infos.clear();
+        cn_infos.clear();
+        for (const auto& [node_id, conn_ctx] : memory_nodes) {
+            mn_infos.push_back(conn_ctx.remote_node_info);
+        }
+        for (const auto& [node_id, conn_ctx] : compute_nodes) {
+            cn_infos.push_back(conn_ctx.remote_node_info);
+        }
     }
 
     RetStatus RegisterMemory(void* buffer, size_t size) {
@@ -570,6 +623,10 @@ protected:
         CHECK_NOT_NULLPTR(cnode_ips, LOG_TAG_RDMA);
         CHECK_NOT_NULLPTR(cnode_ports, LOG_TAG_RDMA);
         CHECK_NOT_NULLPTR(target_rdma_device_name, LOG_TAG_RDMA);
+
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_RDMA,
+                "Initializing RDMA_Manager for %s node. self_idx=%hhu, rdma_port=%hhu, gid_index=%d",
+                is_memory_node ? "memory" : "compute", self_idx, rdma_port, gid_index);
 
         int ret = 0;
         String error_msg;
@@ -1436,6 +1493,8 @@ EXIT:
                     rs = RetStatus::Fail(error_msg.ToCStr());
                     goto EXIT;
                 }
+
+                num_connected_nodes.fetch_add(1);
             }
 
             DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_RDMA,
@@ -1511,6 +1570,30 @@ EXIT:
         }
 
         return idx;
+    }
+
+    void DisconnectFromComputeNode(NodeID compute_node_id) {
+        FatalAssert(selfInfo.node_id.IsMemoryNode(), LOG_TAG_RDMA,
+                    "Only memory nodes can disconnect from compute nodes.");
+        FatalAssert(compute_node_id.IsComputeNode(), LOG_TAG_RDMA,
+                    "compute_node_id must be a compute node.");
+        auto it = compute_nodes.find(compute_node_id);
+        FatalAssert(it != compute_nodes.end(), LOG_TAG_RDMA,
+                    "Connection context for compute node %s not found.",
+                    compute_node_id.ToString().ToCStr());
+        ConnectionContext& ctx = it->second;
+        for (uint8_t conn_id = 0; conn_id < MAX_CONN_PER_NODE; ++conn_id) {
+            FatalAssert(ctx.connections[conn_id].qp != nullptr, LOG_TAG_RDMA,
+                        "QP for connection %hhu is nullptr.", conn_id);
+            ModifyQPStateToError(ctx.connections[conn_id].qp);
+            ibv_destroy_qp(ctx.connections[conn_id].qp);
+            ctx.connections[conn_id].qp = nullptr;
+        }
+        FatalAssert(ctx.socket != -1, LOG_TAG_RDMA,
+                    "TCP connection to compute node %s is already closed.",
+                    compute_node_id.ToString().ToCStr());
+        close(ctx.socket);
+        ctx.socket = -1;
     }
 
     RetStatus RDMAReadInternal(NodeID target_node, uint8_t connection_idx, TaskID id,
@@ -1705,6 +1788,7 @@ EXIT:
     struct ibv_mr* mr = nullptr;
     int server_socket = -1;
     std::atomic<bool> ready = false;
+    std::atomic<size_t> num_connected_nodes = 0;
 };
 
 

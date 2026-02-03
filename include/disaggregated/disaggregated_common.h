@@ -132,6 +132,9 @@ namespace network_config {
 };
 
 inline void ReadNetworkConfigs() {
+    DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
+            "Reading network configuration from file: %s",
+            network_config::network_config_file_path);
     std::ifstream config_file(network_config::network_config_file_path);
     FatalAssert(config_file.is_open(), LOG_TAG_BASIC,
                 "Failed to open network configuration file at path: %s",
@@ -158,12 +161,19 @@ inline void ReadNetworkConfigs() {
     FatalAssert(network_config::self_idx < network_config::num_compute_nodes, LOG_TAG_BASIC,
                 "Self node index exceeds the number of compute nodes!");
 #endif
+    String memory_node_list = "[";
+    String compute_node_list = "[";
 
     for (uint8_t i = 0; i < network_config::num_memory_nodes; ++i) {
         config_file >> network_config::memory_node_ids[i];
         config_file >> network_config::memory_node_ips[i];
         config_file >> network_config::memory_node_ports[i];
         network_config::memory_node_ip_lists[i] = network_config::memory_node_ips[i];
+        memory_node_list +=
+            String("%sCNode-%hhu:%s:%u%s",
+                   ((IS_MEMORY_NODE() && (network_config::self_idx == i)) ? "*" : ""),
+                   network_config::memory_node_ids[i], network_config::memory_node_ips[i],
+                   network_config::memory_node_ports[i], i == (network_config::num_memory_nodes - 1) ? "]" : ", ");
     }
 
     for (uint8_t i = 0; i < network_config::num_compute_nodes; ++i) {
@@ -171,6 +181,11 @@ inline void ReadNetworkConfigs() {
         config_file >> network_config::compute_node_ips[i];
         config_file >> network_config::compute_node_ports[i];
         network_config::compute_node_ip_lists[i] = network_config::compute_node_ips[i];
+        compute_node_list +=
+            String("%sMNode-%hhu:%s:%u%s",
+                   ((IS_COMPUTE_NODE() && (network_config::self_idx == i)) ? "*" : ""),
+                   network_config::compute_node_ids[i], network_config::compute_node_ips[i],
+                   network_config::compute_node_ports[i], i == (network_config::num_compute_nodes - 1) ? "]" : ", ");
     }
 
     config_file >> network_config::rdma_device_name;
@@ -178,6 +193,13 @@ inline void ReadNetworkConfigs() {
     config_file >> network_config::gid_index;
 
     config_file.close();
+    DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
+            "Completed reading network configuration: %hhu memory nodes:%s, %hhu compute nodes:%s, "
+            "RDMA device: %s, port: %hhu, GID index: %d",
+            network_config::num_memory_nodes, memory_node_list.ToCStr(),
+            network_config::num_compute_nodes, compute_node_list.ToCStr(),
+            network_config::rdma_device_name, network_config::rdma_port,
+            network_config::gid_index);
 }
 
 struct ClusterMeta {

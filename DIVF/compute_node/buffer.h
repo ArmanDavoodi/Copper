@@ -37,18 +37,18 @@ struct BufferEntry {
     BufferEntry(uintptr_t raddr, size_t size_bytes, size_t page_size, uint16_t dimension, bool is_leaf) :
         state(BufferEntryState::BUFFER_ENTRY_EVICTED),
         remote_addr(raddr), total_size_bytes(size_bytes) {
-        FatalAssert(page_size > 0, LOG_TAG_BASIC,
+        FatalAssert(page_size > 0, LOG_TAG_BUFFER,
                     "Page size must be greater than 0 in BufferEntry constructor");
         /* todo: alignment */
         size_t element_size = (is_leaf ? sizeof(IVFVectorID) : sizeof(VectorID)) + sizeof(VTYPE) * dimension;
         size_t num_vectors_per_page = page_size / element_size;
-        FatalAssert(total_size_bytes % element_size == 0, LOG_TAG_BASIC,
+        FatalAssert(total_size_bytes % element_size == 0, LOG_TAG_BUFFER,
                     "Cluster size is not aligned with vector size in BufferEntry constructor");
         size_t total_num_vectors = total_size_bytes / element_size;
         num_pages = (total_num_vectors + num_vectors_per_page - 1) / num_vectors_per_page;
-        FatalAssert(num_pages <= MAX_NUM_PAGE_PER_CLUSTER, LOG_TAG_BASIC,
+        FatalAssert(num_pages <= MAX_NUM_PAGE_PER_CLUSTER, LOG_TAG_BUFFER,
                     "Cluster requires more than MAX_NUM_PAGE_PER_CLUSTER pages in BufferEntry constructor");
-        FatalAssert(total_num_vectors > 0, LOG_TAG_BASIC,
+        FatalAssert(total_num_vectors > 0, LOG_TAG_BUFFER,
                     "Cluster must contain at least one vector in BufferEntry constructor");
         for (size_t p = 0; p < num_pages; ++p) {
             if (p == num_pages - 1) {
@@ -66,14 +66,14 @@ public:
         _num_buckets(num_buckets), _bucket_cap(std::max((size_t)1, capacity / num_buckets)),
         _page_pool(pool), _hash(PtrHash<BufferEntry>()),
         _num_hot_entries(0) {
-        FatalAssert(capacity > 0, LOG_TAG_BASIC,
+        FatalAssert(capacity > 0, LOG_TAG_BUFFER,
                     "CacheMetaContainer capacity must be greater than 0");
-        FatalAssert(num_buckets > 0, LOG_TAG_BASIC,
+        FatalAssert(num_buckets > 0, LOG_TAG_BUFFER,
                     "CacheMetaContainer num_buckets must be greater than 0");
         FatalAssert(capacity >= num_buckets,
-                    LOG_TAG_BASIC,
+                    LOG_TAG_BUFFER,
                     "CacheMetaContainer capacity must be at least num_buckets");
-        FatalAssert(pool != nullptr, LOG_TAG_BASIC,
+        FatalAssert(pool != nullptr, LOG_TAG_BUFFER,
                     "CacheMetaContainer memory pool cannot be null");
 
         _hot_entries = new std::vector<BufferEntry*>[num_buckets];
@@ -92,7 +92,7 @@ public:
     }
 
     bool TryLockAndPinEntry(BufferEntry* entry) {
-        FatalAssert(entry != nullptr, LOG_TAG_BASIC,
+        FatalAssert(entry != nullptr, LOG_TAG_BUFFER,
                     "Cannot pin a null entry in CacheMetaContainer");
         size_t hash_value = _hash(entry);
         size_t bucket_idx = hash_value % _num_buckets;
@@ -103,11 +103,11 @@ public:
         }
 
         ++(entry->pin);
-        FatalAssert(entry->pin > 0, LOG_TAG_BASIC,
+        FatalAssert(entry->pin > 0, LOG_TAG_BUFFER,
                     "Pin count overflow in CacheMetaContainer::TryLockAndPinEntry()");
         if (entry->pin > 1) {
             FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED,
-                        LOG_TAG_BASIC,
+                        LOG_TAG_BUFFER,
                         "Pinned entry must be in CACHED state in CacheMetaContainer::TryLockAndPinEntry()");
             _locks[bucket_idx].Unlock();
             return true;
@@ -115,10 +115,10 @@ public:
 
         if (entry->state == BufferEntryState::BUFFER_ENTRY_CACHED) {
             FatalAssert(_hot_entries[bucket_idx].size() > entry->cache_list_idx,
-                        LOG_TAG_BASIC,
+                        LOG_TAG_BUFFER,
                         "Pinned entry's cache list index is out of bounds in CacheMetaContainer::TryLockAndPinEntry()");
             FatalAssert(entry == _hot_entries[bucket_idx][entry->cache_list_idx],
-                        LOG_TAG_BASIC,
+                        LOG_TAG_BUFFER,
                         "Pinned entry must be in hot entries list in CacheMetaContainer::TryLockAndPinEntry()");
             if (entry->cache_list_idx != _hot_entries[bucket_idx].size() - 1) {
                 BufferEntry* last_entry = _hot_entries[bucket_idx].back();
@@ -130,11 +130,11 @@ public:
         } else if (entry->state == BufferEntryState::BUFFER_ENTRY_COOLING) {
             size_t idx = entry->cache_list_idx;
             FatalAssert(_cooling_entries[idx] == entry,
-                        LOG_TAG_BASIC,
+                        LOG_TAG_BUFFER,
                         "Pinned entry must be in cooling entries list in CacheMetaContainer::TryLockAndPinEntry()");
             FatalAssert(idx >= bucket_idx * _bucket_cap &&
                         idx < (bucket_idx + 1) * _bucket_cap,
-                        LOG_TAG_BASIC,
+                        LOG_TAG_BUFFER,
                         "Pinned entry's cache list index is out of bounds in CacheMetaContainer::TryLockAndPinEntry()");
             if (idx != _cooling_bucket_next_idx[bucket_idx]) {
                 BufferEntry* last_entry = _cooling_entries[_cooling_bucket_next_idx[bucket_idx]];
@@ -144,7 +144,7 @@ public:
             _cooling_entries[idx] = nullptr;
         } else {
             FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_EVICTED,
-                        LOG_TAG_BASIC,
+                        LOG_TAG_BUFFER,
                         "Pinned entry must be in EVICTED state in CacheMetaContainer::TryLockAndPinEntry()");
         }
         _locks[bucket_idx].Unlock();
@@ -152,11 +152,11 @@ public:
     }
 
     void UnpinEntry(BufferEntry* entry) {
-        CHECK_NOT_NULLPTR(entry, LOG_TAG_BASIC);
-        FatalAssert(entry->pin > 0, LOG_TAG_BASIC,
+        CHECK_NOT_NULLPTR(entry, LOG_TAG_BUFFER);
+        FatalAssert(entry->pin > 0, LOG_TAG_BUFFER,
                     "Cannot unpin an entry with pin count 0 in CacheMetaContainer::UnpinEntry()");
         FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED,
-                    LOG_TAG_BASIC,
+                    LOG_TAG_BUFFER,
                     "Unpinned entry must be in CACHED state in CacheMetaContainer::UnpinEntry()");
         size_t hash_value = _hash(entry);
         size_t bucket_idx = hash_value % _num_buckets;
@@ -173,12 +173,12 @@ public:
     }
 
     size_t TryMoveToCooling(uint64_t num_pages, void** freed_pages, size_t max_pages_needed) {
-        FatalAssert(num_pages > 0, LOG_TAG_BASIC,
+        FatalAssert(num_pages > 0, LOG_TAG_BUFFER,
                     "num_pages must be greater than 0 in CacheMetaContainer::TryMoveToCooling()");
-        FatalAssert(num_pages <= ((_num_buckets * _bucket_cap) / 10), LOG_TAG_BASIC,
+        FatalAssert(num_pages <= ((_num_buckets * _bucket_cap) / 10), LOG_TAG_BUFFER,
                     "num_pages exceeds total capacity in CacheMetaContainer::TryMoveToCooling()");
-        CHECK_NOT_NULLPTR(freed_pages, LOG_TAG_BASIC);
-        FatalAssert(max_pages_needed > 0, LOG_TAG_BASIC,
+        CHECK_NOT_NULLPTR(freed_pages, LOG_TAG_BUFFER);
+        FatalAssert(max_pages_needed > 0, LOG_TAG_BUFFER,
                     "max_pages_needed must be greater than 0 in CacheMetaContainer::TryMoveToCooling()");
 
         /* todo: check stats */
@@ -208,13 +208,13 @@ public:
             }
             _hot_entries[bucket_idx].pop_back();
             _num_hot_entries.fetch_sub(1);
-            FatalAssert(entry != nullptr, LOG_TAG_BASIC,
+            FatalAssert(entry != nullptr, LOG_TAG_BUFFER,
                         "Hot entry is null in CacheMetaContainer::TryMoveToCooling()");
             FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED,
-                        LOG_TAG_BASIC,
+                        LOG_TAG_BUFFER,
                         "Hot entry is not in CACHED state in CacheMetaContainer::TryMoveToCooling()");
             FatalAssert(entry->pin == 0,
-                        LOG_TAG_BASIC,
+                        LOG_TAG_BUFFER,
                         "Hot entry is pinned in CacheMetaContainer::TryMoveToCooling()");
             entry->lock.Lock(SX_EXCLUSIVE);
             _locks[bucket_idx].Unlock();
@@ -224,10 +224,10 @@ public:
             size_t idx = _cooling_bucket_next_idx[bucket_idx] + _bucket_cap * bucket_idx;
             if (_cooling_entries[idx] != nullptr) {
                 FatalAssert(_cooling_entries[idx]->state == BufferEntryState::BUFFER_ENTRY_COOLING,
-                            LOG_TAG_BASIC,
+                            LOG_TAG_BUFFER,
                             "Cooling entry slot is occupied by a non-cooling entry in CacheMetaContainer::TryMoveToCooling()");
                 FatalAssert(_cooling_entries[idx]->pin == 0,
-                            LOG_TAG_BASIC,
+                            LOG_TAG_BUFFER,
                             "Cooling entry slot is occupied by a pinned entry in CacheMetaContainer::TryMoveToCooling()");
                 _cooling_entries[idx]->state = BufferEntryState::BUFFER_ENTRY_EVICTED;
                 if (num_freed < max_pages_needed) {
@@ -278,7 +278,7 @@ public:
     static RetStatus Init(size_t page_size, size_t pool_size, BlockingQueue<IVFSearchTask*>* search_task_queue,
                           uint16_t dim, uint8_t self_node_idx, size_t num_user_threads,
                           ClusterMeta*& centroids, VTYPE*& centroid_data, size_t& num_centroids) {
-        FatalAssert(instance == nullptr, LOG_TAG_BASIC,
+        FatalAssert(instance == nullptr, LOG_TAG_BUFFER,
                     "BufferMgr is already initialized!");
         instance = new BufferMgr(page_size, pool_size, search_task_queue, dim,
                                  self_node_idx, num_user_threads, centroids, centroid_data, num_centroids);
@@ -286,11 +286,11 @@ public:
     }
 
     static RetStatus Destroy() {
-        FatalAssert(instance != nullptr, LOG_TAG_BASIC,
+        FatalAssert(instance != nullptr, LOG_TAG_BUFFER,
                     "BufferMgr is not initialized!");
         std::vector<VectorID> completed_tasks;
         RDMA_Manager::DestroyInstance(completed_tasks);
-        FatalAssert(completed_tasks.empty(), LOG_TAG_BASIC,
+        FatalAssert(completed_tasks.empty(), LOG_TAG_BUFFER,
                     "There are unprocessed completed RDMA tasks during BufferMgr destruction!");
         delete instance;
         instance = nullptr;
@@ -298,29 +298,29 @@ public:
     }
 
     static BufferMgr* GetInstance() {
-        FatalAssert(instance != nullptr, LOG_TAG_BASIC,
+        FatalAssert(instance != nullptr, LOG_TAG_BUFFER,
                     "BufferMgr is not initialized!");
         return instance;
     }
 
     RetStatus PrefetchClustersForSearch(const VectorID* cluster_ids, size_t num_clusters,
                                         IVFSearchTaskFactory* task_factory) {
-        FatalAssert(this == instance, LOG_TAG_BASIC,
+        FatalAssert(this == instance, LOG_TAG_BUFFER,
                     "BufferMgr instance mismatch in BufferMgr::PrefetchClusters()");
-        CHECK_NOT_NULLPTR(cluster_ids, LOG_TAG_BASIC);
-        FatalAssert(num_clusters > 0, LOG_TAG_BASIC,
+        CHECK_NOT_NULLPTR(cluster_ids, LOG_TAG_BUFFER);
+        FatalAssert(num_clusters > 0, LOG_TAG_BUFFER,
                     "num_clusters must be greater than 0 in BufferMgr::PrefetchClusters()");
 
         RetStatus status = RetStatus::Success();
         RDMA_Manager* rdma_mgr = RDMA_Manager::GetInstance();
-        CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BASIC);
+        CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BUFFER);
         task_factory->num_sibling_tasks = 0;
 
         std::vector<size_t> current_indices;
         current_indices.reserve(num_clusters);
         for (size_t i = 0; i < num_clusters; ++i) {
             auto it = _buffer_map.find(cluster_ids[i]);
-            FatalAssert(it != _buffer_map.end(), LOG_TAG_BASIC,
+            FatalAssert(it != _buffer_map.end(), LOG_TAG_BUFFER,
                         "Cluster ID not found in BufferMgr::PrefetchClusters()");
             task_factory->num_sibling_tasks += it->second.num_pages;
             current_indices.push_back(i);
@@ -344,12 +344,12 @@ public:
                 }
 
                 if (entry.state == BufferEntryState::BUFFER_ENTRY_LOADING) {
-                    FatalAssert(!entry.pending.empty(), LOG_TAG_BASIC,
+                    FatalAssert(!entry.pending.empty(), LOG_TAG_BUFFER,
                                 "BufferEntry in LOADING state must have pending tasks");
                     entry.pending.push_back(task_factory);
                     entry.lock.Unlock();
                 } else if (entry.state == BufferEntryState::BUFFER_ENTRY_EVICTED) {
-                    FatalAssert(entry.pending.empty(), LOG_TAG_BASIC,
+                    FatalAssert(entry.pending.empty(), LOG_TAG_BUFFER,
                                 "BufferEntry in EVICTED state must not have pending tasks");
                     entry.state = BufferEntryState::BUFFER_ENTRY_LOADING;
                     entry.pending.push_back(task_factory);
@@ -357,21 +357,21 @@ public:
                     to_load.push_back(cluster_ids[i]);
                     num_pages_to_load += entry.num_pages;
                 } else {
-                    FatalAssert(entry.pending.empty(), LOG_TAG_BASIC,
+                    FatalAssert(entry.pending.empty(), LOG_TAG_BUFFER,
                                 "BufferEntry in EVICTED state must not have pending tasks");
                     FatalAssert(entry.state == BufferEntryState::BUFFER_ENTRY_CACHED,
-                                LOG_TAG_BASIC,
+                                LOG_TAG_BUFFER,
                                 "BufferEntry must be in CACHED state in BufferMgr::PrefetchClusters()");
                     for (size_t p = 0; p < entry.num_pages; ++p) {
-                        FatalAssert(entry.page_num_elements[p] > 0, LOG_TAG_BASIC,
+                        FatalAssert(entry.page_num_elements[p] > 0, LOG_TAG_BUFFER,
                                     "Page must contain at least one element in BufferMgr::PrefetchClusters()");
-                        FatalAssert(entry.pages[p] != nullptr, LOG_TAG_BASIC,
+                        FatalAssert(entry.pages[p] != nullptr, LOG_TAG_BUFFER,
                                     "Page pointer cannot be null in BufferMgr::PrefetchClusters()");
                         FatalAssert(entry.page_num_elements[p] * element_size <= _cache.GetPageSize(),
-                                    LOG_TAG_BASIC,
+                                    LOG_TAG_BUFFER,
                                     "Page size is smaller than number of elements in BufferMgr::PrefetchClusters()");
                         IVFSearchTask* task = task_factory->CreateTask(
-                            entry.page_num_elements[p] * element_size,
+                            entry.page_num_elements[p],
                             reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(entry.pages[p])));
                         in_cache_tasks.push_back(task);
                     }
@@ -381,7 +381,7 @@ public:
 
             if (!in_cache_tasks.empty()) {
                 bool res = _search_task_queue->BatchPush(in_cache_tasks.data(), in_cache_tasks.size());
-                FatalAssert(res, LOG_TAG_BASIC,
+                FatalAssert(res, LOG_TAG_BUFFER,
                             "Failed to push in-cache search tasks to search task queue in BufferMgr::PrefetchClusters()");
                 UNUSED_VARIABLE(res);
                 in_cache_tasks.clear();
@@ -398,7 +398,7 @@ public:
 
         if (!to_load.empty()) {
             status = ReadFromRemote(std::move(to_load), element_size, num_pages_to_load);
-            FatalAssert(status.IsOK(), LOG_TAG_BASIC,
+            FatalAssert(status.IsOK(), LOG_TAG_BUFFER,
                         "Failed to issue RDMA reads in BufferMgr::PrefetchClusters(): %s",
                         status.Msg());
         }
@@ -409,44 +409,45 @@ public:
     RetStatus PollRemoteReads() {
         RetStatus status = RetStatus::Success();
         RDMA_Manager* rdma_mgr = RDMA_Manager::GetInstance();
-        CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BASIC);
+        CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BUFFER);
         /*  to avoid contention */
         if (!_poll_lock.TryLock(SX_EXCLUSIVE)) {
             return status;
         }
         std::vector<VectorID> completed_tasks;
         status = rdma_mgr->PushCompletedReadsToTaskQueue(completed_tasks);
-        FatalAssert(status.IsOK(), LOG_TAG_BASIC,
+        FatalAssert(status.IsOK(), LOG_TAG_BUFFER,
                     "Failed to poll completed RDMA reads in BufferMgr::PollRemoteReads(): %s",
                     status.Msg());
 
         std::vector<IVFSearchTask*> new_tasks;
         for (VectorID cluster_id : completed_tasks) {
             auto it = _buffer_map.find(cluster_id);
-            FatalAssert(it != _buffer_map.end(), LOG_TAG_BASIC,
+            FatalAssert(it != _buffer_map.end(), LOG_TAG_BUFFER,
                         "Cluster ID not found in BufferMgr::PollRemoteReads()");
             BufferEntry& entry = it->second;
             entry.lock.Lock(SX_EXCLUSIVE);
-            FatalAssert(entry.state == BufferEntryState::BUFFER_ENTRY_LOADING, LOG_TAG_BASIC,
+            FatalAssert(entry.state == BufferEntryState::BUFFER_ENTRY_LOADING, LOG_TAG_BUFFER,
                         "BufferEntry must be in LOADING state in BufferMgr::PollRemoteReads()");
-            FatalAssert(!entry.pending.empty(), LOG_TAG_BASIC,
+            FatalAssert(!entry.pending.empty(), LOG_TAG_BUFFER,
                         "BufferEntry in LOADING state must have pending tasks in BufferMgr::PollRemoteReads()");
-            FatalAssert(entry.pin > 0, LOG_TAG_BASIC,
+            FatalAssert(entry.pin > 0, LOG_TAG_BUFFER,
                         "BufferEntry must be pinned in BufferMgr::PollRemoteReads()");
             entry.state = BufferEntryState::BUFFER_ENTRY_CACHED;
 
             for (IVFSearchTaskFactory* task_factory : entry.pending) {
                 size_t element_size = (task_factory->is_leaf ? sizeof(IVFVectorID) : sizeof(VectorID)) + sizeof(VTYPE) * _dim;
+                UNUSED_VARIABLE(element_size);
                 for (size_t p = 0; p < entry.num_pages; ++p) {
-                    FatalAssert(entry.page_num_elements[p] > 0, LOG_TAG_BASIC,
+                    FatalAssert(entry.page_num_elements[p] > 0, LOG_TAG_BUFFER,
                                 "Page must contain at least one element in BufferMgr::PollRemoteReads()");
-                    FatalAssert(entry.pages[p] != nullptr, LOG_TAG_BASIC,
+                    FatalAssert(entry.pages[p] != nullptr, LOG_TAG_BUFFER,
                                 "Page pointer cannot be null in BufferMgr::PollRemoteReads()");
                     FatalAssert(entry.page_num_elements[p] * element_size <= _cache.GetPageSize(),
-                                LOG_TAG_BASIC,
+                                LOG_TAG_BUFFER,
                                 "Page size is smaller than number of elements in BufferMgr::PollRemoteReads()");
                     IVFSearchTask* task = task_factory->CreateTask(
-                        entry.page_num_elements[p] * element_size,
+                        entry.page_num_elements[p],
                         reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(entry.pages[p])));
                     new_tasks.push_back(task);
                 }
@@ -457,7 +458,7 @@ public:
 
         if (!new_tasks.empty()) {
             bool res = _search_task_queue->BatchPush(new_tasks.data(), new_tasks.size());
-            FatalAssert(res, LOG_TAG_BASIC,
+            FatalAssert(res, LOG_TAG_BUFFER,
                         "Failed to push newly created search tasks to search task queue in BufferMgr::PollRemoteReads()");
             UNUSED_VARIABLE(res);
             new_tasks.clear();
@@ -477,23 +478,23 @@ protected:
         _cache_meta_container(std::max((size_t)((pool_size / page_size) * COOLING_SIZE_RATIO), 1lu),
                               num_user_threads * 2, &_cache),
         _search_task_queue(search_task_queue) {
-        FatalAssert(_search_task_queue != nullptr, LOG_TAG_BASIC,
+        FatalAssert(_search_task_queue != nullptr, LOG_TAG_BUFFER,
                     "search_task_queue cannot be null in BufferMgr constructor");
-        FatalAssert(num_user_threads > 0, LOG_TAG_BASIC,
+        FatalAssert(num_user_threads > 0, LOG_TAG_BUFFER,
                     "num_user_threads must be greater than 0 in BufferMgr constructor");
-        FatalAssert(IS_COMPUTE_NODE(), LOG_TAG_BASIC,
+        FatalAssert(IS_COMPUTE_NODE(), LOG_TAG_BUFFER,
                     "BufferMgr can only be initialized on compute nodes");
-        FatalAssert(page_size > 0, LOG_TAG_BASIC,
+        FatalAssert(page_size > 0, LOG_TAG_BUFFER,
                     "page_size must be greater than 0 in BufferMgr constructor");
-        FatalAssert(pool_size >= page_size, LOG_TAG_BASIC,
+        FatalAssert(pool_size >= page_size, LOG_TAG_BUFFER,
                     "pool_size must be at least equal to page_size in BufferMgr constructor");
-        FatalAssert(pool_size % page_size == 0, LOG_TAG_BASIC,
+        FatalAssert(pool_size % page_size == 0, LOG_TAG_BUFFER,
                     "pool_size must be multiple of page_size in BufferMgr constructor");
-        FatalAssert(dim > 0, LOG_TAG_BASIC,
+        FatalAssert(dim > 0, LOG_TAG_BUFFER,
                     "dim must be greater than 0 in BufferMgr constructor");
-        FatalAssert(centroids == nullptr, LOG_TAG_BASIC,
+        FatalAssert(centroids == nullptr, LOG_TAG_BUFFER,
                     "centroids must be null in BufferMgr constructor");
-        FatalAssert(centroid_data == nullptr, LOG_TAG_BASIC,
+        FatalAssert(centroid_data == nullptr, LOG_TAG_BUFFER,
                     "centroid_data must be null in BufferMgr constructor");
         RetStatus status = RetStatus::Success();
         network_config::self_idx = self_node_idx;
@@ -515,23 +516,25 @@ protected:
                 network_config::self_idx,
                 num_user_threads
             );
-        FatalAssert(status.IsOK(), LOG_TAG_BASIC,
+        FatalAssert(status.IsOK(), LOG_TAG_BUFFER,
                     "Failed to initialize RDMA_Manager in BufferMgr::Init(): %s",
                     status.Msg());
         RDMA_Manager* rdma_mgr = RDMA_Manager::GetInstance();
-        CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BASIC);
+        CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BUFFER);
         status = rdma_mgr->RegisterMemory(_cache.GetBaseAddress(), _cache.GetPoolSize());
-        FatalAssert(status.IsOK(), LOG_TAG_BASIC,
+        FatalAssert(status.IsOK(), LOG_TAG_BUFFER,
                     "Failed to register memory in BufferMgr::Init(): %s",
                     status.Msg());
         status = rdma_mgr->EstablishConnections();
-        FatalAssert(status.IsOK(), LOG_TAG_BASIC,
+        FatalAssert(status.IsOK(), LOG_TAG_BUFFER,
                     "Failed to establish RDMA connections in BufferMgr::Init(): %s",
                     status.Msg());
 
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
+                "RDMA_Manager initialized successfully in BufferMgr::Init(). Waiting to receive centroids...");
         NodeID mnode_id = rdma_mgr->GetMemoryNodeID();
         rdma_mgr->ReceiveMessage(mnode_id, &num_centroids, sizeof(num_centroids));
-        FatalAssert(num_centroids > 0, LOG_TAG_BASIC,
+        FatalAssert(num_centroids > 0, LOG_TAG_BUFFER,
                     "Number of centroids must be greater than 0 in BufferMgr::Init()");
 
         centroids = new ClusterMeta[num_centroids];
@@ -549,13 +552,12 @@ protected:
 
     }
 
-    ~BufferMgr() {
-    }
+    ~BufferMgr() {}
 
     RetStatus ReadFromRemote(std::vector<VectorID>&& cluster_ids, size_t element_size, size_t num_pages_to_load) {
         RetStatus status = RetStatus::Success();
         RDMA_Manager* rdma_mgr = RDMA_Manager::GetInstance();
-        CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BASIC);
+        CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BUFFER);
         NodeID mnode_id = rdma_mgr->GetMemoryNodeID();
         bool use_sg = (num_pages_to_load != cluster_ids.size());
         void** local_buffers = new void*[num_pages_to_load];
@@ -572,14 +574,14 @@ protected:
             }
 
             if (num_allocated < num_pages_to_load) {
-                DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_BASIC,
+                DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_BUFFER,
                         "Not enough free pages in BufferMgr::ReadFromRemote(), allocated %zu out of %zu needed. Retrying...",
                         num_allocated, num_pages_to_load);
                 usleep(1);
             }
         }
 
-        FatalAssert(num_allocated == num_pages_to_load, LOG_TAG_BASIC,
+        FatalAssert(num_allocated == num_pages_to_load, LOG_TAG_BUFFER,
                     "Failed to allocate enough pages in BufferMgr::ReadFromRemote()");
         /* todo: more efficnet implementation */
         if (use_sg) {
@@ -590,7 +592,7 @@ protected:
             uintptr_t* remote_addrs = new uintptr_t[cluster_ids.size()];
             for (size_t i = 0; i < cluster_ids.size(); ++i) {
                 auto it = _buffer_map.find(cluster_ids[i]);
-                FatalAssert(it != _buffer_map.end(), LOG_TAG_BASIC,
+                FatalAssert(it != _buffer_map.end(), LOG_TAG_BUFFER,
                             "Cluster ID not found in BufferMgr::ReadFromRemote()");
                 BufferEntry& entry = it->second;
                 remote_addrs[i] = entry.remote_addr;
@@ -600,17 +602,17 @@ protected:
                 for (size_t p = 0; p < entry.num_pages; ++p) {
                     entry.pages[p] = local_buffers[num_used + p];
                     sizes[i][p] = entry.page_num_elements[p] * element_size;
-                    FatalAssert(sizes[i][p] <= _cache.GetPageSize(), LOG_TAG_BASIC,
+                    FatalAssert(sizes[i][p] <= _cache.GetPageSize(), LOG_TAG_BUFFER,
                                 "Page size is smaller than number of elements in BufferMgr::ReadFromRemote()");
                 }
                 num_used += entry.num_pages;
             }
-            FatalAssert(num_used == num_pages_to_load, LOG_TAG_BASIC,
+            FatalAssert(num_used == num_pages_to_load, LOG_TAG_BUFFER,
                         "Number of pages to load mismatch in BufferMgr::ReadFromRemote()");
             status = rdma_mgr->RDMASGRead(mnode_id, local_addrs, remote_addrs,
                                           reinterpret_cast<uint32_t**>(sizes), num_sge,
                                           cluster_ids.size(), std::move(cluster_ids));
-            FatalAssert(status.IsOK(), LOG_TAG_BASIC,
+            FatalAssert(status.IsOK(), LOG_TAG_BUFFER,
                         "Failed to issue scatter-gather RDMA read in BufferMgr::ReadFromRemote(): %s",
                         status.Msg());
             delete[] local_addrs;
@@ -622,25 +624,25 @@ protected:
             size_t* sizes = new size_t[cluster_ids.size()];
             for (size_t i = 0; i < cluster_ids.size(); ++i) {
                 auto it = _buffer_map.find(cluster_ids[i]);
-                FatalAssert(it != _buffer_map.end(), LOG_TAG_BASIC,
+                FatalAssert(it != _buffer_map.end(), LOG_TAG_BUFFER,
                             "Cluster ID not found in BufferMgr::ReadFromRemote()");
                 BufferEntry& entry = it->second;
                 remote_addrs[i] = entry.remote_addr;
                 sizes[i] = entry.total_size_bytes;
-                FatalAssert(sizes[i] <= _cache.GetPageSize() * entry.num_pages, LOG_TAG_BASIC,
+                FatalAssert(sizes[i] <= _cache.GetPageSize() * entry.num_pages, LOG_TAG_BUFFER,
                             "Total cluster size exceeds allocated pages in BufferMgr::ReadFromRemote()");
-                FatalAssert(sizes[i] > 0, LOG_TAG_BASIC,
+                FatalAssert(sizes[i] > 0, LOG_TAG_BUFFER,
                             "Cluster size must be greater than 0 in BufferMgr::ReadFromRemote()");
-                FatalAssert(entry.num_pages == 1, LOG_TAG_BASIC,
+                FatalAssert(entry.num_pages == 1, LOG_TAG_BUFFER,
                             "Cluster with multiple pages must use scatter-gather RDMA read in BufferMgr::ReadFromRemote()");
-                FatalAssert(entry.page_num_elements[0] * element_size == sizes[i], LOG_TAG_BASIC,
+                FatalAssert(entry.page_num_elements[0] * element_size == sizes[i], LOG_TAG_BUFFER,
                             "Cluster size does not match number of elements in BufferMgr::ReadFromRemote()");
                 entry.pages[0] = local_buffers[i];
             }
             status = rdma_mgr->RDMARead(mnode_id, local_buffers, remote_addrs,
                                        reinterpret_cast<uint32_t*>(sizes),
                                        cluster_ids.size(), std::move(cluster_ids));
-            FatalAssert(status.IsOK(), LOG_TAG_BASIC,
+            FatalAssert(status.IsOK(), LOG_TAG_BUFFER,
                         "Failed to issue RDMA read in BufferMgr::ReadFromRemote(): %s",
                         status.Msg());
             delete[] remote_addrs;
