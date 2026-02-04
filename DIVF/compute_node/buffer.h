@@ -643,7 +643,7 @@ protected:
         if (use_sg) {
             size_t num_used = 0;
             void*** local_addrs = new void**[cluster_ids.size()];
-            size_t** sizes = new size_t*[cluster_ids.size()];
+            uint32_t** sizes = new uint32_t*[cluster_ids.size()];
             uint32_t* num_sge = new uint32_t[cluster_ids.size()];
             uintptr_t* remote_addrs = new uintptr_t[cluster_ids.size()];
             for (size_t i = 0; i < cluster_ids.size(); ++i) {
@@ -654,7 +654,7 @@ protected:
                 remote_addrs[i] = entry.remote_addr;
                 num_sge[i] = entry.num_pages;
                 local_addrs[i] = local_buffers + num_used;
-                sizes[i] = new size_t[entry.num_pages];
+                sizes[i] = new uint32_t[entry.num_pages];
                 for (size_t p = 0; p < entry.num_pages; ++p) {
                     entry.pages[p] = local_buffers[num_used + p];
                     sizes[i][p] = entry.page_num_elements[p] * element_size;
@@ -667,8 +667,7 @@ protected:
             }
             FatalAssert(num_used == num_pages_to_load, LOG_TAG_BUFFER,
                         "Number of pages to load mismatch in BufferMgr::ReadFromRemote()");
-            status = rdma_mgr->RDMASGRead(mnode_id, local_addrs, remote_addrs,
-                                          reinterpret_cast<uint32_t**>(sizes), num_sge,
+            status = rdma_mgr->RDMASGRead(mnode_id, local_addrs, remote_addrs, sizes, num_sge,
                                           cluster_ids.size(), std::move(cluster_ids));
             FatalAssert(status.IsOK(), LOG_TAG_BUFFER,
                         "Failed to issue scatter-gather RDMA read in BufferMgr::ReadFromRemote(): %s",
@@ -679,7 +678,7 @@ protected:
             delete[] remote_addrs;
         } else {
             uintptr_t* remote_addrs = new uintptr_t[cluster_ids.size()];
-            size_t* sizes = new size_t[cluster_ids.size()];
+            uint32_t* sizes = new uint32_t[cluster_ids.size()];
             for (size_t i = 0; i < cluster_ids.size(); ++i) {
                 auto it = _buffer_map.find(cluster_ids[i]);
                 FatalAssert(it != _buffer_map.end(), LOG_TAG_BUFFER,
@@ -697,8 +696,7 @@ protected:
                             "Cluster size does not match number of elements in BufferMgr::ReadFromRemote()");
                 entry.pages[0] = local_buffers[i];
             }
-            status = rdma_mgr->RDMARead(mnode_id, local_buffers, remote_addrs,
-                                       reinterpret_cast<uint32_t*>(sizes),
+            status = rdma_mgr->RDMARead(mnode_id, local_buffers, remote_addrs, sizes,
                                        cluster_ids.size(), std::move(cluster_ids));
             FatalAssert(status.IsOK(), LOG_TAG_BUFFER,
                         "Failed to issue RDMA read in BufferMgr::ReadFromRemote(): %s",

@@ -9,23 +9,23 @@ MN_CONF_FILE="disaggregated_bench/memory_node/run.conf"
 VAR_LOG_OUTPUT_PATH=$ROOT/disaggregated_bench/out/logs/
 
 VAR_DEF_K=1
-VAR_N_PROBES=64
-VAR_BUILT_SIZE=$(( 1024 * 1024 * 4 )) #num embedings to insert during build
-VAR_AVG_NUM_VEC_PER_CLUSTER=$((1024 * 2))
+VAR_N_PROBES=4
+VAR_BUILT_SIZE=$(( 1024 * 32 )) #num embedings to insert during build
+VAR_AVG_NUM_VEC_PER_CLUSTER=$((512))
 VAR_NUM_CLUSTERS=$((VAR_BUILT_SIZE / VAR_AVG_NUM_VEC_PER_CLUSTER))
 VAR_KMEANS_MAX_ITERS=10
 VAR_INSERT_DUPLICATES=0 #1 to allow inserting duplicate vectors and 0 to not allow
 
-VAR_NUM_QUERY_THREADS=160
+VAR_NUM_QUERY_THREADS=16
 VAR_BUILD_NUM_THREADS=160
 
 VAR_PAGE_SIZE=$((VAR_AVG_NUM_VEC_PER_CLUSTER * 256)) # should be power of 2
-VAR_POOL_SIZE=$((1024 * 1024 * 1024 * 16)) #16GB
+VAR_POOL_SIZE=$((1024 * 1024 * 128)) #128MB
 
-VAR_WARMUP_TIME_SEC=10 #only search
-VAR_RUN_TIME_SEC=30 #real test used for stat collection
+VAR_WARMUP_TIME_SEC=60 #only search
+VAR_RUN_TIME_SEC=60 #real test used for stat collection
 
-VAR_RUNTIME_THROUGHPUT_REPORT_SEC=1 #use 0 to disable
+VAR_RUNTIME_THROUGHPUT_REPORT_SEC=5 #use 0 to disable
 VAR_SHOW_RUNTIME_REPORT_FOR_BUILD_AND_WARMUP=1 #1 to show throughput report during build and warmup phases
 
 VAR_COLLECT_AVG_DISTANCES=1 #1 to collect and print average distances during searches

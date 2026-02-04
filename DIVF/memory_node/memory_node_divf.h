@@ -817,7 +817,7 @@ protected:
         VTYPE* centroid_data = new VTYPE[num_centroids * dim];
         for (size_t c = 0; c < num_centroids; ++c) {
             centroids[c].centroid_id = clusters[c].centroid_id;
-            centroids[c].remote_addr = reinterpret_cast<uint64_t>(clusters[c].data);
+            centroids[c].remote_addr = reinterpret_cast<uintptr_t>(clusters[c].data);
             centroids[c].remote_size = clusters[c].num_points * (sizeof(IVFVectorID) + (dim * sizeof(VTYPE)));
             DIVF_MEMCOPY(
                 centroid_data + (c * dim),

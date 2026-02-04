@@ -382,7 +382,7 @@ EXIT:
             return RetStatus::Fail("RDMA_Manager is not ready for RDMA operations.");
         }
 
-        uint8_t connection_idx = GrabConnection(target_node);
+        uint8_t connection_idx = GrabConnection(target_node, num_clusters);
         auto it = memory_nodes.find(target_node);
         FatalAssert(it != memory_nodes.end(), LOG_TAG_RDMA,
                     "Target memory node not found!");
@@ -412,17 +412,17 @@ EXIT:
             return RetStatus::Fail("RDMA_Manager is not ready for RDMA operations.");
         }
 
-        uint8_t connection_idx = GrabConnection(target_node);
+        uint8_t connection_idx = GrabConnection(target_node, num_clusters);
         auto it = memory_nodes.find(target_node);
         FatalAssert(it != memory_nodes.end(), LOG_TAG_RDMA,
                     "Target memory node not found!");
         ConnectionContext& ctx = it->second;
         TaskID task_id(ctx.connections[connection_idx].next_task_id.fetch_add(1), connection_idx, target_node);
-        SANITY_CHECK({
+        SANITY_CHECK(
             std::vector<VectorID> cluster_ids_copy(cluster_ids);
-            FatalAsssert(cluster_ids.size() == num_clusters, LOG_TAG_RDMA,
+            FatalAssert(cluster_ids.size() == num_clusters, LOG_TAG_RDMA,
                         "Number of cluster IDs does not match num_clusters in RDMASGReadInternal()");
-        });
+        );
         pending_tasks.BatchInsert(task_id, std::move(cluster_ids));
         return RDMASGReadInternal(target_node, connection_idx, task_id,
                                   local_buffers, remote_addresses, sizes, num_sge,
@@ -477,15 +477,19 @@ EXIT:
                 FatalAssert(it != memory_nodes.end(), LOG_TAG_RDMA,
                             "Target memory node not found!");
                 ConnectionInfo& conn_info = it->second.connections[task_id.connection_idx];
+                size_t old_size = completed_tasks.size();
                 bool erased = pending_tasks.Erase(task_id, completed_tasks);
                 FatalAssert(erased, LOG_TAG_RDMA,
                             "Completed task ID not found in pending tasks!");
                 UNUSED_VARIABLE(erased);
+                size_t num_completed = completed_tasks.size() - old_size;
+                FatalAssert(num_completed > 0, LOG_TAG_RDMA,
+                            "Number of completed tasks should be greater than 0 after erasing from pending tasks!");
                 uint16_t num_pending =
-                    conn_info.num_pending_requests.fetch_sub(1);
-                FatalAssert(num_pending > 0, LOG_TAG_RDMA,
+                    conn_info.num_pending_requests.fetch_sub(num_completed);
+                FatalAssert(num_pending >= num_completed, LOG_TAG_RDMA,
                             "Number of pending requests underflowed!");
-                if (destroying && ((num_pending - 1) > 0)) {
+                if (destroying && ((num_pending - num_completed) > 0)) {
                     done = false;
                 }
             }
@@ -1578,7 +1582,7 @@ EXIT:
         return rs;
     }
 
-    uint8_t GrabConnection(NodeID target) {
+    uint8_t GrabConnection(NodeID target, size_t num_clusters) {
         FatalAssert(target.IsMemoryNode(), LOG_TAG_RDMA,
                     "Only connections to memory nodes can be grabbed.");
         FatalAssert(selfInfo.node_id.IsComputeNode(), LOG_TAG_RDMA,
@@ -1606,9 +1610,9 @@ EXIT:
                 continue;
             }
 
-            uint32_t num_pending = ctx.connections[idx].num_pending_requests.fetch_add(1) + 1;
+            uint32_t num_pending = ctx.connections[idx].num_pending_requests.fetch_add(num_clusters) + num_clusters;
             if (num_pending >= MAX_SEND_WR[COMPUTE_NODE_IDX]) {
-                ctx.connections[idx].num_pending_requests.fetch_sub(1);
+                ctx.connections[idx].num_pending_requests.fetch_sub(num_clusters);
                 idx = (idx + 1) % MAX_CONN_PER_NODE;
                 DIVFTREE_YIELD();
                 continue;
@@ -1765,11 +1769,6 @@ EXIT:
                         "num_sge[%zu] is zero in RDMASGRead", i);
             CHECK_NOT_NULLPTR(local_buffers[i], LOG_TAG_RDMA);
             CHECK_NOT_NULLPTR(sizes[i], LOG_TAG_RDMA);
-            FatalAssert(remote_addresses[i] >= conn_ctx.remote_region_addr &&
-                        (remote_addresses[i] + sizes[i][0]) <=
-                        (conn_ctx.remote_region_addr + conn_ctx.remote_region_size),
-                        LOG_TAG_RDMA,
-                        "remote_address[%zu] is out of remote registered memory region in RDMASGRead", i);
             sge_list[i] = new ibv_sge[num_sge[i]];
             for (size_t j = 0; j < num_sge[i]; ++j) {
                 FatalAssert(local_buffers[i][j] != nullptr, LOG_TAG_RDMA,
@@ -1781,6 +1780,11 @@ EXIT:
                             (reinterpret_cast<uintptr_t>(mr->addr) + mr->length),
                             LOG_TAG_RDMA,
                             "local_buffer[%zu][%zu] is out of registered memory region in RDMASGRead", i, j);
+                FatalAssert(remote_addresses[i] >= conn_ctx.remote_region_addr &&
+                            (remote_addresses[i] + sizes[i][j]) <=
+                            (conn_ctx.remote_region_addr + conn_ctx.remote_region_size),
+                            LOG_TAG_RDMA,
+                            "remote_address[%zu] is out of remote registered memory region in RDMASGRead", i);
 
                 sge_list[i][j].addr = reinterpret_cast<uintptr_t>(local_buffers[i][j]);
                 sge_list[i][j].length = sizes[i][j];
