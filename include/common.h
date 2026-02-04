@@ -72,11 +72,18 @@ struct RetStatus {
     const char* message = nullptr;
 
     static inline RetStatus Success() {
-        return RetStatus{SUCCESS, "OK"};
+        RetStatus status;
+        status.stat = SUCCESS;
+        status.message = nullptr;
+        return status;
     }
 
     static inline RetStatus Fail(const char* msg) {
-        return RetStatus{FAIL, msg};
+        RetStatus status;
+        status.stat = FAIL;
+        status.message = new char[strlen(msg) + 1];
+        strcpy(const_cast<char*>(status.message), msg);
+        return status;
     }
 
     inline bool IsOK() const {
@@ -86,6 +93,49 @@ struct RetStatus {
     inline const char* Msg() const {
         return message;
     }
+
+    ~RetStatus() {
+        if (message != nullptr) {
+            delete[] message;
+            message = nullptr;
+        }
+    }
+
+    inline void operator=(const RetStatus& other) {
+        stat = other.stat;
+        if (message != nullptr) {
+            delete[] message;
+            message = nullptr;
+        }
+        if (other.message != nullptr) {
+            message = new char[strlen(other.message) + 1];
+            strcpy(const_cast<char*>(message), other.message);
+        }
+    }
+
+    inline void operator=(RetStatus&& other) {
+        stat = other.stat;
+        message = other.message;
+        other.message = nullptr;
+    }
+
+    RetStatus(const RetStatus& other) {
+        stat = other.stat;
+        if (other.message != nullptr) {
+            message = new char[strlen(other.message) + 1];
+            strcpy(const_cast<char*>(message), other.message);
+        } else {
+            message = nullptr;
+        }
+    }
+
+    RetStatus(RetStatus&& other) {
+        stat = other.stat;
+        message = other.message;
+        other.message = nullptr;
+    }
+
+    RetStatus() = default;
 };
 
 typedef uint64_t RawVectorID;
@@ -881,21 +931,12 @@ String ANNVectorInfoToString(const ANNVectorInfo& target) {
                  target.distance_to_query, VECTORID_LOG(target.id), target.version.ToString().ToCStr());
 }
 
-struct L2DTYPEIDPairCMP {
-    inline int operator()(const std::pair<DTYPE, IVFVectorID>& a,
-                          const std::pair<DTYPE, IVFVectorID>& b) const {
-        return L2::MoreSimilar(a.first, b.first);
-    }
-
-    inline int operator()(const std::pair<DTYPE, VectorID>& a,
-                          const std::pair<DTYPE, VectorID>& b) const {
-        return L2::MoreSimilar(a.first, b.first);
-    }
-};
+struct L2DTYPEIDPairCMP;
 
 struct IVFSearchTask {
     const VTYPE* query_vector;
     const size_t num_sibling_tasks;
+    const VectorID cluster_id;
     size_t top_k;
     size_t cluster_partition_num_elements;
     void* cluster_partition_address;
@@ -920,10 +961,12 @@ struct IVFSearchTaskFactory {
         SortedList<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP>* top_centroids;
     };
 
-    inline IVFSearchTask* CreateTask(size_t cluster_partition_num_elements, void* cluster_partition_address) {
+    inline IVFSearchTask* CreateTask(VectorID cluster_id, size_t cluster_partition_num_elements,
+                                     void* cluster_partition_address) {
         return new IVFSearchTask{
             .query_vector = query_vector,
             .num_sibling_tasks = num_sibling_tasks,
+            .cluster_id = cluster_id,
             .top_k = top_k,
             .cluster_partition_num_elements = cluster_partition_num_elements,
             .cluster_partition_address = cluster_partition_address,

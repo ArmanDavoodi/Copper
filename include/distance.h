@@ -309,6 +309,28 @@ inline constexpr SimilarityComparator GetDistancePairSimilarityComparator(Distan
     return nullptr; // Return nullptr if the distance type is invalid
 }
 
+struct L2DTYPEIDPairCMP {
+    inline int operator()(const std::pair<DTYPE, IVFVectorID>& a,
+                          const std::pair<DTYPE, IVFVectorID>& b) const {
+        return L2::MoreSimilar(a.first, b.first);
+    }
+
+    inline int operator()(const std::pair<DTYPE, VectorID>& a,
+                          const std::pair<DTYPE, VectorID>& b) const {
+        return L2::MoreSimilar(a.first, b.first);
+    }
+
+    inline bool operator==(const L2DTYPEIDPairCMP& other) const {
+        UNUSED_VARIABLE(other);
+        return true;
+    }
+
+    inline bool operator!=(const L2DTYPEIDPairCMP& other) const {
+        UNUSED_VARIABLE(other);
+        return false;
+    }
+};
+
 };
 
 #endif

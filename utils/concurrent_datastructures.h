@@ -6,6 +6,7 @@
 #include <queue>
 
 #include "utils/string.h"
+#include "utils/synchronization.h"
 
 #include "third_party/moodycamel/concurrentqueue/concurrentqueue.h"
 #include "third_party/moodycamel/concurrentqueue/blockingconcurrentqueue.h"
@@ -18,10 +19,9 @@ template<typename K, typename V, typename Hash>
 class ConcurrentMultiMap {
 public:
     ConcurrentMultiMap(size_t num_buckets, Hash hash = Hash()) : _num_buckets(num_buckets),
-                                                            _hash(hash),
-                                                            _total_size(0) {
+                                                                 _hash(hash) {
         FatalAssert(_num_buckets > 0, LOG_TAG_BASIC, "Number of buckets must be greater than 0");
-        _data = new std::unordered_map<K, std::vector<V>>[_num_buckets];
+        _data = new std::unordered_map<K, std::vector<V>, Hash>[_num_buckets];
         _locks = new SXSpinLock[_num_buckets];
     }
 
@@ -127,7 +127,7 @@ protected:
     const size_t _num_buckets;
     Hash _hash;
 
-    std::unordered_map<K, std::vector<V>>* _data;
+    std::unordered_map<K, std::vector<V>, Hash>* _data;
     SXSpinLock* _locks;
 };
 

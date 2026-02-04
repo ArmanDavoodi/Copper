@@ -1,7 +1,7 @@
 #ifndef BENCHMARK_H_
 #define BENCHMARK_H_
 
-#include "configurations.h"
+#include "bench/configurations.h"
 #include "divftree.h"
 
 #include <cstdint>

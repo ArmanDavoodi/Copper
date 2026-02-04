@@ -58,6 +58,49 @@ struct BufferEntry {
             }
         }
     }
+
+    BufferEntry(BufferEntry&& other) noexcept {
+        FatalAssert(!other.lock.IsLocked(), LOG_TAG_BUFFER,
+                    "Cannot move a locked BufferEntry");
+        pin = other.pin;
+        state = other.state;
+        num_pages = other.num_pages;
+        remote_addr = other.remote_addr;
+        total_size_bytes = other.total_size_bytes;
+        cache_list_idx = other.cache_list_idx;
+        pending = std::move(other.pending);
+        for (size_t p = 0; p < num_pages; ++p) {
+            pages[p] = other.pages[p];
+            page_num_elements[p] = other.page_num_elements[p];
+            other.pages[p] = nullptr;
+            other.page_num_elements[p] = 0;
+        }
+        other.pin = 0;
+        other.num_pages = 0;
+    }
+
+    inline BufferEntry& operator=(BufferEntry&& other) noexcept {
+        FatalAssert(!lock.IsLocked(), LOG_TAG_BUFFER,
+                    "Cannot move-assign to a locked BufferEntry");
+        FatalAssert(!other.lock.IsLocked(), LOG_TAG_BUFFER,
+                    "Cannot move-assign from a locked BufferEntry");
+        pin = other.pin;
+        state = other.state;
+        num_pages = other.num_pages;
+        remote_addr = other.remote_addr;
+        total_size_bytes = other.total_size_bytes;
+        cache_list_idx = other.cache_list_idx;
+        pending = std::move(other.pending);
+        for (size_t p = 0; p < num_pages; ++p) {
+            pages[p] = other.pages[p];
+            page_num_elements[p] = other.page_num_elements[p];
+            other.pages[p] = nullptr;
+            other.page_num_elements[p] = 0;
+        }
+        other.pin = 0;
+        other.num_pages = 0;
+        return *this;
+    }
 };
 
 class CacheMetaContainer {
@@ -102,11 +145,12 @@ public:
             return false;
         }
 
-        ++(entry->pin);
-        FatalAssert(entry->pin > 0, LOG_TAG_BUFFER,
+        entry->pin += entry->num_pages;
+        FatalAssert(entry->pin >= entry->num_pages, LOG_TAG_BUFFER,
                     "Pin count overflow in CacheMetaContainer::TryLockAndPinEntry()");
-        if (entry->pin > 1) {
-            FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED,
+        if (entry->pin > entry->num_pages) {
+            FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED ||
+                        entry->state == BufferEntryState::BUFFER_ENTRY_LOADING,
                         LOG_TAG_BUFFER,
                         "Pinned entry must be in CACHED state in CacheMetaContainer::TryLockAndPinEntry()");
             _locks[bucket_idx].Unlock();
@@ -276,12 +320,12 @@ class BufferMgr {
 public:
     /* constructs the memory pool and connection manager + connects to MNs + gets the metadata */
     static RetStatus Init(size_t page_size, size_t pool_size, BlockingQueue<IVFSearchTask*>* search_task_queue,
-                          uint16_t dim, uint8_t self_node_idx, size_t num_user_threads,
+                          uint16_t dim, size_t num_user_threads,
                           ClusterMeta*& centroids, VTYPE*& centroid_data, size_t& num_centroids) {
         FatalAssert(instance == nullptr, LOG_TAG_BUFFER,
                     "BufferMgr is already initialized!");
         instance = new BufferMgr(page_size, pool_size, search_task_queue, dim,
-                                 self_node_idx, num_user_threads, centroids, centroid_data, num_centroids);
+                                 num_user_threads, centroids, centroid_data, num_centroids);
         return RetStatus::Success();
     }
 
@@ -301,6 +345,18 @@ public:
         FatalAssert(instance != nullptr, LOG_TAG_BUFFER,
                     "BufferMgr is not initialized!");
         return instance;
+    }
+
+    void UnpinCluster(VectorID cluster_id) {
+        FatalAssert(this == instance, LOG_TAG_BUFFER,
+                    "BufferMgr instance mismatch in BufferMgr::UnpinCluster()");
+        auto it = _buffer_map.find(cluster_id);
+        FatalAssert(it != _buffer_map.end(), LOG_TAG_BUFFER,
+                    "Cluster ID not found in BufferMgr::UnpinCluster()");
+        BufferEntry& entry = it->second;
+        FatalAssert(entry.pin > 0, LOG_TAG_BUFFER,
+                    "Cannot unpin a cluster with pin count 0 in BufferMgr::UnpinCluster()");
+        _cache_meta_container.UnpinEntry(&entry);
     }
 
     RetStatus PrefetchClustersForSearch(const VectorID* cluster_ids, size_t num_clusters,
@@ -371,12 +427,13 @@ public:
                                     LOG_TAG_BUFFER,
                                     "Page size is smaller than number of elements in BufferMgr::PrefetchClusters()");
                         IVFSearchTask* task = task_factory->CreateTask(
+                            cluster_ids[i],
                             entry.page_num_elements[p],
                             reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(entry.pages[p])));
                         in_cache_tasks.push_back(task);
                     }
+                    entry.lock.Unlock();
                 }
-                entry.lock.Unlock();
             }
 
             if (!in_cache_tasks.empty()) {
@@ -447,6 +504,7 @@ public:
                                 LOG_TAG_BUFFER,
                                 "Page size is smaller than number of elements in BufferMgr::PollRemoteReads()");
                     IVFSearchTask* task = task_factory->CreateTask(
+                        cluster_id,
                         entry.page_num_elements[p],
                         reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(entry.pages[p])));
                     new_tasks.push_back(task);
@@ -472,7 +530,7 @@ protected:
     static constexpr double COOLING_SIZE_RATIO = 0.2;
 
     BufferMgr(size_t page_size, size_t pool_size, BlockingQueue<IVFSearchTask*>* search_task_queue, uint16_t dim,
-              uint8_t self_node_idx, size_t num_user_threads, ClusterMeta*& centroids, VTYPE*& centroid_data,
+              size_t num_user_threads, ClusterMeta*& centroids, VTYPE*& centroid_data,
               size_t& num_centroids) :
         _dim(dim), _cache(page_size, pool_size),
         _cache_meta_container(std::max((size_t)((pool_size / page_size) * COOLING_SIZE_RATIO), 1lu),
@@ -497,8 +555,6 @@ protected:
         FatalAssert(centroid_data == nullptr, LOG_TAG_BUFFER,
                     "centroid_data must be null in BufferMgr constructor");
         RetStatus status = RetStatus::Success();
-        network_config::self_idx = self_node_idx;
-        ReadNetworkConfigs();
         status =
             RDMA_Manager::Initialize(
                 network_config::num_memory_nodes,
@@ -546,7 +602,7 @@ protected:
         for (size_t c = 0; c < num_centroids; ++c) {
             _buffer_map.emplace(
                 centroids[c].centroid_id,
-                centroids[c].remote_addr, centroids[c].remote_size, _cache.GetPageSize(), dim, true
+                BufferEntry(centroids[c].remote_addr, centroids[c].remote_size, _cache.GetPageSize(), dim, true)
             );
         }
 
@@ -602,6 +658,8 @@ protected:
                 for (size_t p = 0; p < entry.num_pages; ++p) {
                     entry.pages[p] = local_buffers[num_used + p];
                     sizes[i][p] = entry.page_num_elements[p] * element_size;
+                    FatalAssert(sizes[i][p] > 0, LOG_TAG_BUFFER,
+                                "Page size must be greater than 0 in BufferMgr::ReadFromRemote()");
                     FatalAssert(sizes[i][p] <= _cache.GetPageSize(), LOG_TAG_BUFFER,
                                 "Page size is smaller than number of elements in BufferMgr::ReadFromRemote()");
                 }
@@ -653,7 +711,7 @@ protected:
         return RetStatus::Success();
     }
 
-    static BufferMgr* instance;
+    inline static BufferMgr* instance;
     const uint16_t _dim;
     MemoryPool _cache;
     std::unordered_map<VectorID, BufferEntry, VectorIDHash> _buffer_map;

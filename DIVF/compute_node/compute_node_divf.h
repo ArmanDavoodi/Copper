@@ -18,7 +18,6 @@
 namespace divftree {
 
 struct DIVFIndexAttr {
-    uint8_t self_node_idx;
     uint16_t dimension;
     size_t num_user_threads;
     size_t pool_size;
@@ -39,7 +38,6 @@ public:
             index_attr.pool_size,
             &search_task_queue,
             index_attr.dimension,
-            index_attr.self_node_idx,
             index_attr.num_user_threads,
             centroids,
             centroid_data,
@@ -138,6 +136,7 @@ public:
                 FatalAssert(task_status.IsOK(), LOG_TAG_BASIC,
                             "Failed to process IVF search task in DIVFIndex::ANNSearch(): %s",
                             task_status.Msg());
+                bufferMgr->UnpinCluster(task->cluster_id);
                 delete task;
             } else {
                 status = bufferMgr->PollRemoteReads();

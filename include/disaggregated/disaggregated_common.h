@@ -139,9 +139,11 @@ inline void ReadNetworkConfigs() {
     FatalAssert(config_file.is_open(), LOG_TAG_BASIC,
                 "Failed to open network configuration file at path: %s",
                 network_config::network_config_file_path);
-
-    config_file >> network_config::num_memory_nodes;
-    config_file >> network_config::num_compute_nodes;
+    int temp;
+    config_file >> temp;
+    network_config::num_memory_nodes = static_cast<uint8_t>(temp);
+    config_file >> temp;
+    network_config::num_compute_nodes = static_cast<uint8_t>(temp);
 
     FatalAssert(network_config::num_memory_nodes <= MAX_MNODE_COUNT, LOG_TAG_BASIC,
                 "Number of memory nodes exceeds the maximum allowed count!");
@@ -165,9 +167,11 @@ inline void ReadNetworkConfigs() {
     String compute_node_list = "[";
 
     for (uint8_t i = 0; i < network_config::num_memory_nodes; ++i) {
-        config_file >> network_config::memory_node_ids[i];
+        config_file >> temp;
+        network_config::memory_node_ids[i] = static_cast<uint8_t>(temp);
         config_file >> network_config::memory_node_ips[i];
-        config_file >> network_config::memory_node_ports[i];
+        config_file >> temp;
+        network_config::memory_node_ports[i] = static_cast<uint16_t>(temp);
         network_config::memory_node_ip_lists[i] = network_config::memory_node_ips[i];
         memory_node_list +=
             String("%sCNode-%hhu:%s:%u%s",
@@ -177,9 +181,11 @@ inline void ReadNetworkConfigs() {
     }
 
     for (uint8_t i = 0; i < network_config::num_compute_nodes; ++i) {
-        config_file >> network_config::compute_node_ids[i];
+        config_file >> temp;
+        network_config::compute_node_ids[i] = static_cast<uint8_t>(temp);
         config_file >> network_config::compute_node_ips[i];
-        config_file >> network_config::compute_node_ports[i];
+        config_file >> temp;
+        network_config::compute_node_ports[i] = static_cast<uint16_t>(temp);
         network_config::compute_node_ip_lists[i] = network_config::compute_node_ips[i];
         compute_node_list +=
             String("%sMNode-%hhu:%s:%u%s",
@@ -189,8 +195,10 @@ inline void ReadNetworkConfigs() {
     }
 
     config_file >> network_config::rdma_device_name;
-    config_file >> network_config::rdma_port;
-    config_file >> network_config::gid_index;
+    config_file >> temp;
+    network_config::rdma_port = static_cast<uint8_t>(temp);
+    config_file >> temp;
+    network_config::gid_index = temp;
 
     config_file.close();
     DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,

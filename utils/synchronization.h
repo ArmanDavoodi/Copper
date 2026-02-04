@@ -12,7 +12,7 @@
 
 #include "utils/string.h"
 #include "utils/thread.h"
-#include "utils/concurrent_datastructures.h"
+// #include "utils/concurrent_datastructures.h"
 
 namespace divftree {
 
@@ -480,6 +480,16 @@ public:
             Lock(mode);
         }
         return blocked;
+    }
+
+    inline bool IsLocked() const {
+        if (_mode.load(std::memory_order_acquire) == SX_EXCLUSIVE) {
+            return true;
+        }
+        if (_lock._data._shared_counter.load(std::memory_order_acquire) > 0) {
+            return true;
+        }
+        return false;
     }
 
     inline String ToString() const {

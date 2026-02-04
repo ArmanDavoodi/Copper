@@ -28,15 +28,15 @@ struct IVFCluster {
 };
 
 
-class IVFIndex {
+class MN_DIVFIndex {
 public:
-    IVFIndex(const VTYPE* data, size_t num_points, size_t num_clusters, bool insert_duplicates,
-             size_t max_iterations, uint16_t dim, uint8_t self_node_idx, size_t num_threads = 0) :
+    MN_DIVFIndex(const VTYPE* data, size_t num_points, size_t num_clusters, bool insert_duplicates,
+                 size_t max_iterations, uint16_t dim, size_t num_threads = 0) :
              dim(dim), size(0),
              vectorDirectory(num_points, dim, (num_threads == 0 ? std::thread::hardware_concurrency() :
                                                                   num_threads) * 2) {
         if (dim == 0) {
-            DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "IVFIndex dimension cannot be zero!");
+            DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "MN_DIVFIndex dimension cannot be zero!");
         }
 
         pool_size = ALIGNED_SIZE(num_points * ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID)), CACHE_LINE_SIZE) +
@@ -64,8 +64,6 @@ public:
         }
 
         RetStatus status = RetStatus::Success();
-        network_config::self_idx = self_node_idx;
-        ReadNetworkConfigs();
         status =
             RDMA_Manager::Initialize(
                 network_config::num_memory_nodes,
@@ -89,7 +87,7 @@ public:
 
         status = rdma_mgr->RegisterMemory(memory_pool, pool_size);
         FatalAssert(status.IsOK(), LOG_TAG_BASIC,
-                    "Failed to register memory in IVFIndex constructor: %s",
+                    "Failed to register memory in MN_DIVFIndex constructor: %s",
                     status.Msg());
         status = rdma_mgr->EstablishConnections();
         FatalAssert(status.IsOK(), LOG_TAG_BASIC,
@@ -101,16 +99,16 @@ public:
                        out_vector_ids, max_iterations, num_threads);
 
         DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
-                "IVFIndex created with dimension %hu, max vectors %zu, and %zu threads.",
+                "MN_DIVFIndex created with dimension %hu, max vectors %zu, and %zu threads.",
                 dim, num_points, num_threads == 0 ? std::thread::hardware_concurrency() : num_threads);
         delete[] out_vector_ids;
     }
 
-    ~IVFIndex() {
+    ~MN_DIVFIndex() {
         std::vector<VectorID> tasks;
         RDMA_Manager::DestroyInstance(tasks);
         FatalAssert(tasks.size() == 0, LOG_TAG_BASIC,
-                    "There should be no pending tasks when destroying IVFIndex!");
+                    "There should be no pending tasks when destroying MN_DIVFIndex!");
         for (auto& cluster : clusters) {
             if (cluster.centroid_tmp != nullptr) {
                 delete[] cluster.centroid_tmp;
@@ -136,11 +134,11 @@ public:
         std::vector<NodeInfo> compute_nodes, memory_nodes;
         RDMA_Manager* rdma_mgr = RDMA_Manager::GetInstance();
         CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BASIC);
-        rdma_mgr->GetAllNodeInfos(compute_nodes, memory_nodes);
+        rdma_mgr->GetAllNodeInfos(memory_nodes, compute_nodes);
         for (uint8_t cn_idx = 0; cn_idx < compute_nodes.size(); ++cn_idx) {
             Thread* listener_thread = new Thread(100);
             listener_threads.push_back(listener_thread);
-            listener_thread->StartMemberFunction(&IVFIndex::ListenerThread, this, compute_nodes[cn_idx].node_id);
+            listener_thread->StartMemberFunction(&MN_DIVFIndex::ListenerThread, this, compute_nodes[cn_idx].node_id);
         }
 
         for (auto& thrd : listener_threads) {
@@ -164,8 +162,8 @@ protected:
         if (data == nullptr || num_points == 0 || num_clusters < 2 ||
             num_clusters > num_points || clusters.size() != 0 || out_vector_ids == nullptr ||
             num_threads > num_points) {
-            FatalAssert(false, LOG_TAG_BASIC, "Invalid arguments to IVFIndex::Build()");
-            return RetStatus::Fail("Invalid arguments to IVFIndex::Build()");
+            FatalAssert(false, LOG_TAG_BASIC, "Invalid arguments to MN_DIVFIndex::Build()");
+            return RetStatus::Fail("Invalid arguments to MN_DIVFIndex::Build()");
         }
 
         if (num_threads == 0) {
@@ -176,7 +174,7 @@ protected:
         }
 
         DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
-                "Starting IVFIndex::Build() with %zu data points, %zu clusters, %zu max iterations, "
+                "Starting MN_DIVFIndex::Build() with %zu data points, %zu clusters, %zu max iterations, "
                 "%s duplicate insertion, and %zu threads.",
                 num_points, num_clusters, max_iterations,
                 insert_duplicates ? "allowing" : "disallowing", num_threads);
@@ -249,7 +247,7 @@ protected:
             for (size_t t = 1; t < num_threads; t++) {
                 builder_threads.emplace_back(new Thread(100));
                 Thread* thrd = builder_threads.back();
-                thrd->StartMemberFunction(&IVFIndex::ParallelBuilder, this, data, &seen_idx, num_points,
+                thrd->StartMemberFunction(&MN_DIVFIndex::ParallelBuilder, this, data, &seen_idx, num_points,
                                          thread_step, valid, insert_duplicates,
                                          out_vector_ids, cluster_build_locks,
                                          &(temp_storage[t * dim * clusters.size()]),
@@ -272,7 +270,7 @@ protected:
         delete[] cluster_sizes;
         delete[] current_size;
 
-        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "IVFIndex::Build() completed successfully with %zu unique vectors and"
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "MN_DIVFIndex::Build() completed successfully with %zu unique vectors and"
                 "%lu total size.", vectorDirectory.Size(true), vectorDirectory.Size());
         size = vectorDirectory.Size();
         return RetStatus::Success();
@@ -282,7 +280,7 @@ protected:
         size_t aligned_size = ALIGNED_SIZE(size_in_bytes, CACHE_LINE_SIZE);
         size_t offset = next_memory_offset.fetch_add(aligned_size, std::memory_order_acquire);
         FatalAssert((offset + aligned_size) <= pool_size,
-                    LOG_TAG_MEMORY, "IVFIndex memory pool out of memory!");
+                    LOG_TAG_MEMORY, "MN_DIVFIndex memory pool out of memory!");
         return static_cast<void*>(static_cast<char*>(memory_pool) + offset);
     }
 
@@ -839,6 +837,7 @@ protected:
         self->InitDIVFThread();
         SendIndexInfoToNode(target_cn);
         bool last_cn_disconnected = RDMA_Manager::ListenForMessages(target_cn);
+        UNUSED_VARIABLE(last_cn_disconnected);
         self->DestroyDIVFThread();
     }
 };

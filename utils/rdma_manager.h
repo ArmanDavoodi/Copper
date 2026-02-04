@@ -66,6 +66,8 @@ static constexpr uint8_t GET_NODE_TYPE_IDX(bool is_memory_node) {
     return is_memory_node ? MEMROY_NODE_IDX : COMPUTE_NODE_IDX;
 }
 
+inline constexpr uint64_t MAX_TASK_SEQ_NUM = 0x0000FFFFFFFFFFFF;
+
 union TaskID {
     struct {
         uint64_t task_seq_num : 48;
@@ -73,6 +75,18 @@ union TaskID {
         uint64_t node_raw : 8;
     };
     uint64_t raw;
+
+    TaskID() : raw(0) {}
+    TaskID (uint64_t task_num, uint8_t conn_idx, NodeID node_id) :
+        task_seq_num(task_num & MAX_TASK_SEQ_NUM), connection_idx(conn_idx), node_raw(node_id.raw) {}
+
+    inline bool operator==(const TaskID& other) const {
+        return raw == other.raw;
+    }
+
+    inline bool operator!=(const TaskID& other) const {
+        return raw != other.raw;
+    }
 };
 
 struct TaskIDHash {
@@ -80,8 +94,6 @@ struct TaskIDHash {
         return splitmix64(id.raw);
     }
 };
-
-inline constexpr uint64_t MAX_TASK_SEQ_NUM = 0x0000FFFFFFFFFFFF;
 
 struct NodeInfo {
     NodeID node_id;
@@ -99,6 +111,35 @@ struct ConnectionInfo {
     std::atomic<uint16_t> num_pending_requests = 0;
     // size_t num_completed_task_ids = 0;
     // TaskID* completed_task_ids = nullptr;
+
+    ConnectionInfo() = default;
+    ConnectionInfo(const ConnectionInfo& other) = delete;
+    ConnectionInfo& operator=(const ConnectionInfo& other) = delete;
+    ConnectionInfo(ConnectionInfo&& other) noexcept :
+        remote_qp_num(other.remote_qp_num),
+        local_psn(other.local_psn),
+        remote_psn(other.remote_psn),
+        qp(other.qp),
+        cq(other.cq),
+        next_task_id(other.next_task_id.load()),
+        num_pending_requests(other.num_pending_requests.load()) {
+            other.qp = nullptr;
+            other.cq = nullptr;
+        }
+    inline ConnectionInfo& operator=(ConnectionInfo&& other) noexcept {
+        if (this != &other) {
+            remote_qp_num = other.remote_qp_num;
+            local_psn = other.local_psn;
+            remote_psn = other.remote_psn;
+            qp = other.qp;
+            cq = other.cq;
+            next_task_id.store(other.next_task_id.load());
+            num_pending_requests.store(other.num_pending_requests.load());
+            other.qp = nullptr;
+            other.cq = nullptr;
+        }
+        return *this;
+    }
 };
 
 struct ConnectionContext {
@@ -111,44 +152,44 @@ struct ConnectionContext {
     std::atomic<uint8_t> next_connection_idx;
     ConnectionInfo connections[MAX_CONN_PER_NODE];
 
-    // ConnectionContext(NodeID id, in_addr_t ip, uint16_t port) :
-    //     remote_node_info{
-    //         .node_id = id,
-    //         .ip_address = ip,
-    //         .port = port,
-    //     }, socket(-1), remote_region_addr((uintptr_t)nullptr), remote_region_size(0), remote_region_rkey(0),
-    //     next_connection_idx(0) {}
+    ConnectionContext(NodeID id, in_addr_t ip, uint16_t port) :
+        remote_node_info{
+            .node_id = id,
+            .ip_address = ip,
+            .port = port,
+        }, socket(-1), remote_region_addr((uintptr_t)nullptr), remote_region_size(0), remote_region_rkey(0),
+        next_connection_idx(0) {}
 
-    // ConnectionContext(ConnectionContext&& other) noexcept :
-    //     remote_node_info(other.remote_node_info),
-    //     socket(other.socket),
-    //     remote_gid(other.remote_gid),
-    //     remote_region_addr(other.remote_region_addr),
-    //     remote_region_size(other.remote_region_size),
-    //     remote_region_rkey(other.remote_region_rkey),
-    //     next_connection_idx(other.next_connection_idx.load()) {
-    //         for (size_t i = 0; i < MAX_CONN_PER_NODE; i++) {
-    //             connections[i] = std::move(other.connections[i]);
-    //         }
-    //         other.socket = -1;
-    //     }
+    ConnectionContext(ConnectionContext&& other) noexcept :
+        remote_node_info(other.remote_node_info),
+        socket(other.socket),
+        remote_gid(other.remote_gid),
+        remote_region_addr(other.remote_region_addr),
+        remote_region_size(other.remote_region_size),
+        remote_region_rkey(other.remote_region_rkey),
+        next_connection_idx(other.next_connection_idx.load()) {
+            for (size_t i = 0; i < MAX_CONN_PER_NODE; i++) {
+                connections[i] = std::move(other.connections[i]);
+            }
+            other.socket = -1;
+        }
 
-    // inline ConnectionContext& operator=(ConnectionContext&& other) noexcept {
-    //     if (this != &other) {
-    //         remote_node_info = other.remote_node_info;
-    //         socket = other.socket;
-    //         remote_gid = other.remote_gid;
-    //         remote_region_addr = other.remote_region_addr;
-    //         remote_region_size = other.remote_region_size;
-    //         remote_region_rkey = other.remote_region_rkey;
-    //         next_connection_idx.store(other.next_connection_idx.load());
-    //         for (size_t i = 0; i < MAX_CONN_PER_NODE; i++) {
-    //             connections[i] = std::move(other.connections[i]);
-    //         }
-    //         other.socket = -1;
-    //     }
-    //     return *this;
-    // }
+    inline ConnectionContext& operator=(ConnectionContext&& other) noexcept {
+        if (this != &other) {
+            remote_node_info = other.remote_node_info;
+            socket = other.socket;
+            remote_gid = other.remote_gid;
+            remote_region_addr = other.remote_region_addr;
+            remote_region_size = other.remote_region_size;
+            remote_region_rkey = other.remote_region_rkey;
+            next_connection_idx.store(other.next_connection_idx.load());
+            for (size_t i = 0; i < MAX_CONN_PER_NODE; i++) {
+                connections[i] = std::move(other.connections[i]);
+            }
+            other.socket = -1;
+        }
+        return *this;
+    }
 };
 
 struct HandshakeInfo {
@@ -168,8 +209,8 @@ enum class ConnectionMessage : uint8_t {
 class RDMA_Manager {
 public:
     static RetStatus Initialize(uint8_t num_mnodes, uint8_t num_cnodes, uint8_t* mnode_ids,
-                                const char** mnode_ips, uint16_t* mnode_ports,
-                                uint8_t* cnode_ids, const char** cnode_ips, uint16_t* cnode_ports,
+                                char** mnode_ips, uint16_t* mnode_ports,
+                                uint8_t* cnode_ids, char** cnode_ips, uint16_t* cnode_ports,
                                 const char* target_rdma_device_name, uint8_t rdma_port, int gid_index,
                                 bool is_memory_node, uint8_t self_idx, size_t num_threads) {
         FatalAssert(instance == nullptr, LOG_TAG_RDMA,
@@ -346,9 +387,7 @@ EXIT:
         FatalAssert(it != memory_nodes.end(), LOG_TAG_RDMA,
                     "Target memory node not found!");
         ConnectionContext& ctx = it->second;
-        TaskID task_id = TaskID{.node_raw = target_node.ToRaw(),
-                         .connection_idx = connection_idx,
-                         .task_seq_num = ctx.connections[connection_idx].next_task_id.fetch_add(1) & MAX_TASK_SEQ_NUM};
+        TaskID task_id(ctx.connections[connection_idx].next_task_id.fetch_add(1), connection_idx, target_node);
         pending_tasks.BatchInsert(task_id, std::move(cluster_ids));
         return RDMAReadInternal(target_node, connection_idx, task_id,
                                 local_buffers, remote_addresses, sizes,
@@ -378,9 +417,12 @@ EXIT:
         FatalAssert(it != memory_nodes.end(), LOG_TAG_RDMA,
                     "Target memory node not found!");
         ConnectionContext& ctx = it->second;
-        TaskID task_id = TaskID{.node_raw = target_node.ToRaw(),
-                         .connection_idx = connection_idx,
-                         .task_seq_num = ctx.connections[connection_idx].next_task_id.fetch_add(1) & MAX_TASK_SEQ_NUM};
+        TaskID task_id(ctx.connections[connection_idx].next_task_id.fetch_add(1), connection_idx, target_node);
+        SANITY_CHECK({
+            std::vector<VectorID> cluster_ids_copy(cluster_ids);
+            FatalAsssert(cluster_ids.size() == num_clusters, LOG_TAG_RDMA,
+                        "Number of cluster IDs does not match num_clusters in RDMASGReadInternal()");
+        });
         pending_tasks.BatchInsert(task_id, std::move(cluster_ids));
         return RDMASGReadInternal(target_node, connection_idx, task_id,
                                   local_buffers, remote_addresses, sizes, num_sge,
@@ -396,8 +438,6 @@ EXIT:
                     "Protection Domain is not initialized properly.");
         FatalAssert(mr != nullptr, LOG_TAG_RDMA,
                     "Memory region is not registered for RDMA operations.");
-        FatalAssert(selfInfo.node_id.IsComputeNode(), LOG_TAG_RDMA,
-                    "Only compute nodes can push completed reads to task queue.");
         FatalAssert(completed_tasks.empty(), LOG_TAG_RDMA,
                     "Completed tasks vector must be empty on input.");
         // if (destroying) {
@@ -590,8 +630,8 @@ EXIT:
 
 protected:
     RDMA_Manager(uint8_t num_mnodes, uint8_t num_cnodes, uint8_t* mnode_ids,
-                 const char** mnode_ips, uint16_t* mnode_ports,
-                 uint8_t* cnode_ids, const char** cnode_ips, uint16_t* cnode_ports,
+                 char** mnode_ips, uint16_t* mnode_ports,
+                 uint8_t* cnode_ids, char** cnode_ips, uint16_t* cnode_ports,
                  const char* target_rdma_device_name, uint8_t rdma_port, int gid_index,
                  bool is_memory_node, uint8_t self_idx, size_t num_threads) :
                     selfInfo{
@@ -778,7 +818,7 @@ protected:
         std::unordered_map<divftree::NodeID, divftree::ConnectionContext, divftree::NodeIDHash>* target_map;
         uint8_t num_nodes;
         uint16_t* ports;
-        const char** ips;
+        char** ips;
         uint8_t* ids;
         if (!is_memory_node) {
             target_map = &memory_nodes;
@@ -796,7 +836,7 @@ protected:
         num_valid_nodes = 0;
         for (uint8_t i = 0; i < num_nodes; ++i) {
             NodeID node_id = NodeID(!is_memory_node, ids[i]);
-            auto it = target_map->emplace(node_id, node_id, inet_addr(ips[i]), ports[i]);
+            auto it = target_map->emplace(node_id, ConnectionContext(node_id, inet_addr(ips[i]), ports[i]));
             FatalAssert(it.second, LOG_TAG_RDMA,
                         "Duplicate compute node ID %hhu detected!", ids[i]);
             ++num_valid_nodes;
@@ -810,7 +850,7 @@ protected:
 
         DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_RDMA,
                 "Created QPs for each of the %hhu/%hhu %s nodes.",
-                (is_memory_node ? "compute" : "memory") ,num_valid_nodes, num_nodes);
+                num_valid_nodes, num_nodes, (is_memory_node ? "compute" : "memory"));
 
         return;
 
@@ -892,7 +932,8 @@ ERROR_EXIT:
             poll_list = nullptr;
         }
 
-        CloseTCPConnections();
+        RetStatus rs = CloseTCPConnections();
+        return rs;
     }
 
     static RetStatus CreateQP(struct ibv_qp** qp, struct ibv_cq* cq, struct ibv_pd* pd, uint8_t type) {
@@ -946,9 +987,11 @@ ERROR_EXIT:
         int ret = 0;
         memset(&qp_attr, 0, sizeof(qp_attr));
         SANITY_CHECK(
+            struct ibv_qp_init_attr init_attr;
+            memset(&init_attr, 0, sizeof(init_attr));
             ret = ibv_query_qp(qp, &qp_attr,
                                 IBV_QP_STATE,
-                                nullptr);
+                                &init_attr);
             FatalAssert(ret == 0, LOG_TAG_RDMA,
                         "Failed to query QP state before modifying to INIT. ret=(%d)%s errno=(%d)%s",
                         ret, strerror(ret), errno, strerror(errno));
@@ -985,9 +1028,11 @@ ERROR_EXIT:
         memset(&qp_attr, 0, sizeof(qp_attr));
         int ret = 0;
         SANITY_CHECK(
+            struct ibv_qp_init_attr init_attr;
+            memset(&init_attr, 0, sizeof(init_attr));
             ret = ibv_query_qp(qp, &qp_attr,
                                 IBV_QP_STATE,
-                                nullptr);
+                                &init_attr);
             FatalAssert(ret == 0, LOG_TAG_RDMA,
                         "Failed to query QP state before modifying to RTR. ret=(%d)%s errno=(%d)%s",
                         ret, strerror(ret), errno, strerror(errno));
@@ -1021,7 +1066,7 @@ ERROR_EXIT:
                     IBV_QP_RQ_PSN |
                     IBV_QP_MAX_DEST_RD_ATOMIC |
                     IBV_QP_MIN_RNR_TIMER;
-        int ret = ibv_modify_qp(qp, &qp_attr, flags);
+        ret = ibv_modify_qp(qp, &qp_attr, flags);
         if (ret != 0) {
             FatalAssert(false, LOG_TAG_RDMA,
                         "Failed to modify QP to RTR state. ret=(%d)%s errno=(%d)%s",
@@ -1038,9 +1083,11 @@ ERROR_EXIT:
         memset(&qp_attr, 0, sizeof(qp_attr));
         int ret = 0;
         SANITY_CHECK(
+            struct ibv_qp_init_attr init_attr;
+            memset(&init_attr, 0, sizeof(init_attr));
             ret = ibv_query_qp(qp, &qp_attr,
                                 IBV_QP_STATE,
-                                nullptr);
+                                &init_attr);
             FatalAssert(ret == 0, LOG_TAG_RDMA,
                         "Failed to query QP state before modifying to RTS. ret=(%d)%s errno=(%d)%s",
                         ret, strerror(ret), errno, strerror(errno));
@@ -1063,7 +1110,7 @@ ERROR_EXIT:
                     IBV_QP_RETRY_CNT |
                     IBV_QP_RNR_RETRY |
                     IBV_QP_MAX_QP_RD_ATOMIC;
-        int ret = ibv_modify_qp(qp, &qp_attr, flags);
+        ret = ibv_modify_qp(qp, &qp_attr, flags);
         if (ret != 0) {
             FatalAssert(false, LOG_TAG_RDMA,
                         "Failed to modify QP to RTS state. ret=(%d)%s errno=(%d)%s",
@@ -1073,11 +1120,12 @@ ERROR_EXIT:
         }
 
         SANITY_CHECK(
+            memset(&init_attr, 0, sizeof(init_attr));
             struct ibv_qp_attr qp_attr_dummy;
             memset(&qp_attr_dummy, 0, sizeof(qp_attr_dummy));
             ret = ibv_query_qp(qp, &qp_attr_dummy,
                                 IBV_QP_STATE,
-                                nullptr);
+                                &init_attr);
             FatalAssert(ret == 0, LOG_TAG_RDMA,
                         "Failed to query QP state after modifying to RTS. ret=(%d)%s errno=(%d)%s",
                         ret, strerror(ret), errno, strerror(errno));
@@ -1107,7 +1155,7 @@ ERROR_EXIT:
         return RetStatus::Success();
     }
 
-    RetStatus RDMA_Manager::InitConnectionCtx(uint8_t type, ConnectionContext& ctx) {
+    RetStatus InitConnectionCtx(uint8_t type, ConnectionContext& ctx) {
         String error_msg;
         RetStatus rs = RetStatus::Success();
         struct ibv_qp* qp = nullptr;
@@ -1722,6 +1770,7 @@ EXIT:
                         (conn_ctx.remote_region_addr + conn_ctx.remote_region_size),
                         LOG_TAG_RDMA,
                         "remote_address[%zu] is out of remote registered memory region in RDMASGRead", i);
+            sge_list[i] = new ibv_sge[num_sge[i]];
             for (size_t j = 0; j < num_sge[i]; ++j) {
                 FatalAssert(local_buffers[i][j] != nullptr, LOG_TAG_RDMA,
                             "local_buffer[%zu][%zu] is null in RDMASGRead", i, j);
@@ -1770,7 +1819,7 @@ EXIT:
         return rs;
     }
 
-    static RDMA_Manager* instance;
+    inline static RDMA_Manager* instance;
     const NodeInfo selfInfo;
     const uint8_t _rdma_port;
     const int _gid_index;

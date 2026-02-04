@@ -1,7 +1,7 @@
 #ifndef HNSWLIB_BENCHMARK_H_
 #define HNSWLIB_BENCHMARK_H_
 
-#include "configurations.h"
+#include "bench/configurations.h"
 #include "third_party/index/hnswlib/hnswlib/hnswlib.h"
 #include "common.h"
 

@@ -1,7 +1,7 @@
 #ifndef DATASET_H_
 #define DATASET_H_
 
-#include "configurations.h"
+#include "bench/configurations.h"
 
 inline uint32_t total_num_vectors = 0;
 inline std::atomic<uint32_t> next_offset = 0;
