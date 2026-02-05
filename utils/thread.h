@@ -33,10 +33,17 @@
 #endif
 
 
-#ifndef DIVF_SEED
-#define DIVF_SEED std::random_device()()
-#endif
+// #ifndef DIVF_SEED
+// #define DIVF_SEED std::random_device()()
+// #endif
 namespace divftree {
+
+inline std::random_device::result_type GetRandomSeed() {
+    static std::random_device rd;
+    static std::mutex rd_mutex;
+    std::lock_guard<std::mutex> lock(rd_mutex);
+    return rd();
+}
 
 enum LockMode : uint8_t  {
     SX_SHARED, SX_EXCLUSIVE
@@ -66,7 +73,7 @@ public:
     Thread(uint32_t random_perc) : centroid_compute_buffer(nullptr),
                                    _parent_id((threadSelf == nullptr) ? INVALID_DIVF_THREAD_ID : threadSelf->ID()),
                                    _id(nextId.fetch_add(1)), _done(true), _safty_net(false), _thrd(nullptr),
-                                   _gen(DIVF_SEED), _gen64(DIVF_SEED), _uniform_dist(1, random_perc),
+                                   _gen(GetRandomSeed()), _gen64(GetRandomSeed()), _uniform_dist(1, random_perc),
                                    _next_task_id(0) {}
 
     ~Thread() {

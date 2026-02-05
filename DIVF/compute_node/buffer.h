@@ -234,7 +234,7 @@ public:
             }
 
             size_t bucket_idx = threadSelf->UniformRange64(0, _num_buckets - 1);
-            if (_locks[bucket_idx].TryLock(SX_EXCLUSIVE)) {
+            if (!_locks[bucket_idx].TryLock(SX_EXCLUSIVE)) {
                 continue;
             }
 
@@ -616,6 +616,8 @@ protected:
         CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BUFFER);
         NodeID mnode_id = rdma_mgr->GetMemoryNodeID();
         bool use_sg = (num_pages_to_load != cluster_ids.size());
+        FatalAssert(!use_sg, LOG_TAG_BUFFER,
+                    "Non-scatter-gather RDMA read is not implemented in BufferMgr::ReadFromRemote()");
         void** local_buffers = new void*[num_pages_to_load];
         size_t num_allocated = 0;
         while (num_allocated < num_pages_to_load) {

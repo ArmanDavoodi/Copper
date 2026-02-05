@@ -20,7 +20,7 @@ inline constexpr size_t MAX_MESSAGE_SIZE = 4096;
 /* todo: maybe I need to pass this as a runtime arg?! needs tuning */
 static constexpr uint32_t MAX_SEND_WR[NUM_NODE_TYPES] = {
     0,                          /* MN_SIDE */
-    1024 / MAX_CONN_PER_NODE,   /* CN_SIDE */
+    16,   /* CN_SIDE */
 };
 
 static constexpr int MAX_CQE[NUM_NODE_TYPES] = {
@@ -41,8 +41,8 @@ static constexpr uint32_t MAX_INLINE_DATA[NUM_NODE_TYPES] = {
 
 
 static constexpr uint32_t MAX_RD_ATOMIC[NUM_NODE_TYPES] = {
-    0,                               /* MN_SIDE */
-    MAX_SEND_WR[COMPUTE_NODE_IDX],   /* CN_SIDE */
+    16,   /* MN_SIDE */
+    16,   /* CN_SIDE */
 };
 
 /* We are not using two-sided verbs */
@@ -59,7 +59,7 @@ static constexpr uint32_t MAX_RECV_SGE[NUM_NODE_TYPES] = {
 
 static constexpr ibv_mtu DEFAULT_MTU[NUM_NODE_TYPES] = {
     IBV_MTU_256, /* MN_SIDE */
-    IBV_MTU_4096, /* CN_SIDE */
+    IBV_MTU_256, /* CN_SIDE */
 };
 
 static constexpr uint8_t GET_NODE_TYPE_IDX(bool is_memory_node) {
@@ -507,7 +507,7 @@ EXIT:
         return RetStatus::Success();
     }
 
-    void SendMessage(NodeID target, const void* msg, size_t size) {
+    void SendMessage(NodeID target, const void* msg, size_t size, bool end_message = false) {
         FatalAssert(this == instance, LOG_TAG_RDMA,
                     "RDMA_Manager instance mismatch!");
         FatalAssert(selfInfo.node_id.IsMemoryNode() == target.IsComputeNode(), LOG_TAG_RDMA,
@@ -515,7 +515,8 @@ EXIT:
         FatalAssert(size > 0, LOG_TAG_RDMA,
                     "Cannot send a message of size 0.");
         CHECK_NOT_NULLPTR(msg, LOG_TAG_RDMA);
-        if (!ready.load(std::memory_order_acquire)) {
+        if ((!end_message && !ready.load(std::memory_order_acquire)) ||
+            (end_message && ready.load(std::memory_order_relaxed))) {
             FatalAssert(false, LOG_TAG_RDMA,
                         "RDMA_Manager is not ready for RDMA operations.");
             return;
@@ -1050,7 +1051,7 @@ ERROR_EXIT:
         qp_attr.path_mtu = DEFAULT_MTU[type];
         qp_attr.dest_qp_num = dest_qp_num;
         qp_attr.rq_psn = remote_psn;
-        qp_attr.max_dest_rd_atomic = MAX_RD_ATOMIC[type];
+        qp_attr.max_dest_rd_atomic = MAX_RD_ATOMIC[(type == MEMROY_NODE_IDX ? COMPUTE_NODE_IDX : MEMROY_NODE_IDX)];
         qp_attr.min_rnr_timer = 1;
         qp_attr.ah_attr.is_global = 1;
         qp_attr.ah_attr.dlid = 0;

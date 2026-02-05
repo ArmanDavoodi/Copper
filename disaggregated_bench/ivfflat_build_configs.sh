@@ -9,17 +9,17 @@ MN_CONF_FILE="disaggregated_bench/memory_node/run.conf"
 VAR_LOG_OUTPUT_PATH=$ROOT/disaggregated_bench/out/logs/
 
 VAR_DEF_K=1
-VAR_N_PROBES=4
+VAR_N_PROBES=1
 VAR_BUILT_SIZE=$(( 1024 * 32 )) #num embedings to insert during build
 VAR_AVG_NUM_VEC_PER_CLUSTER=$((512))
 VAR_NUM_CLUSTERS=$((VAR_BUILT_SIZE / VAR_AVG_NUM_VEC_PER_CLUSTER))
 VAR_KMEANS_MAX_ITERS=10
 VAR_INSERT_DUPLICATES=0 #1 to allow inserting duplicate vectors and 0 to not allow
 
-VAR_NUM_QUERY_THREADS=16
+VAR_NUM_QUERY_THREADS=4
 VAR_BUILD_NUM_THREADS=160
 
-VAR_PAGE_SIZE=$((VAR_AVG_NUM_VEC_PER_CLUSTER * 256)) # should be power of 2
+VAR_PAGE_SIZE=$((512 * 256)) # should be power of 2
 VAR_POOL_SIZE=$((1024 * 1024 * 128)) #128MB
 
 VAR_WARMUP_TIME_SEC=60 #only search
