@@ -108,7 +108,9 @@ enum LOG_TAG_BITS : uint64_t {
 #define FUNCTION_NAME_MAX_SIZE 35
 #endif
 
-#define FILE_NAME_MAX_SIZE 64
+#define FILE_NAME_MAX_SIZE 100
+
+#define TIME_MAX_SIZE 28
 
 #define _COLORF_BLACK "\033[0;30m"
 #define _COLORF_RED "\033[0;31m"
@@ -438,20 +440,20 @@ inline void Log(LOG_LEVELS level, uint64_t tag, const Log_Msg& msg,
                 const std::chrono::_V2::system_clock::time_point _time,
                 const char* file_name, const char* func_name, size_t line,
                 thread_id thread_id, uint64_t divf_thread_id) {
-    char time_str[100];
+    char time_str[TIME_MAX_SIZE];
     timetostr(_time, time_str); // todo add coloring if needed
     UNUSED_VARIABLE(func_name);
     if (::divftree::debug::fault_checking != nullptr) {
 #ifdef ENABLE_FAULT_LOGGING
 #ifdef LOG_FUNCTION_NAME
         fprintf(::divftree::debug::output_log, "%s | %s | %s | %s | %s | Thread(%lu): %lu | Message: %s\n",
-            leveltostr(level, true), tagtostr(tag), time_str,
+            leveltostr(level, true), tagtostr(tag), ::divftree::String("%s", time_str).Fit(TIME_MAX_SIZE).ToCStr(),
             ::divftree::String("%s:%lu", file_name, line).Fit(FILE_NAME_MAX_SIZE).ToCStr(),
             ::divftree::String("%s", func_name).Fit(FUNCTION_NAME_MAX_SIZE).ToCStr(),
             thread_id, divf_thread_id, msg._msg);
 #else
         fprintf(::divftree::debug::output_log, "%s | %s | %s | %s | Thread(%lu): %lu | Message: %s\n",
-            leveltostr(level, true), tagtostr(tag), time_str,
+            leveltostr(level, true), tagtostr(tag), ::divftree::String("%s", time_str).Fit(TIME_MAX_SIZE).ToCStr(),
             ::divftree::String("%s:%lu", file_name, line).Fit(FILE_NAME_MAX_SIZE).ToCStr(),
             thread_id, divf_thread_id, msg._msg);
 #endif
@@ -469,13 +471,13 @@ inline void Log(LOG_LEVELS level, uint64_t tag, const Log_Msg& msg,
         std::string callstack = print_callstack();
 #ifdef LOG_FUNCTION_NAME
         fprintf(::divftree::debug::output_log, "%s | %s | %s | %s | %s | Thread(%lu): %lu | Callstack=%s | Message: %s\n",
-            leveltostr(level), tagtostr(tag), time_str,
+            leveltostr(level), tagtostr(tag), ::divftree::String("%s", time_str).Fit(TIME_MAX_SIZE).ToCStr(),
             ::divftree::String("%s:%lu", file_name, line).Fit(FILE_NAME_MAX_SIZE).ToCStr(),
             ::divftree::String("%s", func_name).Fit(FUNCTION_NAME_MAX_SIZE).ToCStr(),
             thread_id, divf_thread_id, callstack.c_str(), msg._msg);
 #else
         fprintf(::divftree::debug::output_log, "%s | %s | %s | %s | Thread(%lu): %lu | Callstack=%s | Message: %s\n",
-            leveltostr(level), tagtostr(tag), time_str,
+            leveltostr(level), tagtostr(tag), ::divftree::String("%s", time_str).Fit(TIME_MAX_SIZE).ToCStr(),
             ::divftree::String("%s:%lu", file_name, line).Fit(FILE_NAME_MAX_SIZE).ToCStr(),
             thread_id, divf_thread_id, callstack.c_str(), msg._msg);
 #endif
@@ -483,13 +485,13 @@ inline void Log(LOG_LEVELS level, uint64_t tag, const Log_Msg& msg,
     else {
 #ifdef LOG_FUNCTION_NAME
         fprintf(::divftree::debug::output_log, "%s | %s | %s | %s | %s | Thread(%lu): %lu | Message: %s\n",
-            leveltostr(level), tagtostr(tag), time_str,
+            leveltostr(level), tagtostr(tag), ::divftree::String("%s", time_str).Fit(TIME_MAX_SIZE).ToCStr(),
             ::divftree::String("%s:%lu", file_name, line).Fit(FILE_NAME_MAX_SIZE).ToCStr(),
             ::divftree::String("%s", func_name).Fit(FUNCTION_NAME_MAX_SIZE).ToCStr(),
             thread_id, divf_thread_id, msg._msg);
 #else
         fprintf(::divftree::debug::output_log, "%s | %s | %s | %s | Thread(%lu): %lu | Message: %s\n",
-            leveltostr(level), tagtostr(tag), time_str,
+            leveltostr(level), tagtostr(tag), ::divftree::String("%s", time_str).Fit(TIME_MAX_SIZE).ToCStr(),
             ::divftree::String("%s:%lu", file_name, line).Fit(FILE_NAME_MAX_SIZE).ToCStr(),
             thread_id, divf_thread_id, msg._msg);
 #endif

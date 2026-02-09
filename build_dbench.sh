@@ -12,6 +12,7 @@ make clean -C disaggregated_bench
 rm -r disaggregated_bench/out
 mkdir -p disaggregated_bench/out/cores
 mkdir -p disaggregated_bench/out/logs
+mkdir -p disaggregated_bench/out/stats
 
 VAR_LOG_MIN_LEVEL=LOG_LEVEL_PANIC
 VAR_LOG_LEVEL=LOG_LEVEL_LOG

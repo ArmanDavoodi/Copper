@@ -109,6 +109,13 @@ void ParseConfigs(divftree::NodeID self_id) {
         }
     }
 
+    vit = var_configs.find("stat-file");
+    if (vit != var_configs.end()) {
+        strncpy(stat_file, vit->second.c_str(), 255);
+    } else {
+        throw std::runtime_error("Stat file path not provided!");
+    }
+
     vit = var_configs.find("n-probes");
     if (vit != var_configs.end()) {
         if (!parseUnsignedInt(vit->second, n_probes) ||

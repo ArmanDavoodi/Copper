@@ -6,21 +6,24 @@ cd $ROOT
 CN_CONF_FILE="disaggregated_bench/compute_node/run.conf"
 MN_CONF_FILE="disaggregated_bench/memory_node/run.conf"
 
+CN_STAT_FILE=$ROOT/disaggregated_bench/out/stats/stats.stat
+
 VAR_LOG_OUTPUT_PATH=$ROOT/disaggregated_bench/out/logs/
 
-VAR_DEF_K=1
-VAR_N_PROBES=1
-VAR_BUILT_SIZE=$(( 1024 * 32 )) #num embedings to insert during build
-VAR_AVG_NUM_VEC_PER_CLUSTER=$((512))
+VAR_DEF_K=10
+VAR_BUILT_SIZE=$(( 1024 * 1024 * 4 )) #num embedings to insert during build
+VAR_AVG_NUM_VEC_PER_CLUSTER=$((1024 * 2))
 VAR_NUM_CLUSTERS=$((VAR_BUILT_SIZE / VAR_AVG_NUM_VEC_PER_CLUSTER))
+VAR_N_PROBES=64
 VAR_KMEANS_MAX_ITERS=10
 VAR_INSERT_DUPLICATES=0 #1 to allow inserting duplicate vectors and 0 to not allow
 
-VAR_NUM_QUERY_THREADS=4
+VAR_NUM_QUERY_THREADS=64
 VAR_BUILD_NUM_THREADS=160
 
-VAR_PAGE_SIZE=$((512 * 256)) # should be power of 2
-VAR_POOL_SIZE=$((1024 * 1024 * 128)) #128MB
+VAR_PAGE_SIZE=$((VAR_AVG_NUM_VEC_PER_CLUSTER * 256)) # should be power of 2
+# VAR_PAGE_SIZE=$((1024 * 512))
+VAR_POOL_SIZE=$((1024 * 1024 * 1024)) #1GB
 
 VAR_WARMUP_TIME_SEC=60 #only search
 VAR_RUN_TIME_SEC=60 #real test used for stat collection
@@ -48,6 +51,7 @@ echo "throughput-report-time:$VAR_RUNTIME_THROUGHPUT_REPORT_SEC" >> $CN_CONF_FIL
 echo "show-runtime-report-for-build-and-warmup:$VAR_SHOW_RUNTIME_REPORT_FOR_BUILD_AND_WARMUP" >> $CN_CONF_FILE
 
 echo "collect-avg-distances:$VAR_COLLECT_AVG_DISTANCES" >> $CN_CONF_FILE
+echo "stat-file:$CN_STAT_FILE" >> $CN_CONF_FILE
 
 #create the config file if it does not exists and clean it if it does
 echo > $MN_CONF_FILE

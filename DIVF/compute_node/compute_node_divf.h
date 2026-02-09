@@ -150,6 +150,12 @@ public:
         return RetStatus::Success();
     }
 
+    String GetStats(MemoryStatsNode*& m_stat_list) {
+        BufferMgr* bufferMgr = BufferMgr::GetInstance();
+        CHECK_NOT_NULLPTR(bufferMgr, LOG_TAG_BASIC);
+        return bufferMgr->GetStats(m_stat_list);
+    }
+
 protected:
     static constexpr size_t poll_rate = 10;
     const DIVFIndexAttr index_attr;
@@ -191,8 +197,12 @@ protected:
         task->top_vectors->MergeWith(temp_list, task->top_k, true);
         task->neighbour_list_lock->Unlock();
         temp_list.Clear();
-
-        task->num_tasks_completed->fetch_add(1, std::memory_order_release);
+        size_t num_total_processes = task->num_sibling_tasks;
+        size_t num_tasks_completed = task->num_tasks_completed->fetch_add(1) + 1;
+        UNUSED_VARIABLE(num_total_processes);
+        UNUSED_VARIABLE(num_tasks_completed);
+        FatalAssert(num_tasks_completed <= num_total_processes, LOG_TAG_BASIC,
+                    "More tasks completed than total sibling tasks in ProcessIVFSearchTask()");
         return RetStatus::Success();
     }
 };

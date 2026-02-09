@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <map>
 
 #include "utils/concurrent_datastructures.h"
 #include "disaggregated/disaggregated_common.h"
@@ -16,11 +17,12 @@
 namespace divftree {
 
 inline constexpr size_t MAX_MESSAGE_SIZE = 4096;
+inline constexpr uint32_t MAX_NUM_READ_WR = 16;
 
 /* todo: maybe I need to pass this as a runtime arg?! needs tuning */
 static constexpr uint32_t MAX_SEND_WR[NUM_NODE_TYPES] = {
-    0,                          /* MN_SIDE */
-    16,   /* CN_SIDE */
+    0,                 /* MN_SIDE */
+    MAX_NUM_READ_WR,   /* CN_SIDE */
 };
 
 static constexpr int MAX_CQE[NUM_NODE_TYPES] = {
@@ -30,7 +32,7 @@ static constexpr int MAX_CQE[NUM_NODE_TYPES] = {
 
 static constexpr uint32_t MAX_SEND_SGE[NUM_NODE_TYPES] = {
     1,   /* MN_SIDE */
-    16,  /* CN_SIDE */ /* todo: check that it does not go beyond */
+    4,   /* CN_SIDE */ /* todo: check that it does not go beyond */ /* max is 30 for the current hardware */
 };
 
 /* todo: needs tuning */
@@ -41,8 +43,8 @@ static constexpr uint32_t MAX_INLINE_DATA[NUM_NODE_TYPES] = {
 
 
 static constexpr uint32_t MAX_RD_ATOMIC[NUM_NODE_TYPES] = {
-    16,   /* MN_SIDE */
-    16,   /* CN_SIDE */
+    0,                 /* MN_SIDE */
+    MAX_NUM_READ_WR,   /* CN_SIDE */
 };
 
 /* We are not using two-sided verbs */
@@ -58,8 +60,8 @@ static constexpr uint32_t MAX_RECV_SGE[NUM_NODE_TYPES] = {
 };
 
 static constexpr ibv_mtu DEFAULT_MTU[NUM_NODE_TYPES] = {
-    IBV_MTU_256, /* MN_SIDE */
-    IBV_MTU_256, /* CN_SIDE */
+    IBV_MTU_4096, /* MN_SIDE */
+    IBV_MTU_4096, /* CN_SIDE */
 };
 
 static constexpr uint8_t GET_NODE_TYPE_IDX(bool is_memory_node) {
@@ -243,8 +245,8 @@ public:
             ConnectionMessage resp;
             for (auto& [node_id, conn_ctx] : instance->memory_nodes) {
                 resp = ConnectionMessage::INVALID;
-                instance->SendMessage(node_id, &disconnect_msg, sizeof(disconnect_msg));
-                instance->ReceiveMessage(node_id, &resp, sizeof(resp));
+                instance->SendMessage(node_id, &disconnect_msg, sizeof(disconnect_msg), true);
+                instance->ReceiveMessage(node_id, &resp, sizeof(resp), true);
                 FatalAssert(resp == ConnectionMessage::MN_TO_CN_DISCONNECT_RESP, LOG_TAG_RDMA,
                             "Failed to receive disconnect response from memory node %s",
                             node_id.ToString().ToCStr());
@@ -381,17 +383,35 @@ EXIT:
         if (!ready.load(std::memory_order_acquire)) {
             return RetStatus::Fail("RDMA_Manager is not ready for RDMA operations.");
         }
+        RetStatus rs = RetStatus::Success();
 
-        uint8_t connection_idx = GrabConnection(target_node, num_clusters);
+        uint8_t num_resources_acquired = 0;
+        uint8_t num_remaining = num_clusters;
         auto it = memory_nodes.find(target_node);
         FatalAssert(it != memory_nodes.end(), LOG_TAG_RDMA,
                     "Target memory node not found!");
         ConnectionContext& ctx = it->second;
-        TaskID task_id(ctx.connections[connection_idx].next_task_id.fetch_add(1), connection_idx, target_node);
-        pending_tasks.BatchInsert(task_id, std::move(cluster_ids));
-        return RDMAReadInternal(target_node, connection_idx, task_id,
-                                local_buffers, remote_addresses, sizes,
-                                num_clusters);
+        while (num_remaining > 0) {
+            uint8_t connection_idx = GrabConnection(target_node, num_clusters, num_resources_acquired);
+            FatalAssert(num_resources_acquired > 0, LOG_TAG_RDMA,
+                        "Failed to acquire any RDMA resources for RDMA read.");
+            FatalAssert(num_resources_acquired <= num_remaining, LOG_TAG_RDMA,
+                        "Acquired more RDMA resources than remaining clusters to read.");
+            TaskID task_id(ctx.connections[connection_idx].next_task_id.fetch_add(1), connection_idx, target_node);
+            size_t total_acquired = num_clusters - num_remaining;
+            if (num_resources_acquired == num_clusters) {
+                pending_tasks.BatchInsert(task_id, std::move(cluster_ids));
+            } else {
+                pending_tasks.BatchInsert(task_id, cluster_ids.data() + total_acquired, num_resources_acquired);
+            }
+            rs = RDMAReadInternal(target_node, connection_idx, task_id,
+                                  local_buffers + total_acquired, remote_addresses + total_acquired,
+                                  sizes + total_acquired, num_resources_acquired);
+            FatalAssert(rs.IsOK(), LOG_TAG_RDMA,
+                        "RDMAReadInternal() failed. %s", rs.Msg());
+            num_remaining -= num_resources_acquired;
+        }
+        return rs;
     }
 
     RetStatus RDMASGRead(NodeID target_node, void*** local_buffers, uintptr_t* remote_addresses,
@@ -412,21 +432,35 @@ EXIT:
             return RetStatus::Fail("RDMA_Manager is not ready for RDMA operations.");
         }
 
-        uint8_t connection_idx = GrabConnection(target_node, num_clusters);
+        RetStatus rs = RetStatus::Success();
+        uint8_t num_resources_acquired = 0;
+        uint8_t num_remaining = num_clusters;
         auto it = memory_nodes.find(target_node);
         FatalAssert(it != memory_nodes.end(), LOG_TAG_RDMA,
                     "Target memory node not found!");
         ConnectionContext& ctx = it->second;
-        TaskID task_id(ctx.connections[connection_idx].next_task_id.fetch_add(1), connection_idx, target_node);
-        SANITY_CHECK(
-            std::vector<VectorID> cluster_ids_copy(cluster_ids);
-            FatalAssert(cluster_ids.size() == num_clusters, LOG_TAG_RDMA,
-                        "Number of cluster IDs does not match num_clusters in RDMASGReadInternal()");
-        );
-        pending_tasks.BatchInsert(task_id, std::move(cluster_ids));
-        return RDMASGReadInternal(target_node, connection_idx, task_id,
-                                  local_buffers, remote_addresses, sizes, num_sge,
-                                  num_clusters);
+        while (num_remaining > 0) {
+            uint8_t connection_idx = GrabConnection(target_node, num_clusters, num_resources_acquired);
+            FatalAssert(num_resources_acquired > 0, LOG_TAG_RDMA,
+                        "Failed to acquire any RDMA resources for RDMA scatter-gather read.");
+            FatalAssert(num_resources_acquired <= num_remaining, LOG_TAG_RDMA,
+                        "Acquired more RDMA resources than remaining clusters to read.");
+            TaskID task_id(ctx.connections[connection_idx].next_task_id.fetch_add(1), connection_idx, target_node);
+            size_t total_acquired = num_clusters - num_remaining;
+            if (num_resources_acquired == num_clusters) {
+                pending_tasks.BatchInsert(task_id, std::move(cluster_ids));
+            } else {
+                pending_tasks.BatchInsert(task_id, cluster_ids.data() + total_acquired, num_resources_acquired);
+            }
+            rs = RDMASGReadInternal(target_node, connection_idx, task_id,
+                                    local_buffers + total_acquired, remote_addresses + total_acquired,
+                                    sizes + total_acquired, num_sge + total_acquired,
+                                    num_resources_acquired);
+            FatalAssert(rs.IsOK(), LOG_TAG_RDMA,
+                        "RDMASGReadInternal() failed. %s", rs.Msg());
+            num_remaining -= num_resources_acquired;
+        }
+        return rs;
     }
 
     RetStatus PushCompletedReadsToTaskQueue(std::vector<VectorID>& completed_tasks, bool destroying = false) {
@@ -570,7 +604,7 @@ EXIT:
         }
     }
 
-    void ReceiveMessage(NodeID source, void* buffer, size_t buffer_size) {
+    void ReceiveMessage(NodeID source, void* buffer, size_t buffer_size, bool end_message = false) {
         FatalAssert(this == instance, LOG_TAG_RDMA,
                     "RDMA_Manager instance mismatch!");
         FatalAssert(selfInfo.node_id.IsMemoryNode() == source.IsComputeNode(), LOG_TAG_RDMA,
@@ -578,7 +612,8 @@ EXIT:
         FatalAssert(buffer_size > 0, LOG_TAG_RDMA,
                     "Cannot send a message of size 0.");
         CHECK_NOT_NULLPTR(buffer, LOG_TAG_RDMA);
-        if (!ready.load(std::memory_order_acquire)) {
+        if ((!end_message && !ready.load(std::memory_order_acquire)) ||
+            (end_message && ready.load(std::memory_order_relaxed))) {
             FatalAssert(false, LOG_TAG_RDMA,
                         "RDMA_Manager is not ready for RDMA operations.");
             return;
@@ -1583,7 +1618,7 @@ EXIT:
         return rs;
     }
 
-    uint8_t GrabConnection(NodeID target, size_t num_clusters) {
+    uint8_t GrabConnection(NodeID target, size_t num_clusters, uint8_t& num_resources_acquired) {
         FatalAssert(target.IsMemoryNode(), LOG_TAG_RDMA,
                     "Only connections to memory nodes can be grabbed.");
         FatalAssert(selfInfo.node_id.IsComputeNode(), LOG_TAG_RDMA,
@@ -1611,12 +1646,18 @@ EXIT:
                 continue;
             }
 
-            uint32_t num_pending = ctx.connections[idx].num_pending_requests.fetch_add(num_clusters) + num_clusters;
+            uint32_t num_pending = ctx.connections[idx].num_pending_requests.fetch_add(num_clusters);
             if (num_pending >= MAX_SEND_WR[COMPUTE_NODE_IDX]) {
                 ctx.connections[idx].num_pending_requests.fetch_sub(num_clusters);
                 idx = (idx + 1) % MAX_CONN_PER_NODE;
                 DIVFTREE_YIELD();
                 continue;
+            } else if (num_pending + num_clusters > MAX_SEND_WR[COMPUTE_NODE_IDX]) {
+                uint32_t to_free = (num_pending + num_clusters) - MAX_SEND_WR[COMPUTE_NODE_IDX];
+                ctx.connections[idx].num_pending_requests.fetch_sub(to_free);
+                num_resources_acquired = static_cast<uint8_t>(num_clusters - to_free);
+            } else {
+                num_resources_acquired = static_cast<uint8_t>(num_clusters);
             }
 
             break;
@@ -1680,7 +1721,10 @@ EXIT:
         struct ibv_send_wr* wr_list = new ibv_send_wr[num_clusters];
         struct ibv_sge* sge_list = new ibv_sge[num_clusters];
         struct ibv_send_wr* bad_wr = nullptr;
-
+        SANITY_CHECK(
+            std::map<std::pair<void*, uint32_t>, size_t> local_buffers_map;
+            std::map<std::pair<void*, uint32_t>, size_t> remote_buffers_map;
+        );
 
         for (size_t i = 0; i < num_clusters; ++i) {
             FatalAssert(local_buffers[i] != nullptr, LOG_TAG_RDMA,
@@ -1697,6 +1741,29 @@ EXIT:
                         (conn_ctx.remote_region_addr + conn_ctx.remote_region_size),
                         LOG_TAG_RDMA,
                         "remote_address[%zu] is out of remote registered memory region in RDMARead", i);
+            SANITY_CHECK(
+                auto last = local_buffers_map.upper_bound(std::make_pair(local_buffers[i], sizes[i]));
+                for (auto it = local_buffers_map.begin(); it != last; ++it) {
+                    FatalAssert((it->first.first < local_buffers[i]) && (it->first.first + it->first.second <= local_buffers[i]),
+                                LOG_TAG_MEMORY, "Memory corruption detected before allocated slot");
+                }
+                for (auto it = last; it != local_buffers_map.end(); ++it) {
+                    FatalAssert((it->first.first > local_buffers[i]) && (local_buffers[i] + sizes[i] <= it->first.first),
+                                LOG_TAG_MEMORY, "Memory corruption detected after allocated slot");
+                }
+                local_buffers_map[std::make_pair(local_buffers[i], sizes[i])] = i;
+
+                auto last_r = remote_buffers_map.upper_bound(std::make_pair((void*)remote_addresses[i], sizes[i]));
+                for (auto it = remote_buffers_map.begin(); it != last_r; ++it) {
+                    FatalAssert((it->first.first < (void*)remote_addresses[i]) && (it->first.first + it->first.second <= (void*)remote_addresses[i]),
+                                LOG_TAG_MEMORY, "Memory corruption detected before allocated slot");
+                }
+                for (auto it = last_r; it != remote_buffers_map.end(); ++it) {
+                    FatalAssert((it->first.first > (void*)remote_addresses[i]) && ((void*)remote_addresses[i] + sizes[i] <= it->first.first),
+                                LOG_TAG_MEMORY, "Memory corruption detected after allocated slot");
+                }
+                remote_buffers_map[std::make_pair((void*)remote_addresses[i], sizes[i])] = i;
+            );
             sge_list[i].addr = reinterpret_cast<uintptr_t>(local_buffers[i]);
             sge_list[i].length = sizes[i];
             sge_list[i].lkey = mr->lkey;
@@ -1768,6 +1835,8 @@ EXIT:
         for (size_t i = 0; i < num_clusters; ++i) {
             FatalAssert(num_sge[i] > 0, LOG_TAG_RDMA,
                         "num_sge[%zu] is zero in RDMASGRead", i);
+            FatalAssert(num_sge[i] <= MAX_SEND_SGE[COMPUTE_NODE_IDX], LOG_TAG_RDMA,
+                        "num_sge[%zu] exceeds MAX_SGE_PER_WR (%u) in RDMASGRead", i, MAX_SEND_SGE[COMPUTE_NODE_IDX]);
             CHECK_NOT_NULLPTR(local_buffers[i], LOG_TAG_RDMA);
             CHECK_NOT_NULLPTR(sizes[i], LOG_TAG_RDMA);
             sge_list[i] = new ibv_sge[num_sge[i]];

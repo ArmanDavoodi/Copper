@@ -9,6 +9,8 @@
 #include <random>
 #include <atomic>
 #include <mutex>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 #include "debug.h"
 
@@ -458,6 +460,121 @@ public:
         return (_next_task_id++);
     }
 
+    inline void UpdatePollStats(bool lock_acquired, size_t num_tasks_polled) {
+#ifdef ENABLE_STAT_COLLECTION
+        ++cnt_num_polls;
+        if (!lock_acquired) {
+            ++cnt_unsuccsessful_polls;
+        } else if (num_tasks_polled == 0) {
+            ++cnt_empty_polls;
+        } else {
+            cnt_num_remote_reads_polled += num_tasks_polled;
+        }
+#else
+        UNUSED_VARIABLE(lock_acquired);
+        UNUSED_VARIABLE(num_tasks_polled);
+#endif
+    }
+
+    inline void UpdateMemoryStats(size_t num_from_cool, size_t num_from_pool, size_t num_tries) {
+#ifdef ENABLE_STAT_COLLECTION
+        FatalAssert(num_tries > 0, LOG_TAG_BUFFER, "num_tries should be greater than 0 in BufferMgr::ReadFromRemote()");
+        FatalAssert((num_from_cool + num_from_pool) > 0, LOG_TAG_BUFFER,
+                    "at least one memory should be allocated in BufferMgr::ReadFromRemote()");
+        ++cnt_remote_accesses;
+        cnt_tries_to_get_memory += num_tries;
+        if (num_tries == 1) {
+            ++cnt_single_try;
+            cnt_got_memory_from_cool_once += num_from_cool;
+            cnt_got_memory_from_pool_once += num_from_pool;
+        } else {
+            cnt_got_memory_from_cool_multiple += num_from_cool;
+            cnt_got_memory_from_pool_multiple += num_from_pool;
+        }
+#else
+        UNUSED_VARIABLE(num_from_cool);
+        UNUSED_VARIABLE(num_from_pool);
+        UNUSED_VARIABLE(num_tries);
+#endif
+    }
+
+    /* todo add stats to check how many times do we get anything from pool vs cooling list(i.e eviction) */
+    inline void AppendStats(String& stats_str,
+                            size_t& total_num_polls,
+                            size_t& total_unsuccsessful_polls,
+                            size_t& total_empty_polls,
+                            size_t& total_num_remote_reads_polled,
+                            size_t& total_remote_accesses,
+                            size_t& total_tries_to_get_memory,
+                            size_t& total_single_try,
+                            size_t& total_got_memory_from_cool_once,
+                            size_t& total_got_memory_from_pool_once,
+                            size_t& total_got_memory_from_cool_multiple,
+                            size_t& total_got_memory_from_pool_multiple) {
+#ifdef ENABLE_STAT_COLLECTION
+        stats_str += String("Thread(%lu): %lu - "
+                            "num_polls: %zu(num_fail: %.2f%%(%zu), num_empty %.2f%%(%zu), num_valid: %.2f%%(%zu)), "
+                            "num_valid_to_successful_ratio: %.2f%%, "
+                            "num_remote_reads_polled: %zu, avg_num_polled_per_valid_polls: %zu, "
+                            "num_remote_rdma_reads: %zu(single_alloc: %.2f%%(%zu), multi_alloc: %.2f%%(%zu)), "
+                            "num_alloc_tries: %zu, avg_num_alloc_tries_per_req: %zu, "
+                            "avg_num_alloc_multi_tries_per_req: %zu, "
+                            "num_pages_got: %zu(from_pool: %.2f%%(%zu), from_cooling_list: %.2f%%(%zu))\n",
+                            syscall(SYS_gettid), _id, cnt_num_polls,
+                            (cnt_num_polls > 0 ? (100.0 * cnt_unsuccsessful_polls / cnt_num_polls) : 0),
+                            cnt_unsuccsessful_polls,
+                            (cnt_num_polls > 0 ? (100.0 * cnt_empty_polls / cnt_num_polls) : 0), cnt_empty_polls,
+                            (cnt_num_polls > 0 ?
+                                (100.0 * (cnt_num_polls - cnt_unsuccsessful_polls - cnt_empty_polls) / cnt_num_polls) :
+                                0),
+                            cnt_num_polls - cnt_unsuccsessful_polls - cnt_empty_polls,
+                            (cnt_num_polls > 0 ? (100.0 * (cnt_num_polls - cnt_unsuccsessful_polls - cnt_empty_polls) /
+                                                  (cnt_num_polls - cnt_unsuccsessful_polls)) : 0),
+                            cnt_num_remote_reads_polled,
+                            (((cnt_num_polls > 0) && (cnt_num_polls - cnt_unsuccsessful_polls - cnt_empty_polls) > 0) ?
+                             (cnt_num_remote_reads_polled / (cnt_num_polls - cnt_unsuccsessful_polls - cnt_empty_polls))
+                             : 0), cnt_remote_accesses,
+                            (cnt_remote_accesses > 0 ? (100.0 * cnt_single_try / cnt_remote_accesses) : 0), cnt_single_try,
+                            (cnt_remote_accesses > 0 ? (100.0 * (cnt_remote_accesses - cnt_single_try) / cnt_remote_accesses) : 0), (cnt_remote_accesses - cnt_single_try),
+                            cnt_tries_to_get_memory,
+                            (cnt_remote_accesses > 0 ? (cnt_tries_to_get_memory / cnt_remote_accesses) : 0),
+                            (((cnt_remote_accesses > 0) && (cnt_remote_accesses - cnt_single_try > 0)) ?
+                                (cnt_tries_to_get_memory / (cnt_remote_accesses - cnt_single_try)) : 0),
+                            cnt_got_memory_from_cool_once + cnt_got_memory_from_cool_multiple + cnt_got_memory_from_pool_once + cnt_got_memory_from_pool_multiple,
+                            (cnt_got_memory_from_cool_once + cnt_got_memory_from_cool_multiple + cnt_got_memory_from_pool_once + cnt_got_memory_from_pool_multiple > 0) ?
+                            ((cnt_got_memory_from_pool_once + cnt_got_memory_from_pool_multiple) * 100.0) / (cnt_got_memory_from_cool_once + cnt_got_memory_from_cool_multiple + cnt_got_memory_from_pool_once + cnt_got_memory_from_pool_multiple) : 0,
+                            cnt_got_memory_from_pool_once + cnt_got_memory_from_pool_multiple,
+                            (cnt_got_memory_from_cool_once + cnt_got_memory_from_cool_multiple + cnt_got_memory_from_pool_once + cnt_got_memory_from_pool_multiple > 0) ?
+                            ((cnt_got_memory_from_cool_once + cnt_got_memory_from_cool_multiple) * 100.0) / (cnt_got_memory_from_cool_once + cnt_got_memory_from_cool_multiple + cnt_got_memory_from_pool_once + cnt_got_memory_from_pool_multiple) : 0,
+                            cnt_got_memory_from_cool_once + cnt_got_memory_from_cool_multiple
+                        );
+        total_num_polls += cnt_num_polls;
+        total_unsuccsessful_polls += cnt_unsuccsessful_polls;
+        total_empty_polls += cnt_empty_polls;
+        total_num_remote_reads_polled += cnt_num_remote_reads_polled;
+        total_remote_accesses += cnt_remote_accesses;
+        total_tries_to_get_memory += cnt_tries_to_get_memory;
+        total_single_try += cnt_single_try;
+        total_got_memory_from_cool_once += cnt_got_memory_from_cool_once;
+        total_got_memory_from_pool_once += cnt_got_memory_from_pool_once;
+        total_got_memory_from_cool_multiple += cnt_got_memory_from_cool_multiple;
+        total_got_memory_from_pool_multiple += cnt_got_memory_from_pool_multiple;
+#else
+        UNUSED_VARIABLE(stats_str);
+        UNUSED_VARIABLE(total_num_polls);
+        UNUSED_VARIABLE(total_unsuccsessful_polls);
+        UNUSED_VARIABLE(total_empty_polls);
+        UNUSED_VARIABLE(total_num_remote_reads_polled);
+        UNUSED_VARIABLE(total_remote_accesses);
+        UNUSED_VARIABLE(total_tries_to_get_memory);
+        UNUSED_VARIABLE(total_single_try);
+        UNUSED_VARIABLE(total_got_memory_from_cool_once);
+        UNUSED_VARIABLE(total_got_memory_from_pool_once);
+        UNUSED_VARIABLE(total_got_memory_from_cool_multiple);
+        UNUSED_VARIABLE(total_got_memory_from_pool_multiple);
+#endif
+    }
+
     /*
      * even if there are only 5 vectors in a layer the probablity of choosing taht cluster is 20%.
      * Therefore, if we retry 21 times it should be highly unlikely that this happens. In case we do not succeed.
@@ -496,6 +613,21 @@ protected:
     DIVFThreadID waitingFor = INVALID_DIVF_THREAD_ID;
     std::unordered_set<void*> heldShared;
     std::unordered_set<void*> heldExclusive;
+#endif
+
+#ifdef ENABLE_STAT_COLLECTION
+    size_t cnt_num_polls = 0;
+    size_t cnt_unsuccsessful_polls = 0; /* lock failed */
+    size_t cnt_empty_polls = 0;
+    size_t cnt_num_remote_reads_polled = 0;
+
+    size_t cnt_remote_accesses = 0;
+    size_t cnt_tries_to_get_memory = 0;
+    size_t cnt_single_try = 0;
+    size_t cnt_got_memory_from_cool_once = 0;
+    size_t cnt_got_memory_from_pool_once = 0;
+    size_t cnt_got_memory_from_cool_multiple = 0;
+    size_t cnt_got_memory_from_pool_multiple = 0;
 #endif
 };
 

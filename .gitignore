@@ -45,6 +45,9 @@
 #configurations
 *.conf
 
+#stats
+*.stat
+
 .vscode/
 
 **/third_party/*

@@ -278,7 +278,7 @@ protected:
 
     inline void* AllocateMemory(size_t size_in_bytes) {
         size_t aligned_size = ALIGNED_SIZE(size_in_bytes, CACHE_LINE_SIZE);
-        size_t offset = next_memory_offset.fetch_add(aligned_size, std::memory_order_acquire);
+        size_t offset = next_memory_offset.fetch_add(aligned_size);
         FatalAssert((offset + aligned_size) <= pool_size,
                     LOG_TAG_MEMORY, "MN_DIVFIndex memory pool out of memory!");
         return static_cast<void*>(static_cast<char*>(memory_pool) + offset);

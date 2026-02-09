@@ -19,6 +19,16 @@ enum class BufferEntryState : uint8_t {
     BUFFER_ENTRY_LOADING
 };
 
+struct MemoryStatsNode {
+    size_t num_allocated_pages;
+    size_t num_bytes_in_use;
+    MemoryStatsNode* next;
+
+    MemoryStatsNode(size_t num_allocated_pages, size_t num_bytes_in_use) :
+        num_allocated_pages(num_allocated_pages), num_bytes_in_use(num_bytes_in_use), next(nullptr) {}
+    MemoryStatsNode() : num_allocated_pages(0), num_bytes_in_use(0), next(nullptr) {}
+};
+
 struct BufferEntry {
     SXSpinLock lock;
     size_t pin = 0;
@@ -33,6 +43,16 @@ struct BufferEntry {
     size_t cache_list_idx;
 
     std::vector<IVFSearchTaskFactory*> pending;
+#ifdef ENABLE_STAT_COLLECTION
+    size_t num_read_local = 0;
+    size_t num_read_remote_in_progress = 0;
+    size_t num_read_remote = 0;
+    size_t num_read = 0;
+
+    size_t num_moved_to_cool = 0;
+    size_t num_removed_from_cool = 0;
+    size_t num_evicted = 0;
+#endif
 
     BufferEntry(uintptr_t raddr, size_t size_bytes, size_t page_size, uint16_t dimension, bool is_leaf) :
         state(BufferEntryState::BUFFER_ENTRY_EVICTED),
@@ -186,6 +206,10 @@ public:
                 last_entry->cache_list_idx = idx;
             }
             _cooling_entries[idx] = nullptr;
+            entry->state = BufferEntryState::BUFFER_ENTRY_CACHED;
+#ifdef ENABLE_STAT_COLLECTION
+            (entry->num_removed_from_cool)++;
+#endif
         } else {
             FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_EVICTED,
                         LOG_TAG_BUFFER,
@@ -216,10 +240,11 @@ public:
         _locks[bucket_idx].Unlock();
     }
 
-    size_t TryMoveToCooling(uint64_t num_pages, void** freed_pages, size_t max_pages_needed) {
+    size_t TryMoveToCooling(uint64_t num_pages, void** freed_pages, size_t max_pages_needed, size_t& bytes_freed,
+                            size_t& pages_freed) {
         FatalAssert(num_pages > 0, LOG_TAG_BUFFER,
                     "num_pages must be greater than 0 in CacheMetaContainer::TryMoveToCooling()");
-        FatalAssert(num_pages <= ((_num_buckets * _bucket_cap) / 10), LOG_TAG_BUFFER,
+        FatalAssert(num_pages <= ((_num_buckets * _bucket_cap) / 2), LOG_TAG_BUFFER,
                     "num_pages exceeds total capacity in CacheMetaContainer::TryMoveToCooling()");
         CHECK_NOT_NULLPTR(freed_pages, LOG_TAG_BUFFER);
         FatalAssert(max_pages_needed > 0, LOG_TAG_BUFFER,
@@ -274,6 +299,11 @@ public:
                             LOG_TAG_BUFFER,
                             "Cooling entry slot is occupied by a pinned entry in CacheMetaContainer::TryMoveToCooling()");
                 _cooling_entries[idx]->state = BufferEntryState::BUFFER_ENTRY_EVICTED;
+#ifdef ENABLE_STAT_COLLECTION
+                (entry->num_moved_to_cool)++;
+                (_cooling_entries[idx]->num_evicted)++;
+                bytes_freed += _cooling_entries[idx]->total_size_bytes;
+#endif
                 if (num_freed < max_pages_needed) {
                     size_t num_needed = std::min(_cooling_entries[idx]->num_pages, max_pages_needed - num_freed);
                     for (size_t p = 0; p < num_needed; ++p) {
@@ -282,9 +312,11 @@ public:
                     if (num_needed < _cooling_entries[idx]->num_pages) {
                         _page_pool->BatchFree(_cooling_entries[idx]->pages + num_needed,
                                               _cooling_entries[idx]->num_pages - num_needed);
+                        pages_freed += (_cooling_entries[idx]->num_pages - num_needed);
                     }
                 } else {
                     _page_pool->BatchFree(_cooling_entries[idx]->pages, _cooling_entries[idx]->num_pages);
+                    pages_freed += _cooling_entries[idx]->num_pages;
                 }
             }
 
@@ -301,6 +333,37 @@ public:
 
     inline size_t NumHotEntries() {
         return _num_hot_entries.load(std::memory_order_acquire);
+    }
+
+    inline void FreeAll() {
+        for (size_t i = 0; i < _num_buckets; ++i) {
+            _locks[i].Lock(SX_EXCLUSIVE);
+            for (BufferEntry* entry : _hot_entries[i]) {
+                FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED,
+                            LOG_TAG_BUFFER,
+                            "Hot entry must be in CACHED state in CacheMetaContainer::FreeAll()");
+                FatalAssert(entry->pin == 0,
+                            LOG_TAG_BUFFER,
+                            "Hot entry must be unpinned in CacheMetaContainer::FreeAll()");
+                entry->state = BufferEntryState::BUFFER_ENTRY_EVICTED;
+                _page_pool->BatchFree(entry->pages, entry->num_pages);
+            }
+            _hot_entries[i].clear();
+            _locks[i].Unlock();
+        }
+        for (size_t i = 0; i < _num_buckets * _bucket_cap; ++i) {
+            if (_cooling_entries[i] != nullptr) {
+                FatalAssert(_cooling_entries[i]->state == BufferEntryState::BUFFER_ENTRY_COOLING,
+                            LOG_TAG_BUFFER,
+                            "Cooling entry must be in COOLING state in CacheMetaContainer::FreeAll()");
+                FatalAssert(_cooling_entries[i]->pin == 0,
+                            LOG_TAG_BUFFER,
+                            "Cooling entry must be unpinned in CacheMetaContainer::FreeAll()");
+                _cooling_entries[i]->state = BufferEntryState::BUFFER_ENTRY_EVICTED;
+                _page_pool->BatchFree(_cooling_entries[i]->pages, _cooling_entries[i]->num_pages);
+                _cooling_entries[i] = nullptr;
+            }
+        }
     }
 
 protected:
@@ -391,14 +454,23 @@ public:
         remaining.reserve(num_clusters);
         size_t num_pages_to_load = 0;
         while (!current_indices.empty()) {
-            for (size_t i = 0; i < num_clusters; ++i) {
+            for (size_t i : current_indices) {
                 auto it = _buffer_map.find(cluster_ids[i]);
                 BufferEntry& entry = it->second;
                 if (!_cache_meta_container.TryLockAndPinEntry(&entry)) {
                     remaining.push_back(i);
                     continue;
                 }
-
+#ifdef ENABLE_STAT_COLLECTION
+                (entry.num_read)++;
+                if (entry.state == BufferEntryState::BUFFER_ENTRY_LOADING) {
+                    (entry.num_read_remote_in_progress)++;
+                } else if (entry.state == BufferEntryState::BUFFER_ENTRY_CACHED) {
+                    (entry.num_read_local)++;
+                } else {
+                    (entry.num_read_remote)++;
+                }
+#endif
                 if (entry.state == BufferEntryState::BUFFER_ENTRY_LOADING) {
                     FatalAssert(!entry.pending.empty(), LOG_TAG_BUFFER,
                                 "BufferEntry in LOADING state must have pending tasks");
@@ -444,6 +516,7 @@ public:
                 in_cache_tasks.clear();
             }
 
+            /* todo: stat collection */
             if (remaining.size() == current_indices.size()) {
                 // none of the remaining entries could be locked
                 DIVFTREE_YIELD();
@@ -469,6 +542,7 @@ public:
         CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BUFFER);
         /*  to avoid contention */
         if (!_poll_lock.TryLock(SX_EXCLUSIVE)) {
+            threadSelf->UpdatePollStats(false, 0);
             return status;
         }
         std::vector<VectorID> completed_tasks;
@@ -476,6 +550,7 @@ public:
         FatalAssert(status.IsOK(), LOG_TAG_BUFFER,
                     "Failed to poll completed RDMA reads in BufferMgr::PollRemoteReads(): %s",
                     status.Msg());
+        threadSelf->UpdatePollStats(true, completed_tasks.size());
 
         std::vector<IVFSearchTask*> new_tasks;
         for (VectorID cluster_id : completed_tasks) {
@@ -509,6 +584,14 @@ public:
                         reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(entry.pages[p])));
                     new_tasks.push_back(task);
                 }
+
+                FatalAssert(task_factory->num_sibling_tasks > 0, LOG_TAG_BUFFER,
+                            "Sibling task count must be greater than 0 in BufferMgr::PollRemoteReads()");
+                FatalAssert(task_factory->num_sibling_tasks >= entry.num_pages, LOG_TAG_BUFFER,
+                            "Sibling task count must be at least the number of pages in BufferMgr::PollRemoteReads()");
+                FatalAssert(task_factory->num_tasks_completed->load(std::memory_order_acquire) <
+                    task_factory->num_sibling_tasks, LOG_TAG_BUFFER,
+                            "All tasks should not have been completed in BufferMgr::PollRemoteReads()");
             }
             entry.pending.clear();
             entry.lock.Unlock();
@@ -524,6 +607,54 @@ public:
 
         _poll_lock.Unlock();
         return RetStatus::Success();
+    }
+
+        inline String GetStats(MemoryStatsNode*& memory_stats_head) {
+#ifdef ENABLE_MEMORY_STAT_COLLECTION
+        memory_stats_head = _memory_stats_head;
+#else
+        memory_stats_head = nullptr;
+#endif
+#ifdef ENABLE_STAT_COLLECTION
+        String stats = "";
+        size_t total_moved_to_cool = 0;
+        size_t total_removed_from_cool = 0;
+        size_t total_evicted = 0;
+        size_t total_read_local = 0;
+        size_t total_read_remote_in_progress = 0;
+        size_t total_read_remote = 0;
+        size_t total_read = 0;
+        for (const auto& pair : _buffer_map) {
+            const BufferEntry& entry = pair.second;
+            total_moved_to_cool += entry.num_moved_to_cool;
+            total_removed_from_cool += entry.num_removed_from_cool;
+            total_evicted += entry.num_evicted;
+            total_read_local += entry.num_read_local;
+            total_read_remote_in_progress += entry.num_read_remote_in_progress;
+            total_read_remote += entry.num_read_remote;
+            total_read += entry.num_read;
+            stats += String(VECTORID_LOG_FMT ": reads: %zu (local: %.2f%%(%zu), remote in progress: %.2f%%(%zu), remote: %.2f%%(%zu)), moved to cool: %zu, removed from cool: %zu, evicted: %zu\n",
+                           VECTORID_LOG(pair.first), entry.num_read,
+                           (((double)(entry.num_read_local) / entry.num_read) * 100), entry.num_read_local,
+                           (((double)(entry.num_read_remote_in_progress) / entry.num_read) * 100),
+                           entry.num_read_remote_in_progress,
+                           (((double)(entry.num_read_remote) / entry.num_read) * 100), entry.num_read_remote,
+                           entry.num_moved_to_cool, entry.num_removed_from_cool, entry.num_evicted);
+        }
+        return
+            String(
+                "BufferMgr Stats:\n"
+                "Total reads: %zu (local: %.2f%%(%zu), remote in progress: %.2f%%(%zu), remote: %.2f%%(%zu)), "
+                "total_moved_to_cool: %zu, total_removed_from_cool: %zu, total_evicted: %zu\n",
+                total_read,
+                (((double)(total_read_local) / total_read) * 100), total_read_local,
+                (((double)(total_read_remote_in_progress) / total_read) * 100), total_read_remote_in_progress,
+                (((double)(total_read_remote) / total_read) * 100), total_read_remote,
+                total_moved_to_cool, total_removed_from_cool, total_evicted
+            ) + stats + String("\n");
+#else
+        return "BufferMgr Stats: (enable stat collection to see details)";
+#endif
     }
 
 protected:
@@ -598,8 +729,21 @@ protected:
 
         rdma_mgr->ReceiveMessage(mnode_id, centroids, sizeof(ClusterMeta) * num_centroids);
         rdma_mgr->ReceiveMessage(mnode_id, centroid_data, sizeof(VTYPE) * num_centroids * dim);
-
+        SANITY_CHECK(
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
+            "Received centroids successfully in BufferMgr::Init(). num_centroids: %zu", num_centroids);
+        );
         for (size_t c = 0; c < num_centroids; ++c) {
+            SANITY_CHECK(
+                String centroid_info = String(VECTORID_LOG_FMT ": remote_addr: %p, remote_size: %zu data=[",
+                                            VECTORID_LOG(centroids[c].centroid_id),
+                                            (void*)(uintptr_t)(centroids[c].remote_addr),
+                                            centroids[c].remote_size);
+                for (uint16_t d = 0; d < dim; ++d) {
+                    centroid_info += String(VTYPE_FMT "%s", centroid_data[c * dim + d], (d == dim - 1) ? "]" : ", ");
+                }
+                DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER, "Centroid %zu: %s", c, centroid_info.ToCStr());
+            );
             _buffer_map.emplace(
                 centroids[c].centroid_id,
                 BufferEntry(centroids[c].remote_addr, centroids[c].remote_size, _cache.GetPageSize(), dim, true)
@@ -608,7 +752,9 @@ protected:
 
     }
 
-    ~BufferMgr() {}
+    ~BufferMgr() {
+        _cache_meta_container.FreeAll();
+    }
 
     RetStatus ReadFromRemote(std::vector<VectorID>&& cluster_ids, size_t element_size, size_t num_pages_to_load) {
         RetStatus status = RetStatus::Success();
@@ -616,19 +762,38 @@ protected:
         CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BUFFER);
         NodeID mnode_id = rdma_mgr->GetMemoryNodeID();
         bool use_sg = (num_pages_to_load != cluster_ids.size());
-        FatalAssert(!use_sg, LOG_TAG_BUFFER,
-                    "Non-scatter-gather RDMA read is not implemented in BufferMgr::ReadFromRemote()");
         void** local_buffers = new void*[num_pages_to_load];
         size_t num_allocated = 0;
+        size_t num_tries = 0;
+        size_t num_from_cool = 0;
+        size_t num_from_pool = 0;
+        size_t bytes_freed_from_cool = 0;
+        size_t num_bytes_needed = 0;
+        size_t num_pages_freed = 0;
+        UNUSED_VARIABLE(num_bytes_needed);
+#ifdef ENABLE_MEMORY_STAT_COLLECTION
+        for (VectorID cluster_id : cluster_ids) {
+            auto it = _buffer_map.find(cluster_id);
+            FatalAssert(it != _buffer_map.end(), LOG_TAG_BUFFER,
+                        "Cluster ID not found in BufferMgr::ReadFromRemote()");
+            BufferEntry& entry = it->second;
+            num_bytes_needed += entry.total_size_bytes;
+        }
+        _memory_stats_lock.Lock(SX_EXCLUSIVE);
+#endif
+
         while (num_allocated < num_pages_to_load) {
+            ++num_tries;
             size_t num_to_alloc = num_pages_to_load - num_allocated;
-            num_allocated += _cache_meta_container.TryMoveToCooling(num_to_alloc, local_buffers + num_allocated,
-                                                                    num_to_alloc);
+            num_from_cool += _cache_meta_container.TryMoveToCooling(num_to_alloc, local_buffers + num_allocated,
+                                                                    num_to_alloc, bytes_freed_from_cool, num_pages_freed);
+            num_allocated += num_from_cool;
             if (num_allocated < num_pages_to_load) {
                 num_to_alloc = num_pages_to_load - num_allocated;
-                num_allocated +=
+                num_from_pool +=
                     _cache.BatchAllocate(local_buffers + num_allocated, num_to_alloc,
                                          AllocationFlags{.clear = 0, .non_blocking = 1, .atomic = 0, .unused = 0});
+                num_allocated += num_from_pool;
             }
 
             if (num_allocated < num_pages_to_load) {
@@ -638,9 +803,39 @@ protected:
                 usleep(1);
             }
         }
+        threadSelf->UpdateMemoryStats(num_from_cool, num_from_pool, num_tries);
 
         FatalAssert(num_allocated == num_pages_to_load, LOG_TAG_BUFFER,
                     "Failed to allocate enough pages in BufferMgr::ReadFromRemote()");
+#ifdef ENABLE_MEMORY_STAT_COLLECTION
+        FatalAssert(num_bytes_needed > 0, LOG_TAG_BUFFER,
+                    "num_bytes_needed must be greater than 0 in BufferMgr::ReadFromRemote()");
+        if (_memory_stats_tail == nullptr) {
+            FatalAssert(_memory_stats_head == nullptr, LOG_TAG_BUFFER,
+                        "Memory stats head should be null when tail is null in BufferMgr::ReadFromRemote()");
+            FatalAssert(num_from_cool == 0, LOG_TAG_BUFFER,
+                        "num_from_cool should be 0 for the first memory stats entry in BufferMgr::ReadFromRemote()");
+            FatalAssert(num_pages_freed == 0, LOG_TAG_BUFFER,
+                        "num_pages_freed should be 0 for the first memory stats entry in BufferMgr::ReadFromRemote()");
+            FatalAssert(bytes_freed_from_cool == 0, LOG_TAG_BUFFER,
+                        "bytes_freed_from_cool should be 0 for the first memory stats entry in BufferMgr::ReadFromRemote()");
+            _memory_stats_head = new MemoryStatsNode(num_allocated, num_bytes_needed);
+            _memory_stats_tail = _memory_stats_head;
+        } else {
+            FatalAssert(_memory_stats_tail != nullptr, LOG_TAG_BUFFER,
+                        "Memory stats tail should not be null when adding a new entry in BufferMgr::ReadFromRemote()");
+            FatalAssert(_memory_stats_tail->current_pages >= num_pages_freed, LOG_TAG_BUFFER,
+                        "Current pages should be greater than or equal to pages allocated from pool in BufferMgr::ReadFromRemote()");
+            size_t _current_pages = _memory_stats_tail->current_pages - num_pages_freed + num_from_pool;
+            FatalAssert(_memory_stats_tail->current_bytes >= bytes_freed_from_cool, LOG_TAG_BUFFER,
+                        "Current bytes should be greater than or equal to bytes freed from cool in BufferMgr::ReadFromRemote()");
+            size_t _current_bytes = _memory_stats_tail->current_bytes - bytes_freed_from_cool + num_bytes_needed;
+            MemoryStatsNode* new_node = new MemoryStatsNode(_current_pages, _current_bytes);
+            _memory_stats_tail->next = new_node;
+            _memory_stats_tail = new_node;
+        }
+        _memory_stats_lock.Unlock();
+#endif
         /* todo: more efficnet implementation */
         if (use_sg) {
             size_t num_used = 0;
@@ -718,6 +913,12 @@ protected:
     CacheMetaContainer _cache_meta_container;
     SXSpinLock _poll_lock;
     BlockingQueue<IVFSearchTask*>* _search_task_queue;
+
+#ifdef ENABLE_MEMORY_STAT_COLLECTION
+    SXLock _memory_stats_lock;
+    MemoryStatsNode* _memory_stats_head = nullptr;
+    MemoryStatsNode* _memory_stats_tail = nullptr;
+#endif
 };
 
 };

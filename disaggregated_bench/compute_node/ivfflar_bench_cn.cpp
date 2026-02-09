@@ -32,6 +32,13 @@ divftree::RetStatus Search(std::vector<std::pair<divftree::DTYPE, divftree::IVFV
     divftree::RetStatus rs;
     neighbours.clear();
     size_t idx = divftree::threadSelf->UniformRange64(0, total_num_queries - 1);
+    if (divftree::threadSelf->UniformRange32(0, 1000) == 0) {
+        divftree::String query_str = divftree::String("search query vector: idx=%zu, data=[", idx);
+        for (size_t i = 0; i < DIMENSION; ++i) {
+            query_str += divftree::String(VTYPE_FMT "%s", search_query_vectors[idx * DIMENSION + i], (i == DIMENSION - 1) ? "]" : ", ");
+        }
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%s", query_str.ToCStr());
+    }
     rs = vector_index->ANNSearch(&search_query_vectors[idx * DIMENSION], default_k, n_probes, neighbours);
     if (!rs.IsOK()) {
         DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_TEST, "Error during search: %s", rs.Msg());
@@ -137,6 +144,25 @@ void worker(divftree::Thread* self) {
         run_done.notify_all();
     }
 
+#ifdef ENABLE_STAT_COLLECTION
+    stat_file_lock.lock();
+    self->AppendStats(
+        stat_file_buffer,
+        _total_num_polls,
+        _total_unsuccsessful_polls,
+        _total_empty_polls,
+        _total_num_remote_reads_polled,
+        _total_remote_accesses,
+        _total_tries_to_get_memory,
+        _total_single_try,
+        _total_got_memory_from_cool_once,
+        _total_got_memory_from_pool_once,
+        _total_got_memory_from_cool_multiple,
+        _total_got_memory_from_pool_multiple
+    );
+    stat_file_lock.unlock();
+#endif
+
     self->DestroyDIVFThread();
 }
 
@@ -162,10 +188,17 @@ int main(int argc, char** argv) {
     FatalAssert(argc == 2, LOG_TAG_TEST,
                 "Usage: %s <self-node-idx>", argv[0]);
     divftree::network_config::self_idx = static_cast<uint8_t>(std::stoul(argv[1]));
-    divftree::ReadNetworkConfigs();
+    std::pair<divftree::String, divftree::String> node_strs = divftree::ReadNetworkConfigs();
     divftree::NodeID self_id = divftree::NodeID(false, divftree::network_config::compute_node_ids[divftree::network_config::self_idx]);
     ReadConfigs();
     ParseConfigs(self_id);
+    DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
+            "Completed reading network configuration: %hhu memory nodes:%s, %hhu compute nodes:%s, "
+            "RDMA device: %s, port: %hhu, GID index: %d",
+            ::divftree::network_config::num_memory_nodes, node_strs.first.ToCStr(),
+            ::divftree::network_config::num_compute_nodes, node_strs.second.ToCStr(),
+            ::divftree::network_config::rdma_device_name, ::divftree::network_config::rdma_port,
+            ::divftree::network_config::gid_index);
 
     divftree::Thread main_thread(100);
     main_thread.InitDIVFThread(DIMENSION);
@@ -316,6 +349,66 @@ int main(int argc, char** argv) {
         delete threads[i];
         threads[i] = nullptr;
     }
+
+#ifdef ENABLE_STAT_COLLECTION
+    FILE* f = fopen(stat_file, "w");
+    if (f == nullptr) {
+        DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_TEST, "Cannot open stat file %s for writing!", stat_file);
+    } else {
+        stat_file_buffer = divftree::String("total_num_polls: %zu(total_num_fail: %.2f%%(%zu), total_num_empty %.2f%%(%zu), total_num_valid: %.2f%%(%zu)), "
+                            "total_num_valid_to_successful_ratio: %.2f%%, "
+                            "total_num_remote_reads_polled: %zu, avg_num_polled_per_valid_polls: %zu, "
+                            "total_num_remote_rdma_reads: %zu(single_alloc: %.2f%%(%zu), multi_alloc: %.2f%%(%zu)), "
+                            "total_num_alloc_tries: %zu, avg_num_alloc_tries_per_req: %zu, "
+                            "avg_num_alloc_multi_tries_per_req: %zu, "
+                            "total_num_pages_got: %zu(from_pool: %.2f%%(%zu), from_cooling_list: %.2f%%(%zu))\n",
+                            _total_num_polls,
+                            (_total_num_polls > 0 ? (100.0 * _total_unsuccsessful_polls / _total_num_polls) : 0),
+                            _total_unsuccsessful_polls,
+                            (_total_num_polls > 0 ? (100.0 * _total_empty_polls / _total_num_polls) : 0), _total_empty_polls,
+                            (_total_num_polls > 0 ?
+                                (100.0 * (_total_num_polls - _total_unsuccsessful_polls - _total_empty_polls) / _total_num_polls) :
+                                0),
+                            _total_num_polls - _total_unsuccsessful_polls - _total_empty_polls,
+                            (_total_num_polls > 0 ? (100.0 * (_total_num_polls - _total_unsuccsessful_polls - _total_empty_polls) /
+                                                  (_total_num_polls - _total_unsuccsessful_polls)) : 0),
+                            _total_num_remote_reads_polled,
+                            (((_total_num_polls > 0) && (_total_num_polls - _total_unsuccsessful_polls - _total_empty_polls) > 0) ?
+                             (_total_num_remote_reads_polled / (_total_num_polls - _total_unsuccsessful_polls - _total_empty_polls))
+                             : 0), _total_remote_accesses,
+                            (_total_remote_accesses > 0 ? (100.0 * _total_single_try / _total_remote_accesses) : 0), _total_single_try,
+                            (_total_remote_accesses > 0 ? (100.0 * (_total_remote_accesses - _total_single_try) / _total_remote_accesses) : 0), (_total_remote_accesses - _total_single_try),
+                            _total_tries_to_get_memory,
+                            (_total_remote_accesses > 0 ? (_total_tries_to_get_memory / _total_remote_accesses) : 0),
+                            (((_total_remote_accesses > 0) && (_total_remote_accesses - _total_single_try > 0)) ?
+                                (_total_tries_to_get_memory / (_total_remote_accesses - _total_single_try)) : 0),
+                            _total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple + _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple,
+                            (_total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple + _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple > 0) ?
+                            ((_total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple) * 100.0) / (_total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple + _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple) : 0,
+                            _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple,
+                            (_total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple + _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple > 0) ?
+                            ((_total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple) * 100.0) / (_total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple + _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple) : 0,
+                            _total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple
+                        ) + stat_file_buffer;
+        fprintf(f, "%s", stat_file_buffer.ToCStr());
+        stat_file_buffer = "";
+        fprintf(f, "\n-------------------------\n");
+        divftree::MemoryStatsNode* stats = nullptr;
+        divftree::String index_Stats = vector_index->GetStats(stats);
+        fprintf(f, "%s", index_Stats.ToCStr());
+        index_Stats = "";
+        fprintf(f, "\n-------------------------\n");
+        while (stats != nullptr) {
+            divftree::MemoryStatsNode* next = stats->next;
+            fprintf(f, "Memory Stats: Allocated Pages: %zu, Bytes in Use: %zu\n", stats->num_allocated_pages, stats->num_bytes_in_use);
+            delete stats;
+            stats = next;
+        }
+        fprintf(f, "\n-------------------------\n");
+        fclose(f);
+    }
+#endif
+
     delete vector_index;
 
     if (collect_avg_distances) {

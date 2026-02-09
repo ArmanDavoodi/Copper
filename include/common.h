@@ -956,6 +956,31 @@ struct IVFSearchTaskFactory {
     bool is_leaf;
     std::atomic<size_t>* num_tasks_completed;
     SXLock* neighbour_list_lock;
+
+    SANITY_CHECK(
+    std::atomic<size_t>* num_tasks_created = new std::atomic<size_t>(0);
+    DIVFThreadID creator_thread_id = DIVF_THREAD_ID;
+
+    ~IVFSearchTaskFactory() {
+        size_t expected_tasks = num_sibling_tasks;
+        size_t created_tasks = num_tasks_created->load(std::memory_order_acquire);
+        size_t completed_tasks = num_tasks_completed->load(std::memory_order_acquire);
+        FatalAssert(creator_thread_id == DIVF_THREAD_ID, LOG_TAG_BASIC,
+                    "IVFSearchTaskFactory destroyed by a different thread than it was created. Creator thread ID: %u, Destroyer thread ID: %u",
+                    creator_thread_id, DIVF_THREAD_ID);
+        FatalAssert(expected_tasks == completed_tasks,
+                    LOG_TAG_BASIC,
+                    "Not all IVFSearchTasks completed before IVFSearchTaskFactory destruction. "
+                    "Expected tasks: %lu, Completed tasks: %lu, Creator thread ID: %u, Destroyer thread ID: %u",
+                    expected_tasks, completed_tasks, creator_thread_id, DIVF_THREAD_ID);
+        FatalAssert(expected_tasks == created_tasks,
+                    LOG_TAG_BASIC,
+                    "IVFSearchTaskFactory destroyed before all tasks are created. "
+                    "Expected tasks: %lu, Created tasks: %lu, Creator thread ID: %u, Destroyer thread ID: %u",
+                    expected_tasks, created_tasks, creator_thread_id, DIVF_THREAD_ID);
+        delete num_tasks_created;
+    }
+    )
     union {
         SortedList<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP>* top_vectors;
         SortedList<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP>* top_centroids;
@@ -963,6 +988,12 @@ struct IVFSearchTaskFactory {
 
     inline IVFSearchTask* CreateTask(VectorID cluster_id, size_t cluster_partition_num_elements,
                                      void* cluster_partition_address) {
+        SANITY_CHECK(
+            size_t created_tasks = num_tasks_created->fetch_add(1) + 1;
+            FatalAssert(created_tasks <= num_sibling_tasks, LOG_TAG_BASIC,
+                        "Created more IVFSearchTasks than expected. Expected: %lu, Created: %lu",
+                        num_sibling_tasks, created_tasks);
+        );
         return new IVFSearchTask{
             .query_vector = query_vector,
             .num_sibling_tasks = num_sibling_tasks,

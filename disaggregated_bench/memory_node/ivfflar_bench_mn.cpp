@@ -32,10 +32,17 @@ int main(int argc, char** argv) {
     FatalAssert(argc == 2, LOG_TAG_TEST,
                 "Usage: %s <self-node-idx>", argv[0]);
     divftree::network_config::self_idx = static_cast<uint8_t>(std::stoul(argv[1]));
-    divftree::ReadNetworkConfigs();
+    std::pair<divftree::String, divftree::String> node_strs = divftree::ReadNetworkConfigs();
     divftree::NodeID self_id = divftree::NodeID(true, divftree::network_config::memory_node_ids[divftree::network_config::self_idx]);
     ReadConfigs();
     ParseConfigs(self_id);
+    DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
+            "Completed reading network configuration: %hhu memory nodes:%s, %hhu compute nodes:%s, "
+            "RDMA device: %s, port: %hhu, GID index: %d",
+            ::divftree::network_config::num_memory_nodes, node_strs.first.ToCStr(),
+            ::divftree::network_config::num_compute_nodes, node_strs.second.ToCStr(),
+            ::divftree::network_config::rdma_device_name, ::divftree::network_config::rdma_port,
+            ::divftree::network_config::gid_index);
     FILE* file = nullptr;
     OpenDataFile(file, true);
 

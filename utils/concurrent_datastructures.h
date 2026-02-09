@@ -39,6 +39,16 @@ public:
         _locks[bucket_idx].Unlock();
     }
 
+    void BatchInsert(const K& key, const V* values, size_t num_values) {
+        size_t hash_value = _hash(key);
+        size_t bucket_idx = hash_value % _num_buckets;
+
+        _locks[bucket_idx].Lock(SX_EXCLUSIVE);
+        auto& vec = _data[bucket_idx][key];
+        vec.insert(vec.end(), values, values + num_values);
+        _locks[bucket_idx].Unlock();
+    }
+
     void BatchInsert(const K& key, const std::vector<V>& values) {
         size_t hash_value = _hash(key);
         size_t bucket_idx = hash_value % _num_buckets;
