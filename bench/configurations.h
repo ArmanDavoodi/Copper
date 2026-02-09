@@ -5,6 +5,7 @@
 #define BIGANN1B 2
 #define SMALLNORMAL 3
 #define HUGENORMAL 4
+#define FLTNORMAL100M 5
 
 // Hang Detector.+Message: Detected hang in thread id [^0][0-9]*
 #define HANG_DETECTION
@@ -20,6 +21,8 @@
     #include "bench/datasets/smallnormalsample/configurations.h"
     #elif (DATASET == HUGENORMAL)
     #include "bench/datasets/hugenormalsample/configurations.h"
+    #elif (DATASET == FLTNORMAL100M)
+    #include "bench/datasets/100MFloatNormal_SkewedQ/configurations.h"
     #else
     #error UNDEFINED DATASET!
     #endif

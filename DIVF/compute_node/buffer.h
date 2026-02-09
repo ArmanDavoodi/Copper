@@ -253,9 +253,17 @@ public:
         /* todo: check stats */
         size_t num_cooling = 0;
         size_t num_freed = 0;
-        while (num_cooling < num_pages) {
-            if (_num_hot_entries.load(std::memory_order_acquire) < num_pages) {
-                return num_freed;
+        size_t real_num_pages = num_pages;
+        while (num_cooling < real_num_pages) {
+            size_t num_hot = _num_hot_entries.load(std::memory_order_acquire);
+            if (num_hot == 0) {
+                break;
+            }
+
+            if (num_hot < real_num_pages) {
+                real_num_pages = num_hot;
+            } else if (num_hot > real_num_pages && real_num_pages < num_pages) {
+                real_num_pages = std::min(num_hot, num_pages);
             }
 
             size_t bucket_idx = threadSelf->UniformRange64(0, _num_buckets - 1);

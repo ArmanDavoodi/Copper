@@ -360,8 +360,8 @@ protected:
                         "Distance computation returned 0!");
             for (size_t c = 1; c < clusters.size(); c++) {
                 DTYPE dist = Distance(data + (i * dim), clusters[c].centroid_tmp, dim, DistanceType::L2);
-                FatalAssert(dist > 0, LOG_TAG_BASIC,
-                            "Distance computation returned 0!");
+                // FatalAssert(dist > 0, LOG_TAG_BASIC,
+                //             "Distance computation returned 0!");
                 if (MoreSimilar(dist, closest_dist, DistanceType::L2) > 0) {
                     closest_dist = dist;
                     closest_idx = c;

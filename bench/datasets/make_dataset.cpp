@@ -13,6 +13,8 @@ using namespace std;
 
 uint32_t num_vectors;
 uint32_t dimension; // max should fit in uint32
+uint32_t num_skew_directions;
+uint32_t* ratio_dist = nullptr;
 
 string filepath;
 
@@ -70,24 +72,28 @@ using MVTYPE = uint64_t;
 #error VECTOR_TYPE not found!
 #endif
 
+inline random_device seed_gen{};
+inline mt19937 normal_gen(seed_gen());
+inline normal_distribution<double>* normal_dist;
+
 class SkewNormal {
 public:
     SkewNormal()
-        : mu(mean), sigma(stddev), alpha(alpha), gen(random_device{}()), dist(mean, stddev) {}
+        : mu(mean), sigma(stddev), alpha(alpha), gen(seed_gen()), dist(mean, stddev) {}
 
-    VTYPE operator()() {
+    double operator()() {
         double z0 = dist(gen);
         double z1 = dist(gen);
         double delta = alpha / sqrt(1 + alpha * alpha);
-        double x = mu + sigma * (delta * fabs(z0) + sqrt(1 - delta * delta) * z1);
+        return mu + sigma * (delta * fabs(z0) + sqrt(1 - delta * delta) * z1);
 
-        if constexpr (is_integral_v<VTYPE>) {
-            // clamp to valid range for integer types
-            x = round(x);
-            x = clamp(x, (double)numeric_limits<VTYPE>::min(), (double)numeric_limits<VTYPE>::max());
-        }
+        // if constexpr (is_integral_v<VTYPE>) {
+        //     // clamp to valid range for integer types
+        //     x = round(x);
+        //     x = clamp(x, (double)numeric_limits<VTYPE>::min(), (double)numeric_limits<VTYPE>::max());
+        // }
 
-        return static_cast<VTYPE>(x);
+        // return static_cast<VTYPE>(x);
     }
 
 private:
@@ -111,9 +117,11 @@ bool parse_double(const char* str, double& value) {
 }
 
 int ParseInput(int argc, char* argv[]) {
-    if (argc != 7) {
+    if (argc != 6 && argc <= 8) {
         cerr << "Usage: " << argv[0]
-             << " <num_vectors> <dimension> <filepath> <mean> <stddev> <alpha>\n";
+             << " <num_vectors> <dimension> <filepath> <mean> <stddev> | \n"
+             << " <num_vectors> <dimension> <filepath> <mean> <stddev> <alpha> <num_skew_directions> <ratio_dist>...\n";
+        cerr << "argc = " << argc << endl;
         return EXIT_FAILURE;
     }
 
@@ -145,9 +153,33 @@ int ParseInput(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    if (!parse_double(argv[6], alpha) || alpha < -10.0 || alpha > 10.0) {
-        cerr << "Error: alpha must be in range [-10, 10].\n";
+    if (argc == 6) {
+        alpha = 0;
+        num_skew_directions = 0;
+        return EXIT_SUCCESS;
+    }
+
+    if (!parse_double(argv[6], alpha) || alpha < -10.0 || alpha > 10.0 || alpha == 0) {
+        cerr << "Error: alpha must be a non-zero in range [-10, 10].\n";
         return EXIT_FAILURE;
+    }
+
+    if (!parse_uint32(argv[7], num_skew_directions) || num_skew_directions == 0 ||
+         num_skew_directions + 7 >= static_cast<uint32_t>(argc)) {
+        cerr << "Error: num_skew_directions must be a positive 32-bit unsigned integer when alpha is non-zero.\n";
+        return EXIT_FAILURE;
+    }
+
+    ratio_dist = new uint32_t[num_skew_directions];
+    uint32_t sum = 0;
+    for (uint32_t i = 0; i < num_skew_directions; ++i) {
+        if (!parse_uint32(argv[8 + i], ratio_dist[i]) || ratio_dist[i] == 0 || ratio_dist[i] > 100 || sum >= 100) {
+            cerr << "Error: ratio_dist[" << i << "] must be a positive 32-bit unsigned integer.\n";
+            delete[] ratio_dist;
+            return EXIT_FAILURE;
+        }
+        ratio_dist[i] += sum;
+        sum = ratio_dist[i];
     }
 
     return EXIT_SUCCESS;
@@ -158,6 +190,8 @@ int main(int argc, char* argv[]) {
     if (ret != EXIT_SUCCESS) {
         return ret;
     }
+
+    normal_dist = new normal_distribution<double>(mean, stddev);
 
     // Extract the directory part
     filesystem::path pathObj(filepath);
@@ -187,21 +221,95 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    SkewNormal generator;
     VTYPE* buffer = new VTYPE[dimension];
-    for (uint32_t i = 0; i < num_vectors; ++i) {
-        for (uint32_t d = 0; d < dimension; ++d) {
-            buffer[d] = generator();
+    uint32_t step = num_vectors / 100;
+    if (alpha == 0) {
+        for (uint32_t i = 0; i < num_vectors; ++i) {
+            if (step > 0 && i % step == 0) {
+                cout << "Progress: " << (i / step) << "%\n";
+            }
+            for (uint32_t d = 0; d < dimension; ++d) {
+                double x = (*normal_dist)(normal_gen);
+                if constexpr (is_integral_v<VTYPE>) {
+                    // clamp to valid range for integer types
+                    x = round(x);
+                    x = clamp(x, (double)numeric_limits<VTYPE>::min(), (double)numeric_limits<VTYPE>::max());
+                }
+                buffer[d] = static_cast<VTYPE>(x);
+            }
+            ret = fwrite(buffer, dimension * sizeof(VTYPE), 1, file);
+            if (ret != 1) {
+                cerr << "Error: fwrite failed to write " << i << "th vector!\n";
+                return 1;
+            }
         }
-        ret = fwrite(buffer, dimension * sizeof(VTYPE), 1, file);
-        if (ret != 1) {
-            cerr << "Error: fwrite failed to write " << i << "th vector!\n";
-            return 1;
+    } else {
+        double** skew_directions = new double*[num_skew_directions];
+        for (uint32_t i = 0; i < num_skew_directions; ++i) {
+            skew_directions[i] = new double[dimension];
+            double norm = 0;
+            for (uint32_t d = 0; d < dimension; ++d) {
+                skew_directions[i][d] = (*normal_dist)(normal_gen);
+                norm += skew_directions[i][d] * skew_directions[i][d];
+            }
+            norm = sqrt(norm);
+            cout << "Skew direction " << i << " ratio: " << ratio_dist[i] << "% direction=[" ;
+            for (uint32_t d = 0; d < dimension; ++d) {
+                skew_directions[i][d] /= norm; // normalize to unit vector
+                cout << skew_directions[i][d] << (d == dimension - 1 ? "]\n" : ", ");
+            }
         }
+
+        SkewNormal generator;
+        mt19937 direc_gen(seed_gen());
+        uniform_int_distribution<uint32_t> direc_dist(0, 99);
+
+        for (uint32_t i = 0; i < num_vectors; ++i) {
+            if (step > 0 && i % step == 0) {
+                cout << "Progress: " << (i / step) << "%\n";
+            }
+            uint32_t r = direc_dist(direc_gen);
+            uint32_t direc_idx = 0;
+            while (direc_idx < num_skew_directions && r >= ratio_dist[direc_idx]) {
+                ++direc_idx;
+            }
+
+            if (direc_idx == num_skew_directions) {
+                cerr << "Error: direc_idx out of bounds for vector " << i << " with random value " << r << "\n";
+                return 1;
+            }
+
+            double skew_factor = generator();
+            for (uint32_t d = 0; d < dimension; ++d) {
+                double x = (*normal_dist)(normal_gen) + skew_factor * skew_directions[direc_idx][d];
+                if constexpr (is_integral_v<VTYPE>) {
+                    // clamp to valid range for integer types
+                    x = round(x);
+                    x = clamp(x, (double)numeric_limits<VTYPE>::min(), (double)numeric_limits<VTYPE>::max());
+                }
+                buffer[d] = static_cast<VTYPE>(x);
+            }
+            ret = fwrite(buffer, dimension * sizeof(VTYPE), 1, file);
+            if (ret != 1) {
+                cerr << "Error: fwrite failed to write " << i << "th vector!\n";
+                return 1;
+            }
+        }
+
+        for (uint32_t i = 0; i < num_skew_directions; ++i) {
+            delete[] skew_directions[i];
+        }
+        delete[] skew_directions;
     }
+
     fflush(file);
     delete[] buffer;
     fclose(file);
+
+    if (ratio_dist) {
+        delete[] ratio_dist;
+    }
+    delete normal_dist;
 
     return 0;
 }

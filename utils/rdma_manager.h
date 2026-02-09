@@ -392,7 +392,7 @@ EXIT:
                     "Target memory node not found!");
         ConnectionContext& ctx = it->second;
         while (num_remaining > 0) {
-            uint8_t connection_idx = GrabConnection(target_node, num_clusters, num_resources_acquired);
+            uint8_t connection_idx = GrabConnection(target_node, num_remaining, num_resources_acquired);
             FatalAssert(num_resources_acquired > 0, LOG_TAG_RDMA,
                         "Failed to acquire any RDMA resources for RDMA read.");
             FatalAssert(num_resources_acquired <= num_remaining, LOG_TAG_RDMA,
@@ -440,7 +440,7 @@ EXIT:
                     "Target memory node not found!");
         ConnectionContext& ctx = it->second;
         while (num_remaining > 0) {
-            uint8_t connection_idx = GrabConnection(target_node, num_clusters, num_resources_acquired);
+            uint8_t connection_idx = GrabConnection(target_node, num_remaining, num_resources_acquired);
             FatalAssert(num_resources_acquired > 0, LOG_TAG_RDMA,
                         "Failed to acquire any RDMA resources for RDMA scatter-gather read.");
             FatalAssert(num_resources_acquired <= num_remaining, LOG_TAG_RDMA,
