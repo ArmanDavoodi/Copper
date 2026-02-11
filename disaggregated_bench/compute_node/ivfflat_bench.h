@@ -27,17 +27,22 @@ inline bool collect_avg_distances;
 inline char stat_file[256] = "";
 
 #ifdef ENABLE_STAT_COLLECTION
-inline size_t _total_num_polls;
-inline size_t _total_unsuccsessful_polls;
-inline size_t _total_empty_polls;
-inline size_t _total_num_remote_reads_polled;
-inline size_t _total_remote_accesses;
-inline size_t _total_tries_to_get_memory;
-inline size_t _total_single_try;
-inline size_t _total_got_memory_from_cool_once;
-inline size_t _total_got_memory_from_pool_once;
-inline size_t _total_got_memory_from_cool_multiple;
-inline size_t _total_got_memory_from_pool_multiple;
+inline size_t _total_num_queries = 0;
+inline size_t _total_num_tasks_created = 0;
+inline size_t _total_num_search_queue_polls = 0;
+inline size_t _total_num_polls = 0;
+inline size_t _total_num_triggered_polls = 0;
+inline size_t _total_num_empty_queue_induced_polls = 0;
+inline size_t _total_unsuccsessful_polls = 0;
+inline size_t _total_empty_polls = 0;
+inline size_t _total_num_remote_reads_polled = 0;
+inline size_t _total_remote_accesses = 0;
+inline size_t _total_tries_to_get_memory = 0;
+inline size_t _total_single_try = 0;
+inline size_t _total_got_memory_from_cool_once = 0;
+inline size_t _total_got_memory_from_pool_once = 0;
+inline size_t _total_got_memory_from_cool_multiple = 0;
+inline size_t _total_got_memory_from_pool_multiple = 0;
 inline std::mutex stat_file_lock;
 inline divftree::String stat_file_buffer;
 #endif

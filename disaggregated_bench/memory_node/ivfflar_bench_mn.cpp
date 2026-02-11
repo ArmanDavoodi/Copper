@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
     BenchLog("Start Build...");
     auto start_time = std::chrono::high_resolution_clock::now();
     vector_index = new divftree::MN_DIVFIndex(data_set, build_size, num_clusters, insert_duplicates,
-                                              max_iters, DIMENSION, num_threads);
+                                              max_iters, DIMENSION, page_size, num_threads);
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
     size_t build_time = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();

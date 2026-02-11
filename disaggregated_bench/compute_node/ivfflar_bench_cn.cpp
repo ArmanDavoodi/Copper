@@ -107,6 +107,29 @@ void worker(divftree::Thread* self) {
             current_search_err = 0;
         }
     }
+#ifdef ENABLE_STAT_COLLECTION
+    stat_file_lock.lock();
+    self->AppendStats(
+        stat_file_buffer,
+        _total_num_queries,
+        _total_num_tasks_created,
+        _total_num_search_queue_polls,
+        _total_num_polls,
+        _total_num_triggered_polls,
+        _total_num_empty_queue_induced_polls,
+        _total_unsuccsessful_polls,
+        _total_empty_polls,
+        _total_num_remote_reads_polled,
+        _total_remote_accesses,
+        _total_tries_to_get_memory,
+        _total_single_try,
+        _total_got_memory_from_cool_once,
+        _total_got_memory_from_pool_once,
+        _total_got_memory_from_cool_multiple,
+        _total_got_memory_from_pool_multiple, true /* reset_stats */
+    );
+    stat_file_lock.unlock();
+#endif
 
     num_ready = run_ready.fetch_add(1);
     if (num_ready == num_threads - 1) {
@@ -148,7 +171,12 @@ void worker(divftree::Thread* self) {
     stat_file_lock.lock();
     self->AppendStats(
         stat_file_buffer,
+        _total_num_queries,
+        _total_num_tasks_created,
+        _total_num_search_queue_polls,
         _total_num_polls,
+        _total_num_triggered_polls,
+        _total_num_empty_queue_induced_polls,
         _total_unsuccsessful_polls,
         _total_empty_polls,
         _total_num_remote_reads_polled,
@@ -183,6 +211,97 @@ void worker(divftree::Thread* self) {
     do { \
         printf("\n"); \
     } while(0)
+
+inline void FlushStats(bool clear) {
+#ifdef ENABLE_STAT_COLLECTION
+    FILE* f = fopen(stat_file, "a");
+    if (f == nullptr) {
+        DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_TEST, "Cannot open stat file %s for writing!", stat_file);
+    } else {
+        stat_file_buffer = divftree::String("total_num_queries: %zu, total_num_tasks_created: %zu, total_num_search_queue_polls: %zu, "
+                            "avg_num_tasks_created_per_query: %.2f, "
+                            "avg_num_search_queue_polls_per_query: %.2f, "
+                            "avg_num_search_queue_polls_per_created: %.2f, "
+                            "total_num_polls: %zu(triggered: %.2f(%zu), empty_q_end: %.2f(%zu) | "
+                            "total_num_fail: %.2f%%(%zu), total_num_empty %.2f%%(%zu), total_num_valid: %.2f%%(%zu)), "
+                            "total_num_valid_to_successful_ratio: %.2f%%, "
+                            "total_num_remote_reads_polled: %zu, avg_num_polled_per_valid_polls: %zu, "
+                            "total_num_remote_rdma_reads: %zu(single_alloc: %.2f%%(%zu), multi_alloc: %.2f%%(%zu)), "
+                            "total_num_alloc_tries: %zu, avg_num_alloc_tries_per_req: %zu, "
+                            "avg_num_alloc_multi_tries_per_req: %zu, "
+                            "total_num_pages_got: %zu(from_pool: %.2f%%(%zu), from_cooling_list: %.2f%%(%zu))\n",
+                            _total_num_queries, _total_num_tasks_created, _total_num_search_queue_polls,
+                            (_total_num_queries > 0 ? ((double)_total_num_tasks_created / (double)_total_num_queries) : 0),
+                            (_total_num_queries > 0 ? ((double)_total_num_search_queue_polls / (double)_total_num_queries) : 0),
+                            (_total_num_tasks_created > 0 ? ((double)_total_num_search_queue_polls / (double)_total_num_tasks_created) : 0),
+                            _total_num_polls,
+                            (_total_num_polls > 0 ? (100.0 * _total_num_triggered_polls / _total_num_polls) : 0), _total_num_triggered_polls,
+                            (_total_num_polls > 0 ? (100.0 * _total_num_empty_queue_induced_polls / _total_num_polls) : 0), _total_num_empty_queue_induced_polls,
+                            (_total_num_polls > 0 ? (100.0 * _total_unsuccsessful_polls / _total_num_polls) : 0),
+                            _total_unsuccsessful_polls,
+                            (_total_num_polls > 0 ? (100.0 * _total_empty_polls / _total_num_polls) : 0), _total_empty_polls,
+                            (_total_num_polls > 0 ?
+                                (100.0 * (_total_num_polls - _total_unsuccsessful_polls - _total_empty_polls) / _total_num_polls) :
+                                0),
+                            _total_num_polls - _total_unsuccsessful_polls - _total_empty_polls,
+                            (_total_num_polls > 0 ? (100.0 * (_total_num_polls - _total_unsuccsessful_polls - _total_empty_polls) /
+                                                  (_total_num_polls - _total_unsuccsessful_polls)) : 0),
+                            _total_num_remote_reads_polled,
+                            (((_total_num_polls > 0) && (_total_num_polls - _total_unsuccsessful_polls - _total_empty_polls) > 0) ?
+                             (_total_num_remote_reads_polled / (_total_num_polls - _total_unsuccsessful_polls - _total_empty_polls))
+                             : 0), _total_remote_accesses,
+                            (_total_remote_accesses > 0 ? (100.0 * _total_single_try / _total_remote_accesses) : 0), _total_single_try,
+                            (_total_remote_accesses > 0 ? (100.0 * (_total_remote_accesses - _total_single_try) / _total_remote_accesses) : 0), (_total_remote_accesses - _total_single_try),
+                            _total_tries_to_get_memory,
+                            (_total_remote_accesses > 0 ? (_total_tries_to_get_memory / _total_remote_accesses) : 0),
+                            (((_total_remote_accesses > 0) && (_total_remote_accesses - _total_single_try > 0)) ?
+                                (_total_tries_to_get_memory / (_total_remote_accesses - _total_single_try)) : 0),
+                            _total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple + _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple,
+                            (_total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple + _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple > 0) ?
+                            ((_total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple) * 100.0) / (_total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple + _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple) : 0,
+                            _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple,
+                            (_total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple + _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple > 0) ?
+                            ((_total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple) * 100.0) / (_total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple + _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple) : 0,
+                            _total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple
+                        ) + stat_file_buffer;
+        fprintf(f, "%s", stat_file_buffer.ToCStr());
+        stat_file_buffer = "";
+        fprintf(f, "\n-------------------------\n");
+        divftree::MemoryStatsNode* stats = nullptr;
+        divftree::String index_Stats = vector_index->GetStats(stats, clear);
+        fprintf(f, "%s", index_Stats.ToCStr());
+        index_Stats = "";
+        fprintf(f, "\n-------------------------\n");
+        while (stats != nullptr) {
+            divftree::MemoryStatsNode* next = stats->next;
+            fprintf(f, "Memory Stats: Allocated Pages: %zu, Bytes in Use: %zu\n", stats->num_allocated_pages, stats->num_bytes_in_use);
+            delete stats;
+            stats = next;
+        }
+        fprintf(f, "\n-------------------------\n");
+        fclose(f);
+
+        if (clear) {
+            _total_num_queries = 0;
+            _total_num_tasks_created = 0;
+            _total_num_search_queue_polls = 0;
+            _total_num_polls = 0;
+            _total_num_triggered_polls = 0;
+            _total_num_empty_queue_induced_polls = 0;
+            _total_unsuccsessful_polls = 0;
+            _total_empty_polls = 0;
+            _total_num_remote_reads_polled = 0;
+            _total_remote_accesses = 0;
+            _total_tries_to_get_memory = 0;
+            _total_single_try = 0;
+            _total_got_memory_from_cool_once = 0;
+            _total_got_memory_from_pool_once = 0;
+            _total_got_memory_from_cool_multiple = 0;
+            _total_got_memory_from_pool_multiple = 0;
+        }
+    }
+#endif
+}
 
 int main(int argc, char** argv) {
     FatalAssert(argc == 2, LOG_TAG_TEST,
@@ -233,6 +352,7 @@ int main(int argc, char** argv) {
     }
 
     BenchLog("Start Warmup...");
+    stat_file_buffer = divftree::String("****************** Warmup Phase Stats ****************** \n\n");
     warmup_start.store(true, std::memory_order_release);
     warmup_start.notify_all();
 
@@ -287,6 +407,9 @@ int main(int argc, char** argv) {
             distance_lock.Unlock();
         }
     }
+
+    FlushStats(true);
+    stat_file_buffer = divftree::String("\n\n****************** Run Phase Stats ****************** \n\n");
 
     BenchLog("Start Run...");
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -350,64 +473,7 @@ int main(int argc, char** argv) {
         threads[i] = nullptr;
     }
 
-#ifdef ENABLE_STAT_COLLECTION
-    FILE* f = fopen(stat_file, "w");
-    if (f == nullptr) {
-        DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_TEST, "Cannot open stat file %s for writing!", stat_file);
-    } else {
-        stat_file_buffer = divftree::String("total_num_polls: %zu(total_num_fail: %.2f%%(%zu), total_num_empty %.2f%%(%zu), total_num_valid: %.2f%%(%zu)), "
-                            "total_num_valid_to_successful_ratio: %.2f%%, "
-                            "total_num_remote_reads_polled: %zu, avg_num_polled_per_valid_polls: %zu, "
-                            "total_num_remote_rdma_reads: %zu(single_alloc: %.2f%%(%zu), multi_alloc: %.2f%%(%zu)), "
-                            "total_num_alloc_tries: %zu, avg_num_alloc_tries_per_req: %zu, "
-                            "avg_num_alloc_multi_tries_per_req: %zu, "
-                            "total_num_pages_got: %zu(from_pool: %.2f%%(%zu), from_cooling_list: %.2f%%(%zu))\n",
-                            _total_num_polls,
-                            (_total_num_polls > 0 ? (100.0 * _total_unsuccsessful_polls / _total_num_polls) : 0),
-                            _total_unsuccsessful_polls,
-                            (_total_num_polls > 0 ? (100.0 * _total_empty_polls / _total_num_polls) : 0), _total_empty_polls,
-                            (_total_num_polls > 0 ?
-                                (100.0 * (_total_num_polls - _total_unsuccsessful_polls - _total_empty_polls) / _total_num_polls) :
-                                0),
-                            _total_num_polls - _total_unsuccsessful_polls - _total_empty_polls,
-                            (_total_num_polls > 0 ? (100.0 * (_total_num_polls - _total_unsuccsessful_polls - _total_empty_polls) /
-                                                  (_total_num_polls - _total_unsuccsessful_polls)) : 0),
-                            _total_num_remote_reads_polled,
-                            (((_total_num_polls > 0) && (_total_num_polls - _total_unsuccsessful_polls - _total_empty_polls) > 0) ?
-                             (_total_num_remote_reads_polled / (_total_num_polls - _total_unsuccsessful_polls - _total_empty_polls))
-                             : 0), _total_remote_accesses,
-                            (_total_remote_accesses > 0 ? (100.0 * _total_single_try / _total_remote_accesses) : 0), _total_single_try,
-                            (_total_remote_accesses > 0 ? (100.0 * (_total_remote_accesses - _total_single_try) / _total_remote_accesses) : 0), (_total_remote_accesses - _total_single_try),
-                            _total_tries_to_get_memory,
-                            (_total_remote_accesses > 0 ? (_total_tries_to_get_memory / _total_remote_accesses) : 0),
-                            (((_total_remote_accesses > 0) && (_total_remote_accesses - _total_single_try > 0)) ?
-                                (_total_tries_to_get_memory / (_total_remote_accesses - _total_single_try)) : 0),
-                            _total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple + _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple,
-                            (_total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple + _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple > 0) ?
-                            ((_total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple) * 100.0) / (_total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple + _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple) : 0,
-                            _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple,
-                            (_total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple + _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple > 0) ?
-                            ((_total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple) * 100.0) / (_total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple + _total_got_memory_from_pool_once + _total_got_memory_from_pool_multiple) : 0,
-                            _total_got_memory_from_cool_once + _total_got_memory_from_cool_multiple
-                        ) + stat_file_buffer;
-        fprintf(f, "%s", stat_file_buffer.ToCStr());
-        stat_file_buffer = "";
-        fprintf(f, "\n-------------------------\n");
-        divftree::MemoryStatsNode* stats = nullptr;
-        divftree::String index_Stats = vector_index->GetStats(stats);
-        fprintf(f, "%s", index_Stats.ToCStr());
-        index_Stats = "";
-        fprintf(f, "\n-------------------------\n");
-        while (stats != nullptr) {
-            divftree::MemoryStatsNode* next = stats->next;
-            fprintf(f, "Memory Stats: Allocated Pages: %zu, Bytes in Use: %zu\n", stats->num_allocated_pages, stats->num_bytes_in_use);
-            delete stats;
-            stats = next;
-        }
-        fprintf(f, "\n-------------------------\n");
-        fclose(f);
-    }
-#endif
+    FlushStats(false);
 
     delete vector_index;
 

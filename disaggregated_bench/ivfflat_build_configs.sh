@@ -23,7 +23,7 @@ VAR_BUILD_NUM_THREADS=160
 
 VAR_PAGE_SIZE=$((VAR_AVG_NUM_VEC_PER_CLUSTER * 256)) # should be power of 2
 # VAR_PAGE_SIZE=$((1024 * 512))
-VAR_POOL_SIZE=$((1024 * 1024 * 1024)) #1GB
+VAR_POOL_SIZE=$((1024 * 1024 * 1024 * 32)) #32GB
 
 VAR_WARMUP_TIME_SEC=60 #only search
 VAR_RUN_TIME_SEC=60 #real test used for stat collection
@@ -62,5 +62,6 @@ echo "build-size:$VAR_BUILT_SIZE" >> $MN_CONF_FILE
 echo "kmeans-max-iters:$VAR_KMEANS_MAX_ITERS" >> $MN_CONF_FILE
 echo "insert-duplicates:$VAR_INSERT_DUPLICATES" >> $MN_CONF_FILE
 echo "num-build-threads:$VAR_BUILD_NUM_THREADS" >> $MN_CONF_FILE
+echo "page-size:$VAR_PAGE_SIZE" >> $MN_CONF_FILE
 
 cd $CURDIR

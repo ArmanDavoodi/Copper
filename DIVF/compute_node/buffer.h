@@ -200,13 +200,18 @@ public:
                         idx < (bucket_idx + 1) * _bucket_cap,
                         LOG_TAG_BUFFER,
                         "Pinned entry's cache list index is out of bounds in CacheMetaContainer::TryLockAndPinEntry()");
-            if (idx != _cooling_bucket_next_idx[bucket_idx]) {
-                BufferEntry* last_entry = _cooling_entries[_cooling_bucket_next_idx[bucket_idx]];
+            size_t last_b_idx = (_cooling_bucket_next_idx[bucket_idx] == 0 ? _bucket_cap - 1 :
+                                                                             _cooling_bucket_next_idx[bucket_idx] - 1);
+            size_t last_idx = bucket_idx * _bucket_cap + last_b_idx;
+            if (idx != last_idx) {
+                BufferEntry* last_entry = _cooling_entries[last_idx];
+                CHECK_NOT_NULLPTR(last_entry, LOG_TAG_BUFFER);
                 _cooling_entries[idx] = last_entry;
                 last_entry->cache_list_idx = idx;
             }
-            _cooling_entries[idx] = nullptr;
+            _cooling_entries[last_idx] = nullptr;
             entry->state = BufferEntryState::BUFFER_ENTRY_CACHED;
+            _cooling_bucket_next_idx[bucket_idx] = last_b_idx;
 #ifdef ENABLE_STAT_COLLECTION
             (entry->num_removed_from_cool)++;
 #endif
@@ -256,7 +261,7 @@ public:
         size_t real_num_pages = num_pages;
         while (num_cooling < real_num_pages) {
             size_t num_hot = _num_hot_entries.load(std::memory_order_acquire);
-            if (num_hot == 0) {
+            if (num_hot == 0) { /* if less than some amount */
                 break;
             }
 
@@ -294,7 +299,6 @@ public:
                         LOG_TAG_BUFFER,
                         "Hot entry is pinned in CacheMetaContainer::TryMoveToCooling()");
             entry->lock.Lock(SX_EXCLUSIVE);
-            _locks[bucket_idx].Unlock();
 
             // move to cooling list
             entry->state = BufferEntryState::BUFFER_ENTRY_COOLING;
@@ -334,6 +338,7 @@ public:
 
             num_cooling += entry->num_pages;
             entry->lock.Unlock();
+            _locks[bucket_idx].Unlock();
         }
 
         return num_freed;
@@ -617,7 +622,8 @@ public:
         return RetStatus::Success();
     }
 
-        inline String GetStats(MemoryStatsNode*& memory_stats_head) {
+    /* not thread-safe */
+    inline String GetStats(MemoryStatsNode*& memory_stats_head, bool reset_after_fetch = false) {
 #ifdef ENABLE_MEMORY_STAT_COLLECTION
         memory_stats_head = _memory_stats_head;
 #else
@@ -632,8 +638,8 @@ public:
         size_t total_read_remote_in_progress = 0;
         size_t total_read_remote = 0;
         size_t total_read = 0;
-        for (const auto& pair : _buffer_map) {
-            const BufferEntry& entry = pair.second;
+        for (auto& pair : _buffer_map) {
+            BufferEntry& entry = pair.second;
             total_moved_to_cool += entry.num_moved_to_cool;
             total_removed_from_cool += entry.num_removed_from_cool;
             total_evicted += entry.num_evicted;
@@ -648,6 +654,15 @@ public:
                            entry.num_read_remote_in_progress,
                            (((double)(entry.num_read_remote) / entry.num_read) * 100), entry.num_read_remote,
                            entry.num_moved_to_cool, entry.num_removed_from_cool, entry.num_evicted);
+            if (reset_after_fetch) {
+                entry.num_moved_to_cool = 0;
+                entry.num_removed_from_cool = 0;
+                entry.num_evicted = 0;
+                entry.num_read_local = 0;
+                entry.num_read_remote_in_progress = 0;
+                entry.num_read_remote = 0;
+                entry.num_read = 0;
+            }
         }
         return
             String(
@@ -793,21 +808,20 @@ protected:
         while (num_allocated < num_pages_to_load) {
             ++num_tries;
             size_t num_to_alloc = num_pages_to_load - num_allocated;
-            num_from_cool += _cache_meta_container.TryMoveToCooling(num_to_alloc, local_buffers + num_allocated,
+            size_t current_allocated = _cache_meta_container.TryMoveToCooling(num_to_alloc, local_buffers + num_allocated,
                                                                     num_to_alloc, bytes_freed_from_cool, num_pages_freed);
-            num_allocated += num_from_cool;
+            num_allocated += current_allocated;
+            num_from_cool += current_allocated;
             if (num_allocated < num_pages_to_load) {
                 num_to_alloc = num_pages_to_load - num_allocated;
-                num_from_pool +=
+                current_allocated =
                     _cache.BatchAllocate(local_buffers + num_allocated, num_to_alloc,
                                          AllocationFlags{.clear = 0, .non_blocking = 1, .atomic = 0, .unused = 0});
-                num_allocated += num_from_pool;
+                num_from_pool += current_allocated;
+                num_allocated += current_allocated;
             }
 
             if (num_allocated < num_pages_to_load) {
-                DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_BUFFER,
-                        "Not enough free pages in BufferMgr::ReadFromRemote(), allocated %zu out of %zu needed. Retrying...",
-                        num_allocated, num_pages_to_load);
                 usleep(1);
             }
         }

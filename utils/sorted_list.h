@@ -53,11 +53,25 @@ public:
     }
 
     inline void Insert(const T& d) {
-        data.insert(std::upper_bound(data.begin(), data.end(), d, cmp), d);
+        data.insert(std::lower_bound(data.begin(), data.end(), d, cmp), d);
+        SANITY_CHECK({
+            for (size_t i = 1; i < data.size(); ++i) {
+                FatalAssert(cmp(data[i - 1], data[i]), LOG_TAG_BASIC,
+                            "Data is not sorted at index %zu!", i);
+            }
+        });
     }
 
     inline void Insert(T&& d) {
-        data.insert(std::upper_bound(data.begin(), data.end(), d, cmp), std::forward<T>(d));
+        data.insert(std::lower_bound(data.begin(), data.end(), d, cmp), std::forward<T>(d));
+        SANITY_CHECK({
+            for (size_t i = 1; i < data.size(); ++i) {
+                FatalAssert(cmp(data[i - 1], data[i]), LOG_TAG_BASIC,
+                            "Data is not sorted at index %zu!", i);
+                FatalAssert(data[i - 1].first <= data[i].first, LOG_TAG_BASIC,
+                            "Data is not sorted at index %zu!", i);
+            }
+        });
     }
 
     inline Iterator Find(const T& d) {
@@ -95,6 +109,12 @@ public:
     }
 
     inline void PopBack() {
+        SANITY_CHECK({
+            for (size_t i = 1; i < data.size(); ++i) {
+                FatalAssert(cmp(data[i - 1], data[i]), LOG_TAG_BASIC,
+                            "Data is not sorted at index %zu!", i);
+            }
+        });
         data.pop_back();
     }
 
@@ -102,6 +122,13 @@ public:
         if (num == 0) {
             return;
         }
+
+        SANITY_CHECK({
+            for (size_t i = 1; i < data.size(); ++i) {
+                FatalAssert(cmp(data[i - 1], data[i]), LOG_TAG_BASIC,
+                            "Data is not sorted at index %zu!", i);
+            }
+        });
 
         if (num >= data.size()) {
             data.clear();
@@ -134,7 +161,7 @@ public:
                     j++;
                 }
             }
-            if (cmp(data[i], other.data[j]) <= 0) {
+            if (cmp(data[i], other.data[j])) {
                 tmp.push_back(data[i++]);
             } else {
                 tmp.push_back(other.data[j++]);
@@ -156,6 +183,23 @@ public:
             }
             tmp.push_back(other.data[j++]);
         }
+
+        SANITY_CHECK({
+            for (size_t i = 1; i < data.size(); ++i) {
+                FatalAssert(cmp(data[i - 1], data[i]), LOG_TAG_BASIC,
+                            "Data is not sorted at index %zu!", i);
+            }
+
+            for (size_t i = 1; i < other.data.size(); ++i) {
+                FatalAssert(cmp(other.data[i - 1], other.data[i]), LOG_TAG_BASIC,
+                            "Data is not sorted at index %zu!", i);
+            }
+
+            for (size_t i = 1; i < tmp.size(); ++i) {
+                FatalAssert(cmp(tmp[i - 1], tmp[i]), LOG_TAG_BASIC,
+                            "Data is not sorted at index %zu!", i);
+            }
+        });
 
         data.swap(tmp);
     }

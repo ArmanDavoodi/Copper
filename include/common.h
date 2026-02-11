@@ -398,6 +398,10 @@ struct IVFVectorID {
     inline bool operator!=(const IVFVectorID& other) const {
         return (vector_hash != other.vector_hash) || (value != other.value);
     }
+
+    inline String ToString() const {
+        return String("{hash=%lx, value=%u}", vector_hash, value);
+    }
 };
 
 constexpr IVFVectorID INVALID_IVF_VECTOR_ID = {UINT64_MAX, UINT32_MAX};

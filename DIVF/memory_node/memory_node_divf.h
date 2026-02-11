@@ -31,7 +31,7 @@ struct IVFCluster {
 class MN_DIVFIndex {
 public:
     MN_DIVFIndex(const VTYPE* data, size_t num_points, size_t num_clusters, bool insert_duplicates,
-                 size_t max_iterations, uint16_t dim, size_t num_threads = 0) :
+                 size_t max_iterations, uint16_t dim, size_t page_size, size_t num_threads = 0) :
              dim(dim), size(0),
              vectorDirectory(num_points, dim, (num_threads == 0 ? std::thread::hardware_concurrency() :
                                                                   num_threads) * 2) {
@@ -40,7 +40,7 @@ public:
         }
 
         pool_size = ALIGNED_SIZE(num_points * ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID)), CACHE_LINE_SIZE) +
-                          num_clusters * CACHE_LINE_SIZE;
+                          num_clusters * CACHE_LINE_SIZE + ALIGNED_SIZE(page_size, CACHE_LINE_SIZE);
 
 #ifdef USE_HUGETLB
         memory_pool = mmap64(nullptr, pool_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);

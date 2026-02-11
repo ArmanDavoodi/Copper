@@ -93,8 +93,19 @@ public:
             }
         }
 
-        for (const auto& cent : closest_centroids) {
-            cluster_ids.push_back(cent.second);
+        FatalAssert(closest_centroids.Size() == std::min(nprobe, num_centroids), LOG_TAG_BASIC,
+                    "Size of closest centroids list should be equal to nprobe or num_centroids, whichever is smaller.");
+        if (closest_centroids.Size() == 0) {
+            DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_BASIC,
+                    "No centroids found during ANNSearch(). This should not happen if the index is built correctly.");
+            return RetStatus::Fail("No centroids found during ANNSearch()");
+        }
+
+        cluster_ids.push_back(closest_centroids[0].second);
+        for (size_t i = 1; i < closest_centroids.Size(); ++i) {
+            FatalAssert(closest_centroids[i].first >= closest_centroids[i - 1].first, LOG_TAG_BASIC,
+                        "SortedList is not sorted from mroe similar to least similar");
+            cluster_ids.push_back(closest_centroids[i].second);
         }
 
         std::atomic<size_t> tasks_completed = 0;
@@ -120,9 +131,14 @@ public:
         FatalAssert(task_factory.num_sibling_tasks > 0, LOG_TAG_BASIC,
                     "No search tasks were created in DIVFIndex::ANNSearch()");
         SortedList<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP> temp_list(L2DTYPEIDPairCMP(), nprobe);
+        size_t num_triggered_polls = 0;
+        size_t num_empty_queue_polls = 0;
+        size_t num_iterations = 0;
         while (tasks_completed.load(std::memory_order_acquire) < task_factory.num_sibling_tasks) {
+            ++num_iterations;
             IVFSearchTask* task = nullptr;
             if (threadSelf->UniformRange64(0, (index_attr.num_user_threads * poll_rate) - 1) == 0) {
+                ++num_triggered_polls;
                 status = bufferMgr->PollRemoteReads();
                 FatalAssert(status.IsOK(), LOG_TAG_BASIC,
                             "Failed to poll remote reads in DIVFIndex::ANNSearch(): %s",
@@ -139,6 +155,7 @@ public:
                 bufferMgr->UnpinCluster(task->cluster_id);
                 delete task;
             } else {
+                ++num_empty_queue_polls;
                 status = bufferMgr->PollRemoteReads();
                 FatalAssert(status.IsOK(), LOG_TAG_BASIC,
                             "Failed to poll remote reads in DIVFIndex::ANNSearch(): %s",
@@ -147,13 +164,19 @@ public:
         }
 
         topk_list.Extract(neighbours);
+
+        threadSelf->UpdateSearchStats(task_factory.num_sibling_tasks, num_iterations,
+                                      num_triggered_polls, num_empty_queue_polls);
         return RetStatus::Success();
     }
 
-    String GetStats(MemoryStatsNode*& m_stat_list) {
+    String GetStats(MemoryStatsNode*& m_stat_list, bool reset_after_fetch = false) {
         BufferMgr* bufferMgr = BufferMgr::GetInstance();
         CHECK_NOT_NULLPTR(bufferMgr, LOG_TAG_BASIC);
-        return bufferMgr->GetStats(m_stat_list);
+        RDMA_Manager* rdmaMgr = RDMA_Manager::GetInstance();
+        CHECK_NOT_NULLPTR(rdmaMgr, LOG_TAG_BASIC);
+        return rdmaMgr->GetStats(reset_after_fetch) + String("\n----------------\n") +
+               bufferMgr->GetStats(m_stat_list, reset_after_fetch);
     }
 
 protected:

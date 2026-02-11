@@ -310,14 +310,14 @@ inline constexpr SimilarityComparator GetDistancePairSimilarityComparator(Distan
 }
 
 struct L2DTYPEIDPairCMP {
-    inline int operator()(const std::pair<DTYPE, IVFVectorID>& a,
+    inline bool operator()(const std::pair<DTYPE, IVFVectorID>& a,
                           const std::pair<DTYPE, IVFVectorID>& b) const {
-        return L2::MoreSimilar(a.first, b.first);
+        return (L2::MoreSimilar(a.first, b.first) >= 0);
     }
 
-    inline int operator()(const std::pair<DTYPE, VectorID>& a,
+    inline bool operator()(const std::pair<DTYPE, VectorID>& a,
                           const std::pair<DTYPE, VectorID>& b) const {
-        return L2::MoreSimilar(a.first, b.first);
+        return (L2::MoreSimilar(a.first, b.first) >= 0);
     }
 
     inline bool operator==(const L2DTYPEIDPairCMP& other) const {

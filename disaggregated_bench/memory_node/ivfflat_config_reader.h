@@ -137,6 +137,15 @@ void ParseConfigs(divftree::NodeID self_id) {
         throw std::runtime_error("Insert duplicates not provided!");
     }
 
+    vit = var_configs.find("page-size");
+    if (vit != var_configs.end()) {
+        if (!parseUnsignedInt(vit->second, page_size) || (page_size < 1)) {
+            throw std::runtime_error("Invalid page size!");
+        }
+    } else {
+        throw std::runtime_error("Page size not provided!");
+    }
+
     vit = var_configs.find("num-build-threads");
     if (vit != var_configs.end()) {
         if (!parseUnsignedInt(vit->second, num_threads) || (num_threads < 1)) {

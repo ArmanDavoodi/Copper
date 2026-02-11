@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <map>
 
+#include "utils/synchronization.h"
 #include "utils/concurrent_datastructures.h"
 #include "disaggregated/disaggregated_common.h"
 
@@ -284,6 +285,70 @@ public:
         return GetInstance()->selfInfo;
     }
 
+    String GetStats(bool clear_after_fetch = false) {
+#ifndef ENABLE_STAT_COLLECTION
+        return String("RDMA stats collection is disabled.");
+#else
+        FatalAssert(instance == this, LOG_TAG_RDMA,
+                    "RDMA_Manager instance mismatch!");
+        FatalAssert(IS_COMPUTE_NODE(), LOG_TAG_RDMA,
+                    "Only compute nodes can collect RDMA stats.");
+        FatalAssert(memory_nodes.size() == 1, LOG_TAG_RDMA,
+                    "Expected exactly one memory node for stats collection.");
+        stat_lock.Lock(SX_EXCLUSIVE);
+        String stats_str = String("RDMA stats: total_num_requests=%zu(normal:%.2f(%zu), sg:%.2f(%zu)), total_posts=%zu, "
+                            "total_num_work_requests=%zu, total_sge=%zu, total_rdma_read=(%zuGB = %zuMB = %zuKB = %zuB), "
+                            "total_num_tries_to_grab_connection=%zu | avg_posts_per_req=%.2f, avg_wr_per_post=%.2f, "
+                            "avg_num_pages_per_wr=%.2f, avg_request_size=(%.2fGB = %.2fMB = %.2fKB = %.2fB), "
+                            "avg_post_size=(%.2fGB = %.2fMB = %.2fKB = %.2fB), num_retries_per_request=%.2f, "
+                            "num_retries_per_post=%.2f",
+                            total_rdma_sp_reads + total_rdma_sg_reads,
+                            (total_rdma_sp_reads * 100.0) / (total_rdma_sp_reads + total_rdma_sg_reads),
+                            total_rdma_sp_reads,
+                            (total_rdma_sg_reads * 100.0) / (total_rdma_sp_reads + total_rdma_sg_reads),
+                            total_rdma_sg_reads,
+                            total_rdma_posts,
+                            total_num_wr,
+                            total_sge,
+                            total_rdma_read_bytes / (1024ul * 1024ul * 1024ul),
+                            total_rdma_read_bytes / (1024ul * 1024ul),
+                            total_rdma_read_bytes / 1024ul,
+                            total_rdma_read_bytes,
+                            total_num_tries_to_grab_connection,
+                            (double)(total_rdma_posts) / (double)(total_rdma_sp_reads + total_rdma_sg_reads),
+                            (double)(total_num_wr) / (double)(total_rdma_posts),
+                            (double)(total_sge) / (double)(total_num_wr),
+                            ((double)total_rdma_read_bytes / (double)(1024ul * 1024ul * 1024ul)) /
+                                (double)(total_rdma_sp_reads + total_rdma_sg_reads),
+                            ((double)total_rdma_read_bytes / (double)(1024ul * 1024ul)) /
+                                (double)(total_rdma_sp_reads + total_rdma_sg_reads),
+                            ((double)total_rdma_read_bytes / (double)(1024ul)) /
+                                (double)(total_rdma_sp_reads + total_rdma_sg_reads),
+                            ((double)total_rdma_read_bytes) / (double)(total_rdma_sp_reads + total_rdma_sg_reads),
+                            ((double)total_rdma_read_bytes / (double)(1024ul * 1024ul * 1024ul)) /
+                                ((double)(total_rdma_posts)),
+                            ((double)total_rdma_read_bytes / (double)(1024ul * 1024ul)) /
+                                ((double)(total_rdma_posts)),
+                            ((double)total_rdma_read_bytes / (double)(1024ul)) /
+                                ((double)(total_rdma_posts)),
+                            ((double)total_rdma_read_bytes) / ((double)(total_rdma_posts)),
+                            (double)(total_num_tries_to_grab_connection) / (double)(total_rdma_sp_reads + total_rdma_sg_reads),
+                            (double)(total_num_tries_to_grab_connection) / (double)(total_rdma_posts)
+                        );
+        if (clear_after_fetch) {
+            total_rdma_sp_reads = 0;
+            total_rdma_sg_reads = 0;
+            total_rdma_posts = 0;
+            total_num_wr = 0;
+            total_sge = 0;
+            total_rdma_read_bytes = 0;
+            total_num_tries_to_grab_connection = 0;
+        }
+        stat_lock.Unlock();
+        return stats_str;
+#endif
+    }
+
     void GetAllNodeInfos(std::vector<NodeInfo>& mn_infos, std::vector<NodeInfo>& cn_infos) {
         mn_infos.clear();
         cn_infos.clear();
@@ -391,8 +456,18 @@ EXIT:
         FatalAssert(it != memory_nodes.end(), LOG_TAG_RDMA,
                     "Target memory node not found!");
         ConnectionContext& ctx = it->second;
+        size_t num_tries_to_grab_connection = 0;
+        size_t num_posts = 0;
+        size_t totl_size = 0;
+#ifdef ENABLE_STAT_COLLECTION
+        for (size_t i = 0; i < num_clusters; i++) {
+            totl_size += sizes[i];
+        }
+#endif
         while (num_remaining > 0) {
-            uint8_t connection_idx = GrabConnection(target_node, num_remaining, num_resources_acquired);
+            ++num_posts;
+            uint8_t connection_idx = GrabConnection(target_node, num_remaining, num_resources_acquired,
+                                                    num_tries_to_grab_connection);
             FatalAssert(num_resources_acquired > 0, LOG_TAG_RDMA,
                         "Failed to acquire any RDMA resources for RDMA read.");
             FatalAssert(num_resources_acquired <= num_remaining, LOG_TAG_RDMA,
@@ -411,6 +486,9 @@ EXIT:
                         "RDMAReadInternal() failed. %s", rs.Msg());
             num_remaining -= num_resources_acquired;
         }
+
+        UpdateStats(num_clusters, num_posts, totl_size, num_tries_to_grab_connection);
+
         return rs;
     }
 
@@ -439,8 +517,22 @@ EXIT:
         FatalAssert(it != memory_nodes.end(), LOG_TAG_RDMA,
                     "Target memory node not found!");
         ConnectionContext& ctx = it->second;
+        size_t num_tries_to_grab_connection = 0;
+        size_t num_posts = 0;
+        size_t totl_size = 0;
+        size_t totl_num_sge = 0;
+#ifdef ENABLE_STAT_COLLECTION
+        for (size_t i = 0; i < num_clusters; i++) {
+            totl_num_sge += num_sge[i];
+            for (size_t j = 0; j < num_sge[i]; j++) {
+                totl_size += sizes[i][j];
+            }
+        }
+#endif
         while (num_remaining > 0) {
-            uint8_t connection_idx = GrabConnection(target_node, num_remaining, num_resources_acquired);
+            ++num_posts;
+            uint8_t connection_idx = GrabConnection(target_node, num_remaining, num_resources_acquired,
+                                                    num_tries_to_grab_connection);
             FatalAssert(num_resources_acquired > 0, LOG_TAG_RDMA,
                         "Failed to acquire any RDMA resources for RDMA scatter-gather read.");
             FatalAssert(num_resources_acquired <= num_remaining, LOG_TAG_RDMA,
@@ -460,6 +552,8 @@ EXIT:
                         "RDMASGReadInternal() failed. %s", rs.Msg());
             num_remaining -= num_resources_acquired;
         }
+
+        UpdateSGStats(num_clusters, totl_num_sge, num_posts, totl_size, num_tries_to_grab_connection);
         return rs;
     }
 
@@ -1618,7 +1712,8 @@ EXIT:
         return rs;
     }
 
-    uint8_t GrabConnection(NodeID target, size_t num_clusters, uint8_t& num_resources_acquired) {
+    uint8_t GrabConnection(NodeID target, size_t num_clusters, uint8_t& num_resources_acquired,
+                           size_t& num_tries_to_grab_connection) {
         FatalAssert(target.IsMemoryNode(), LOG_TAG_RDMA,
                     "Only connections to memory nodes can be grabbed.");
         FatalAssert(selfInfo.node_id.IsComputeNode(), LOG_TAG_RDMA,
@@ -1632,9 +1727,6 @@ EXIT:
         uint64_t num_iterations = 0;
         while (true) {
             if ((num_iterations > 0) && (num_iterations % MAX_CONN_PER_NODE == 0)) {
-                DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_RDMA,
-                        "High contention detected when grabbing RDMA connection to memory node %s.",
-                        target.ToString().ToCStr());
                 usleep(1);
             }
             ++num_iterations;
@@ -1662,6 +1754,7 @@ EXIT:
 
             break;
         }
+        num_tries_to_grab_connection += num_iterations;
 
         return idx;
     }
@@ -1831,7 +1924,6 @@ EXIT:
         struct ibv_sge** sge_list = new ibv_sge*[num_clusters];
         struct ibv_send_wr* bad_wr = nullptr;
 
-
         for (size_t i = 0; i < num_clusters; ++i) {
             FatalAssert(num_sge[i] > 0, LOG_TAG_RDMA,
                         "num_sge[%zu] is zero in RDMASGRead", i);
@@ -1840,7 +1932,10 @@ EXIT:
             CHECK_NOT_NULLPTR(local_buffers[i], LOG_TAG_RDMA);
             CHECK_NOT_NULLPTR(sizes[i], LOG_TAG_RDMA);
             sge_list[i] = new ibv_sge[num_sge[i]];
+            size_t total_size = 0;
+            UNUSED_VARIABLE(total_size);
             for (size_t j = 0; j < num_sge[i]; ++j) {
+                total_size += sizes[i][j];
                 FatalAssert(local_buffers[i][j] != nullptr, LOG_TAG_RDMA,
                             "local_buffer[%zu][%zu] is null in RDMASGRead", i, j);
                 FatalAssert(sizes[i][j] > 0, LOG_TAG_RDMA,
@@ -1850,16 +1945,17 @@ EXIT:
                             (reinterpret_cast<uintptr_t>(mr->addr) + mr->length),
                             LOG_TAG_RDMA,
                             "local_buffer[%zu][%zu] is out of registered memory region in RDMASGRead", i, j);
-                FatalAssert(remote_addresses[i] >= conn_ctx.remote_region_addr &&
-                            (remote_addresses[i] + sizes[i][j]) <=
-                            (conn_ctx.remote_region_addr + conn_ctx.remote_region_size),
-                            LOG_TAG_RDMA,
-                            "remote_address[%zu] is out of remote registered memory region in RDMASGRead", i);
 
                 sge_list[i][j].addr = reinterpret_cast<uintptr_t>(local_buffers[i][j]);
                 sge_list[i][j].length = sizes[i][j];
                 sge_list[i][j].lkey = mr->lkey;
             }
+
+            FatalAssert(remote_addresses[i] >= conn_ctx.remote_region_addr &&
+                        (remote_addresses[i] + total_size) <=
+                        (conn_ctx.remote_region_addr + conn_ctx.remote_region_size),
+                        LOG_TAG_RDMA,
+                        "remote_address[%zu] is out of remote registered memory region in RDMASGRead", i);
 
             memset(&wr_list[i], 0, sizeof(wr_list[i]));
             wr_list[i].wr_id = id.raw;
@@ -1893,6 +1989,41 @@ EXIT:
         return rs;
     }
 
+    inline void UpdateStats(size_t num_wr, size_t num_posts, size_t bytes, size_t num_retries) {
+        UNUSED_VARIABLE(num_wr);
+        UNUSED_VARIABLE(num_posts);
+        UNUSED_VARIABLE(bytes);
+        UNUSED_VARIABLE(num_retries);
+#ifdef ENABLE_STAT_COLLECTION
+        stat_lock.Lock(SX_EXCLUSIVE);
+        total_rdma_sp_reads += 1;
+        total_num_wr += num_wr;
+        total_sge += num_wr; /* in single post RDMA read, num_wr is equal to num_sge because each WR has only 1 SGE. */
+        total_rdma_posts += num_posts;
+        total_rdma_read_bytes += bytes;
+        total_num_tries_to_grab_connection += num_retries;
+        stat_lock.Unlock();
+#endif
+    }
+
+    inline void UpdateSGStats(size_t num_wr, size_t num_sge, size_t num_posts, size_t bytes, size_t num_retries) {
+        UNUSED_VARIABLE(num_wr);
+        UNUSED_VARIABLE(num_sge);
+        UNUSED_VARIABLE(num_posts);
+        UNUSED_VARIABLE(bytes);
+        UNUSED_VARIABLE(num_retries);
+#ifdef ENABLE_STAT_COLLECTION
+        stat_lock.Lock(SX_EXCLUSIVE);
+        total_rdma_sg_reads += 1;
+        total_num_wr += num_wr;
+        total_sge += num_sge;
+        total_rdma_posts += num_posts;
+        total_rdma_read_bytes += bytes;
+        total_num_tries_to_grab_connection += num_retries;
+        stat_lock.Unlock();
+#endif
+    }
+
     inline static RDMA_Manager* instance;
     const NodeInfo selfInfo;
     const uint8_t _rdma_port;
@@ -1912,6 +2043,17 @@ EXIT:
     int server_socket = -1;
     std::atomic<bool> ready = false;
     std::atomic<size_t> num_connected_nodes = 0;
+
+#ifdef ENABLE_STAT_COLLECTION
+    SXSpinLock stat_lock;
+    size_t total_rdma_sp_reads = 0; /* this how many times the RDMARead API itself was called not ibv_post_send */
+    size_t total_rdma_sg_reads = 0;
+    size_t total_rdma_posts = 0; /* this counts how many times ibv_post_send was called */
+    size_t total_num_wr = 0;
+    size_t total_sge = 0;
+    size_t total_rdma_read_bytes = 0;
+    size_t total_num_tries_to_grab_connection = 0;
+#endif
 };
 
 

@@ -460,6 +460,22 @@ public:
         return (_next_task_id++);
     }
 
+    inline void UpdateSearchStats(size_t n_tasks_created, size_t n_tasks_completed,
+                                  size_t n_triggered_polls, size_t n_empty_queue_induced_polls) {
+#ifdef ENABLE_STAT_COLLECTION
+        ++cnt_num_queries;
+        cnt_num_tasks_created += n_tasks_created;
+        cnt_num_search_queue_polls += n_tasks_completed;
+        cnt_num_triggered_polls += n_triggered_polls;
+        cnt_num_empty_queue_induced_polls += n_empty_queue_induced_polls;
+#else
+        UNUSED_VARIABLE(n_tasks_created);
+        UNUSED_VARIABLE(n_tasks_completed);
+        UNUSED_VARIABLE(n_triggered_polls);
+        UNUSED_VARIABLE(n_empty_queue_induced_polls);
+#endif
+    }
+
     inline void UpdatePollStats(bool lock_acquired, size_t num_tasks_polled) {
 #ifdef ENABLE_STAT_COLLECTION
         ++cnt_num_polls;
@@ -498,9 +514,18 @@ public:
 #endif
     }
 
-    /* todo add stats to check how many times do we get anything from pool vs cooling list(i.e eviction) */
+    // size_t cnt_num_queries = 0;
+    // size_t cnt_num_tasks_created = 0;
+    // size_t cnt_num_search_queue_polls = 0;
+    // size_t cnt_num_triggered_polls = 0;
+    // size_t cnt_num_empty_queue_induced_polls = 0;
     inline void AppendStats(String& stats_str,
+                            size_t& total_num_queries,
+                            size_t& total_num_tasks_created,
+                            size_t& total_num_search_queue_polls,
                             size_t& total_num_polls,
+                            size_t& total_num_triggered_polls,
+                            size_t& total_num_empty_queue_induced_polls,
                             size_t& total_unsuccsessful_polls,
                             size_t& total_empty_polls,
                             size_t& total_num_remote_reads_polled,
@@ -510,17 +535,30 @@ public:
                             size_t& total_got_memory_from_cool_once,
                             size_t& total_got_memory_from_pool_once,
                             size_t& total_got_memory_from_cool_multiple,
-                            size_t& total_got_memory_from_pool_multiple) {
+                            size_t& total_got_memory_from_pool_multiple, bool reset_stats = false) {
 #ifdef ENABLE_STAT_COLLECTION
+        FatalAssert(cnt_num_triggered_polls + cnt_num_empty_queue_induced_polls == cnt_num_polls, LOG_TAG_THREAD,
+                    "the sum of triggered polls and empty queue induced polls should be equal to total polls");
         stats_str += String("Thread(%lu): %lu - "
-                            "num_polls: %zu(num_fail: %.2f%%(%zu), num_empty %.2f%%(%zu), num_valid: %.2f%%(%zu)), "
+                            "num_queries: %zu, num_tasks_created: %zu, num_search_queue_polls: %zu, "
+                            "avg_num_tasks_created_per_query: %.2f, "
+                            "avg_num_search_queue_polls_per_query: %.2f, "
+                            "avg_num_search_queue_polls_per_created: %.2f, "
+                            "num_polls: %zu(triggered: %.2f(%zu), empty_q_end: %.2f(%zu) | "
+                            "num_fail: %.2f%%(%zu), num_empty %.2f%%(%zu), num_valid: %.2f%%(%zu)), "
                             "num_valid_to_successful_ratio: %.2f%%, "
                             "num_remote_reads_polled: %zu, avg_num_polled_per_valid_polls: %zu, "
                             "num_remote_rdma_reads: %zu(single_alloc: %.2f%%(%zu), multi_alloc: %.2f%%(%zu)), "
                             "num_alloc_tries: %zu, avg_num_alloc_tries_per_req: %zu, "
                             "avg_num_alloc_multi_tries_per_req: %zu, "
                             "num_pages_got: %zu(from_pool: %.2f%%(%zu), from_cooling_list: %.2f%%(%zu))\n",
-                            syscall(SYS_gettid), _id, cnt_num_polls,
+                            syscall(SYS_gettid), _id, cnt_num_queries, cnt_num_tasks_created, cnt_num_search_queue_polls,
+                            (cnt_num_queries > 0 ? ((double)cnt_num_tasks_created / (double)cnt_num_queries) : 0),
+                            (cnt_num_queries > 0 ? ((double)cnt_num_search_queue_polls / (double)cnt_num_queries) : 0),
+                            (cnt_num_tasks_created > 0 ? ((double)cnt_num_search_queue_polls / (double)cnt_num_tasks_created) : 0),
+                            cnt_num_polls,
+                            (cnt_num_polls > 0 ? (100.0 * cnt_num_triggered_polls / cnt_num_polls) : 0), cnt_num_triggered_polls,
+                            (cnt_num_polls > 0 ? (100.0 * cnt_num_empty_queue_induced_polls / cnt_num_polls) : 0), cnt_num_empty_queue_induced_polls,
                             (cnt_num_polls > 0 ? (100.0 * cnt_unsuccsessful_polls / cnt_num_polls) : 0),
                             cnt_unsuccsessful_polls,
                             (cnt_num_polls > 0 ? (100.0 * cnt_empty_polls / cnt_num_polls) : 0), cnt_empty_polls,
@@ -548,7 +586,12 @@ public:
                             ((cnt_got_memory_from_cool_once + cnt_got_memory_from_cool_multiple) * 100.0) / (cnt_got_memory_from_cool_once + cnt_got_memory_from_cool_multiple + cnt_got_memory_from_pool_once + cnt_got_memory_from_pool_multiple) : 0,
                             cnt_got_memory_from_cool_once + cnt_got_memory_from_cool_multiple
                         );
+        total_num_queries += cnt_num_queries;
+        total_num_tasks_created += cnt_num_tasks_created;
+        total_num_search_queue_polls += cnt_num_search_queue_polls;
         total_num_polls += cnt_num_polls;
+        total_num_triggered_polls += cnt_num_triggered_polls;
+        total_num_empty_queue_induced_polls += cnt_num_empty_queue_induced_polls;
         total_unsuccsessful_polls += cnt_unsuccsessful_polls;
         total_empty_polls += cnt_empty_polls;
         total_num_remote_reads_polled += cnt_num_remote_reads_polled;
@@ -559,9 +602,32 @@ public:
         total_got_memory_from_pool_once += cnt_got_memory_from_pool_once;
         total_got_memory_from_cool_multiple += cnt_got_memory_from_cool_multiple;
         total_got_memory_from_pool_multiple += cnt_got_memory_from_pool_multiple;
+        if (reset_stats) {
+            cnt_num_queries = 0;
+            cnt_num_tasks_created = 0;
+            cnt_num_search_queue_polls = 0;
+            cnt_num_polls = 0;
+            cnt_num_triggered_polls = 0;
+            cnt_num_empty_queue_induced_polls = 0;
+            cnt_unsuccsessful_polls = 0;
+            cnt_empty_polls = 0;
+            cnt_num_remote_reads_polled = 0;
+            cnt_remote_accesses = 0;
+            cnt_tries_to_get_memory = 0;
+            cnt_single_try = 0;
+            cnt_got_memory_from_cool_once = 0;
+            cnt_got_memory_from_pool_once = 0;
+            cnt_got_memory_from_cool_multiple = 0;
+            cnt_got_memory_from_pool_multiple = 0;
+        }
 #else
         UNUSED_VARIABLE(stats_str);
+        UNUSED_VARIABLE(total_num_queries);
+        UNUSED_VARIABLE(total_num_tasks_created);
+        UNUSED_VARIABLE(total_num_search_queue_polls);
         UNUSED_VARIABLE(total_num_polls);
+        UNUSED_VARIABLE(total_num_triggered_polls);
+        UNUSED_VARIABLE(total_num_empty_queue_induced_polls);
         UNUSED_VARIABLE(total_unsuccsessful_polls);
         UNUSED_VARIABLE(total_empty_polls);
         UNUSED_VARIABLE(total_num_remote_reads_polled);
@@ -616,6 +682,12 @@ protected:
 #endif
 
 #ifdef ENABLE_STAT_COLLECTION
+    size_t cnt_num_queries = 0;
+    size_t cnt_num_tasks_created = 0;
+    size_t cnt_num_search_queue_polls = 0;
+    size_t cnt_num_triggered_polls = 0;
+    size_t cnt_num_empty_queue_induced_polls = 0;
+
     size_t cnt_num_polls = 0;
     size_t cnt_unsuccsessful_polls = 0; /* lock failed */
     size_t cnt_empty_polls = 0;
