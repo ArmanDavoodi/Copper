@@ -8,8 +8,6 @@
 #include "utils/rdma_manager.h"
 #include "utils/concurrent_datastructures.h"
 
-#define MAX_NUM_PAGE_PER_CLUSTER 4
-
 namespace divftree {
 
 enum class BufferEntryState : uint8_t {
@@ -626,6 +624,12 @@ public:
     inline String GetStats(MemoryStatsNode*& memory_stats_head, bool reset_after_fetch = false) {
 #ifdef ENABLE_MEMORY_STAT_COLLECTION
         memory_stats_head = _memory_stats_head;
+        if (reset_after_fetch && _memory_stats_head != nullptr) {
+            CHECK_NOT_NULLPTR(_memory_stats_tail, LOG_TAG_BUFFER);
+            _memory_stats_head = new MemoryStatsNode();
+            (*_memory_stats_head) = (*_memory_stats_tail);
+            _memory_stats_tail = _memory_stats_head;
+        }
 #else
         memory_stats_head = nullptr;
 #endif
@@ -844,14 +848,14 @@ protected:
             _memory_stats_head = new MemoryStatsNode(num_allocated, num_bytes_needed);
             _memory_stats_tail = _memory_stats_head;
         } else {
-            FatalAssert(_memory_stats_tail != nullptr, LOG_TAG_BUFFER,
-                        "Memory stats tail should not be null when adding a new entry in BufferMgr::ReadFromRemote()");
-            FatalAssert(_memory_stats_tail->current_pages >= num_pages_freed, LOG_TAG_BUFFER,
+            FatalAssert(_memory_stats_head != nullptr, LOG_TAG_BUFFER,
+                        "Memory stats head should not be null when adding a new entry in BufferMgr::ReadFromRemote()");
+            FatalAssert(_memory_stats_tail->num_allocated_pages >= num_pages_freed, LOG_TAG_BUFFER,
                         "Current pages should be greater than or equal to pages allocated from pool in BufferMgr::ReadFromRemote()");
-            size_t _current_pages = _memory_stats_tail->current_pages - num_pages_freed + num_from_pool;
-            FatalAssert(_memory_stats_tail->current_bytes >= bytes_freed_from_cool, LOG_TAG_BUFFER,
+            size_t _current_pages = _memory_stats_tail->num_allocated_pages - num_pages_freed + num_from_pool;
+            FatalAssert(_memory_stats_tail->num_bytes_in_use >= bytes_freed_from_cool, LOG_TAG_BUFFER,
                         "Current bytes should be greater than or equal to bytes freed from cool in BufferMgr::ReadFromRemote()");
-            size_t _current_bytes = _memory_stats_tail->current_bytes - bytes_freed_from_cool + num_bytes_needed;
+            size_t _current_bytes = _memory_stats_tail->num_bytes_in_use - bytes_freed_from_cool + num_bytes_needed;
             MemoryStatsNode* new_node = new MemoryStatsNode(_current_pages, _current_bytes);
             _memory_stats_tail->next = new_node;
             _memory_stats_tail = new_node;

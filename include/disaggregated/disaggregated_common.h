@@ -35,7 +35,7 @@
 #define DIVF_IS_COMPUTE_NODE
 #endif
 
-
+#define MAX_NUM_PAGE_PER_CLUSTER 8
 namespace divftree {
 
 inline constexpr bool IS_MEMORY_NODE() {

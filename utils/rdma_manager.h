@@ -33,7 +33,7 @@ static constexpr int MAX_CQE[NUM_NODE_TYPES] = {
 
 static constexpr uint32_t MAX_SEND_SGE[NUM_NODE_TYPES] = {
     1,   /* MN_SIDE */
-    4,   /* CN_SIDE */ /* todo: check that it does not go beyond */ /* max is 30 for the current hardware */
+    MAX_NUM_PAGE_PER_CLUSTER,   /* CN_SIDE */ /* todo: check that it does not go beyond */ /* max is 30 for the current hardware */
 };
 
 /* todo: needs tuning */
