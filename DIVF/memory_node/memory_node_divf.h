@@ -12,7 +12,7 @@
 #include "utils/vector_directory.h"
 #include "utils/rdma_manager.h"
 
-#include <sys/mman.h>
+#include "DIVF/memory_node/mn_memory_arena.h"
 
 
 namespace divftree {
@@ -27,40 +27,24 @@ struct IVFCluster {
     char* data = nullptr; /* data points stored in a flat array */
 };
 
+struct SplitTask {
+    size_t idx;
+};
 
 class MN_DIVFIndex {
 public:
-    MN_DIVFIndex(const VTYPE* data, size_t num_points, size_t num_clusters, bool insert_duplicates,
-                 size_t max_iterations, uint16_t dim, size_t page_size, size_t num_threads = 0) :
+    MN_DIVFIndex(const VTYPE* data, size_t num_points, size_t cluster_cap, bool insert_duplicates,
+                 size_t max_iterations, uint16_t dim, size_t num_threads = 0) :
              dim(dim), size(0),
              vectorDirectory(num_points, dim, (num_threads == 0 ? std::thread::hardware_concurrency() :
-                                                                  num_threads) * 2) {
+                                                                  num_threads) * 2),
+             arena((sizeof(VTYPE) * dim + sizeof(IVFVectorID)) * cluster_cap, (num_points * 2) / cluster_cap, 32) {
         if (dim == 0) {
             DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "MN_DIVFIndex dimension cannot be zero!");
         }
 
-        pool_size = ALIGNED_SIZE(num_points * ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID)), CACHE_LINE_SIZE) +
-                          num_clusters * CACHE_LINE_SIZE + ALIGNED_SIZE(page_size, CACHE_LINE_SIZE);
-
-#ifdef USE_HUGETLB
-        memory_pool = mmap64(nullptr, pool_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-#else
-        memory_pool = mmap64(nullptr, pool_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-#endif
-
-        if (memory_pool == MAP_FAILED) {
-            DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_MEMORY, "Failed to allocate memory for MemoryPool."
-                    "errno %d, errno msg: %s", errno, strerror(errno));
-        }
-
-        if (memory_pool == nullptr) {
-            DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_MEMORY, "MemoryPool mmap returned nullptr");
-        }
-
-        if (!ALIGNED(memory_pool)) {
-            DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_MEMORY,
-                    "MemoryPool memory_pool is not properly aligned. Requested alignment: %lu, memory_pool address: %p",
-                    CACHE_LINE_SIZE, memory_pool);
+        if (cluster_cap == 0) {
+            DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "MN_DIVFIndex cluster capacity cannot be zero!");
         }
 
         RetStatus status = RetStatus::Success();
@@ -85,7 +69,12 @@ public:
         RDMA_Manager* rdma_mgr = RDMA_Manager::GetInstance();
         CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BASIC);
 
-        status = rdma_mgr->RegisterMemory(memory_pool, pool_size);
+        FatalAssert(arena.GetRegions().size() == 1, LOG_TAG_BASIC, "we should only have one region!");
+        const ArenaRegion& memory_region = arena.GetRegions()[0];
+        CHECK_NOT_NULLPTR(memory_region.base, LOG_TAG_BASIC);
+        FatalAssert(memory_region.len > 0, LOG_TAG_BASIC, "region len cannot be 0!");
+
+        status = rdma_mgr->RegisterMemory(memory_region.base, memory_region.len);
         FatalAssert(status.IsOK(), LOG_TAG_BASIC,
                     "Failed to register memory in MN_DIVFIndex constructor: %s",
                     status.Msg());
@@ -95,7 +84,7 @@ public:
                     status.Msg());
 
         IVFVectorID* out_vector_ids = new IVFVectorID[num_points];
-        status = Build(data, num_points, num_clusters, insert_duplicates,
+        status = Build(data, num_points, cluster_cap, insert_duplicates,
                        out_vector_ids, max_iterations, num_threads);
 
         DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
@@ -115,17 +104,17 @@ public:
                 cluster.centroid_tmp = nullptr;
             }
             if (cluster.data != nullptr) {
-                FatalAssert(cluster.data >= memory_pool &&
+                FatalAssert(arena.GetRegions().size() == 1, LOG_TAG_BASIC, "we should only have one region!");
+                const ArenaRegion& memory_region = arena.GetRegions()[0];
+                CHECK_NOT_NULLPTR(memory_region.base, LOG_TAG_BASIC);
+                FatalAssert(memory_region.len > 0, LOG_TAG_BASIC, "region len cannot be 0!");
+                FatalAssert(cluster.data >= memory_region.base &&
                             (reinterpret_cast<uint8_t*>(cluster.data) <
-                             reinterpret_cast<uint8_t*>(memory_pool) + pool_size),
+                                reinterpret_cast<uint8_t*>(memory_region.base) + memory_region.len),
                             LOG_TAG_BASIC,
                             "Cluster data pointer is out of bounds of the memory pool!");
                 cluster.data = nullptr;
             }
-        }
-        if (munmap(memory_pool, pool_size) != 0) {
-            DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_BASIC, "Failed to free memory for MemoryPool. "
-                    "errno %d, errno msg: %s", errno, strerror(errno));
         }
     }
 
@@ -153,14 +142,11 @@ protected:
     std::vector<IVFCluster> clusters;
     SXSpinLock vector_directory_lock;
     VectorDirectory vectorDirectory;
-    void* memory_pool = nullptr;
-    size_t pool_size = 0;
-    std::atomic<size_t> next_memory_offset = 0;
+    MemoryArena arena;
 
-    RetStatus Build(const VTYPE* data, size_t num_points, size_t num_clusters, bool insert_duplicates,
+    RetStatus Build(const VTYPE* data, size_t num_points, size_t cluster_cap, bool insert_duplicates,
                     IVFVectorID* out_vector_ids, size_t max_iterations, size_t num_threads) {
-        if (data == nullptr || num_points == 0 || num_clusters < 2 ||
-            num_clusters > num_points || clusters.size() != 0 || out_vector_ids == nullptr ||
+        if (data == nullptr || num_points == 0 || cluster_cap == 0 || clusters.size() != 0 || out_vector_ids == nullptr ||
             num_threads > num_points) {
             FatalAssert(false, LOG_TAG_BASIC, "Invalid arguments to MN_DIVFIndex::Build()");
             return RetStatus::Fail("Invalid arguments to MN_DIVFIndex::Build()");
@@ -173,11 +159,16 @@ protected:
             }
         }
 
+        size_t num_clusters = num_points / (cluster_cap * 2);
+        if (num_clusters <= 1) {
+            num_clusters = std::max(2lu, num_points / cluster_cap);
+        }
+
         DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
-                "Starting MN_DIVFIndex::Build() with %zu data points, %zu clusters, %zu max iterations, "
-                "%s duplicate insertion, and %zu threads.",
-                num_points, num_clusters, max_iterations,
-                insert_duplicates ? "allowing" : "disallowing", num_threads);
+                "Starting MN_DIVFIndex::Build() with %zu data points, %zu clusters_cap, %zu max iterations, "
+                "%s duplicate insertion, initial num clusters %zu, and %zu threads.",
+                num_points, cluster_cap, max_iterations,
+                insert_duplicates ? "allowing" : "disallowing", num_clusters, num_threads);
 
         clusters.resize(num_clusters);
         DIVF_MEMSET(out_vector_ids, UINT8_MAX, num_points * sizeof(IVFVectorID));
@@ -187,6 +178,9 @@ protected:
         SXSpinLock* cluster_build_locks = new SXSpinLock[num_clusters];
         MVTYPE* temp_storage = new MVTYPE[dim * clusters.size() * num_threads];
         size_t* cluster_sizes = new size_t[clusters.size() * num_threads];
+        SXLock cluster_list_lock;
+        BlockingQueue<SplitTask> unfinished_clusters;
+        std::atomic<size_t> synchronizer;
 
         DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Choosing the first centroids from the existing data points...");
         for (size_t c = 0; c < num_clusters; c++) {
@@ -234,7 +228,7 @@ protected:
 
         DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Starting clustering process...");
         if (num_threads == 1) {
-            SequentialBuild(data, data_seen, num_points, valid,
+            SequentialBuild(data, data_seen, num_points, cluster_cap, valid,
                             insert_duplicates, out_vector_ids, temp_storage, cluster_sizes, current_size,
                             max_iterations);
         } else {
@@ -248,15 +242,16 @@ protected:
                 builder_threads.emplace_back(new Thread(100));
                 Thread* thrd = builder_threads.back();
                 thrd->StartMemberFunction(&MN_DIVFIndex::ParallelBuilder, this, data, &seen_idx, num_points,
-                                         thread_step, valid, insert_duplicates,
-                                         out_vector_ids, cluster_build_locks,
+                                         cluster_cap, thread_step, &unfinished_clusters, valid, insert_duplicates,
+                                         out_vector_ids, cluster_build_locks, &cluster_list_lock, &synchronizer,
                                          &(temp_storage[t * dim * clusters.size()]),
                                          &(cluster_sizes[t * clusters.size()]), &sync_point, &converged,
                                          current_size, max_iterations);
             }
-            ParallelBuild(data, seen_idx, num_points, thread_step,
-                          valid, insert_duplicates, out_vector_ids, cluster_build_locks,
-                          temp_storage, cluster_sizes, true, &sync_point, &converged, current_size, max_iterations);
+            ParallelBuild(data, seen_idx, num_points, cluster_cap, thread_step, &unfinished_clusters,
+                          valid, insert_duplicates, out_vector_ids, cluster_build_locks, &cluster_list_lock,
+                          &synchronizer, temp_storage, cluster_sizes, true, &sync_point,
+                          &converged, current_size, max_iterations);
 
             for (Thread* t : builder_threads) {
                 delete t;
@@ -274,14 +269,6 @@ protected:
                 "%lu total size.", vectorDirectory.Size(true), vectorDirectory.Size());
         size = vectorDirectory.Size();
         return RetStatus::Success();
-    }
-
-    inline void* AllocateMemory(size_t size_in_bytes) {
-        size_t aligned_size = ALIGNED_SIZE(size_in_bytes, CACHE_LINE_SIZE);
-        size_t offset = next_memory_offset.fetch_add(aligned_size);
-        FatalAssert((offset + aligned_size) <= pool_size,
-                    LOG_TAG_MEMORY, "MN_DIVFIndex memory pool out of memory!");
-        return static_cast<void*>(static_cast<char*>(memory_pool) + offset);
     }
 
     inline void ClearClusterData() {
@@ -582,7 +569,7 @@ protected:
         }
     }
 
-    inline void SequentialBuild(const VTYPE* data, size_t seen_idx, size_t end_idx,
+    inline void SequentialBuild(const VTYPE* data, size_t seen_idx, size_t end_idx, size_t cluster_cap,
                                 bool* is_valid, bool insert_duplicates,
                                 IVFVectorID* out_vector_ids, MVTYPE* temp_storage, size_t* cluster_sizes,
                                 std::atomic<size_t>* current_size, size_t max_iterations) {
@@ -657,9 +644,7 @@ protected:
             }
             delete[] clusters[c].centroid_tmp;
             clusters[c].centroid = final_centroid;
-            clusters[c].data =
-                reinterpret_cast<char*>(AllocateMemory(clusters[c].num_points *
-                                                       ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID))));
+            clusters[c].data = reinterpret_cast<char*>(arena.AllocatePage());
             DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
                     "Finalized centroid %zu with %zu points. Centroid data: %s",
                     c, clusters[c].num_points, centroid_data.ToCStr());
@@ -675,10 +660,36 @@ protected:
         });
     }
 
-    inline void ParallelBuild(const VTYPE* data, std::atomic<size_t>& seen_idx, size_t end_idx,
-                              size_t step_size, bool* is_valid, bool insert_duplicates,
-                              IVFVectorID* out_vector_ids, SXSpinLock* cluster_build_locks,
-                              MVTYPE* temp_storage, size_t* cluster_sizes,
+    inline void Balancing(const VTYPE* data, BlockingQueue<SplitTask>* unfinished_clusters, size_t cluster_cap,
+                          IVFVectorID* out_vector_ids, MVTYPE* temp_storage, bool* is_valid, SXLock* cluster_list_lock,
+                          size_t max_iterations, std::atomic<size_t>* synchronizer) {
+        CHECK_NOT_NULLPTR(unfinished_clusters, LOG_TAG_BASIC);
+        CHECK_NOT_NULLPTR(out_vector_ids, LOG_TAG_BASIC);
+        CHECK_NOT_NULLPTR(temp_storage, LOG_TAG_BASIC);
+        CHECK_NOT_NULLPTR(is_valid, LOG_TAG_BASIC);
+        CHECK_NOT_NULLPTR(cluster_list_lock, LOG_TAG_BASIC);
+        CHECK_NOT_NULLPTR(synchronizer, LOG_TAG_BASIC);
+        while (true) {
+            SplitTask t;
+            if (unfinished_clusters->PopHead(t)) {
+                cluster_list_lock->Lock(SX_SHARED);
+                FatalAssert(t.idx < clusters.size(), LOG_TAG_BASIC, "Invalid cluster idx");
+                FatalAssert(clusters[t.idx].num_points > cluster_cap, LOG_TAG_BASIC, "Cluster does not exceed capacity");
+                size_t num_clusters = clusters[t.idx].num_points / (cluster_cap * 2);
+                if (num_clusters <= 1) {
+                    num_clusters = std::max(2lu, clusters[t.idx].num_points / cluster_cap);
+                }
+
+                cluster_list_lock->Lock(SX_EXCLUSIVE);
+            }
+        }
+    }
+
+    inline void ParallelBuild(const VTYPE* data, std::atomic<size_t>& seen_idx, size_t end_idx, size_t cluster_cap,
+                              size_t step_size, BlockingQueue<SplitTask>* unfinished_clusters,
+                              bool* is_valid, bool insert_duplicates,
+                              IVFVectorID* out_vector_ids, SXSpinLock* cluster_build_locks, SXLock* cluster_list_lock,
+                              std::atomic<size_t>* synchronizer, MVTYPE* temp_storage, size_t* cluster_sizes,
                               bool is_master_thread, std::barrier<>* sync_point, std::atomic<bool>* converged,
                               std::atomic<size_t>* current_size,
                               size_t max_iterations) {
@@ -765,9 +776,7 @@ protected:
                 }
                 delete[] clusters[c].centroid_tmp;
                 clusters[c].centroid = final_centroid;
-                clusters[c].data =
-                    reinterpret_cast<char*>(AllocateMemory(clusters[c].num_points *
-                                                           ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID))));
+                clusters[c].data = reinterpret_cast<char*>(arena.AllocatePage());
                 // clusters[c].data = new char[clusters[c].num_points * ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID))];
                 DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
                         "Finalized centroid %zu with %zu points. Centroid data: %s",
@@ -791,15 +800,17 @@ protected:
     }
 
     inline void ParallelBuilder(Thread* self, const VTYPE* data, std::atomic<size_t>* seen_idx, size_t end_idx,
-                                size_t step_size, bool* is_valid, bool insert_duplicates,
-                                IVFVectorID* out_vector_ids, SXSpinLock* cluster_build_locks,
+                                size_t cluster_cap, size_t step_size, BlockingQueue<SplitTask>* unfinished_clusters,
+                                bool* is_valid, bool insert_duplicates,
+                                IVFVectorID* out_vector_ids, SXSpinLock* cluster_build_locks, SXLock* cluster_list_lock,
+                                std::atomic<size_t>* synchronizer,
                                 MVTYPE* temp_storage, size_t* cluster_sizes, std::barrier<>* sync_point,
                                 std::atomic<bool>* converged, std::atomic<size_t>* current_size,
                                 size_t max_iterations) {
         CHECK_NOT_NULLPTR(self, LOG_TAG_DIVFTREE);
         self->InitDIVFThread();
-        ParallelBuild(data, *seen_idx, end_idx, step_size, is_valid,
-                      insert_duplicates, out_vector_ids, cluster_build_locks,
+        ParallelBuild(data, *seen_idx, end_idx, cluster_cap, step_size, unfinished_clusters, is_valid,
+                      insert_duplicates, out_vector_ids, cluster_build_locks, cluster_list_lock, synchronizer,
                       temp_storage, cluster_sizes, false, sync_point, converged,
                       current_size, max_iterations);
         self->DestroyDIVFThread();
