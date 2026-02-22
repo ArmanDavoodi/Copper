@@ -95,6 +95,35 @@ public:
         }
     }
 
+    inline void InitDIVFThread(bool self_created) {
+        if (!self_created) {
+            uint64_t retry = 0;
+            while ((_thrd.load(std::memory_order_acquire) == nullptr) && (retry < MAX_THREAD_RETRY_COUNT)) {
+                ++retry;
+                DIVFTREE_YIELD();
+            }
+            if (_thrd.load(std::memory_order_acquire) == nullptr) {
+                _thrd.wait(nullptr);
+            }
+        }
+
+        FatalAssert(threadSelf == nullptr, LOG_TAG_THREAD, "thread should not be inited yet!");
+        FatalAssert((self_created) || (_thrd.load(std::memory_order_relaxed) != nullptr), LOG_TAG_THREAD,
+                    "thread should have started!");
+        FatalAssert((self_created) || (_thrd.load(std::memory_order_relaxed)->get_id() == std::this_thread::get_id()),
+                    LOG_TAG_THREAD, "the thread itself should call this function");
+        FatalAssert(_done.load(std::memory_order_relaxed), LOG_TAG_THREAD, "thread should be in the initial state");
+        DIVFLOG(LOG_LEVEL_DEBUG, LOG_TAG_THREAD, "Initing thread %p - ID:%lu - parent:%lu", this, _id, _parent_id);
+        threadSelf = this;
+
+#ifdef HANG_DETECTION
+        all_threads_lock.lock();
+        all_threads.push_back(this);
+        all_threads_lock.unlock();
+#endif
+        _done.store(false, std::memory_order_release);
+    }
+
     inline void InitDIVFThread() {
         if (_id != 0) {
             uint64_t retry = 0;
@@ -136,10 +165,10 @@ public:
         FatalAssert(threadSelf == this, LOG_TAG_THREAD, "thread is not inited!");
         FatalAssert(!_done.load(std::memory_order_relaxed), LOG_TAG_THREAD,
                     "thread should not be in the initial state");
-        FatalAssert((_id == 0) || (_thrd.load(std::memory_order_relaxed) != nullptr), LOG_TAG_THREAD,
-                    "thread should have started!");
-        FatalAssert((_id == 0) || (_thrd.load(std::memory_order_relaxed)->get_id() == std::this_thread::get_id()),
-                    LOG_TAG_THREAD, "the thread itself should call this function");
+        // FatalAssert((_id == 0) || (_thrd.load(std::memory_order_relaxed) != nullptr), LOG_TAG_THREAD,
+        //             "thread should have started!");
+        // FatalAssert((_id == 0) || (_thrd.load(std::memory_order_relaxed)->get_id() == std::this_thread::get_id()),
+        //             LOG_TAG_THREAD, "the thread itself should call this function");
         DIVFLOG(LOG_LEVEL_DEBUG, LOG_TAG_THREAD, "Destroying thread %p - ID:%lu - parent:%lu", this, _id, _parent_id);
         threadSelf = nullptr;
         if (centroid_compute_buffer != nullptr) {

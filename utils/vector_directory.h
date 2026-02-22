@@ -19,7 +19,7 @@ struct VectorDirectoryNode {
     IVFVectorInfo info;
 
     VectorDirectoryNode* next_in_chain;
-    VectorDirectoryNode* next;
+    std::atomic<VectorDirectoryNode*> next;
 };
 
 class VectorDirectory {
@@ -97,15 +97,16 @@ public:
 
                     if (fail_if_duplicate) {
                         return INVALID_IVF_VECTOR_ID;
-                    } else {
-                        ++((*node)->num_duplicates);
-                        ++num_vectors;
-                        return ((*node)->id);
                     }
-                } else {
-                    // hash collision, try next value
-                    vid.value++;
+
+                    ++((*node)->num_duplicates);
+                    ++num_vectors;
+                    return ((*node)->id);
                 }
+
+                // hash collision, try next value
+                FatalAssert(vid.value == (*node)->id.value, LOG_TAG_BASIC, "Hash collision with different value in VectorDirectory!");
+                vid.value++;
             }
             node = &((*node)->next_in_chain);
         }
@@ -117,8 +118,16 @@ public:
         (*node)->info.centroid_id = VectorID::AsID(INVALID_VECTOR_ID);
         (*node)->info.offset = UINT64_MAX;
         (*node)->info.vector = nullptr;
-        (*node)->next = head;
-        head = *node;
+
+        VectorDirectoryNode* cur_head = head.load(std::memory_order_acquire);
+        while (true) {
+            (*node)->next.store(cur_head, std::memory_order_release);
+            if (head.compare_exchange_weak(cur_head, *node)) {
+                break;
+            }
+            DIVFTREE_YIELD();
+            cur_head = head.load(std::memory_order_acquire);
+        }
         ++size;
         ++num_vectors;
 
@@ -167,15 +176,19 @@ public:
     }
 
     size_t Size(bool unique = false) const {
-        return (unique ? size : num_vectors);
+        return (unique ? size.load(std::memory_order_acquire) : num_vectors.load(std::memory_order_acquire));
+    }
+
+    VectorDirectoryNode* GetHead() {
+        return head;
     }
 
 protected:
     const uint16_t dimension;
     std::vector<SXSpinLock> locks;
-    size_t size;
-    size_t num_vectors;
-    VectorDirectoryNode* head;
+    std::atomic<size_t> size;
+    std::atomic<size_t> num_vectors;
+    std::atomic<VectorDirectoryNode*> head;
     std::vector<VectorDirectoryNode*> buckets;
 };
 

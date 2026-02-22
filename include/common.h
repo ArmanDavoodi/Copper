@@ -857,7 +857,7 @@ might cause deadlock or unnecessary errors*/
 // };
 
 #ifndef VECTOR_TYPE
-#define VECTOR_TYPE uint16_t
+#define VECTOR_TYPE UINT16
 typedef uint16_t VTYPE;
 typedef uint32_t DTYPE;
 typedef uint64_t MVTYPE;

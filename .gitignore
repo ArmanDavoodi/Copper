@@ -41,6 +41,8 @@
 
 #data
 **/raw_data/*
+**/unique_identified/*
+**/datasets/**/index/*
 
 #configurations
 *.conf
