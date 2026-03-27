@@ -28,10 +28,31 @@ inline divftree::MN_DIVFIndex* vector_index = nullptr;
         printf("\n"); \
     } while(0)
 
-int main(int argc, char** argv) {
-    FatalAssert(argc == 2, LOG_TAG_TEST,
-                "Usage: %s <self-node-idx>", argv[0]);
+/* log-output-file-dir is not the file name but the directory path */
+void ReadArgs(int argc, char** argv) {
+    if (argc != 4) {
+        DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Usage: %s <self-node-idx> <index-file-path> <log-output-file-dir>", argv[0]);
+    }
+
     divftree::network_config::self_idx = static_cast<uint8_t>(std::stoul(argv[1]));
+    index_file_path = argv[2];
+    if (index_file_path.empty()) {
+        DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Index file path cannot be empty!");
+    }
+
+    if (!std::filesystem::exists(index_file_path)) {
+        DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Index file does not exist at path: %s", index_file_path.c_str());
+    }
+
+    if (!std::filesystem::is_regular_file(index_file_path)) {
+        DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Index file path is not a regular file: %s", index_file_path.c_str());
+    }
+
+    var_configs["log-path"] = argv[3];
+}
+
+int main(int argc, char** argv) {
+    ReadArgs(argc, argv);
     std::pair<divftree::String, divftree::String> node_strs = divftree::ReadNetworkConfigs();
     divftree::NodeID self_id = divftree::NodeID(true, divftree::network_config::memory_node_ids[divftree::network_config::self_idx]);
     ReadConfigs();
@@ -43,44 +64,23 @@ int main(int argc, char** argv) {
             ::divftree::network_config::num_compute_nodes, node_strs.second.ToCStr(),
             ::divftree::network_config::rdma_device_name, ::divftree::network_config::rdma_port,
             ::divftree::network_config::gid_index);
-    FILE* file = nullptr;
-    OpenDataFile(file, true);
 
     divftree::Thread main_thread(100);
-    main_thread.InitDIVFThread(DIMENSION);
+    main_thread.InitDIVFThread((uint16_t)DIMENSION);
 
-    BenchLog("Starting benchmark from MN for %s(type:%s, dimension:%hu, distance:%s) "
-             "with %lu threads for build-size:%u. "
-             "num_clusters = %zu, max_iters = %zu, insert_duplicates = %s",
-             DATASET_NAME, DIVF_MACRO_TO_STR(VECTOR_TYPE), DIMENSION,
-             divftree::DISTANCE_TYPE_NAME[(int8_t)DISTANCE_ALG], num_threads, build_size,
-             num_clusters, max_iters, insert_duplicates ? "true" : "false");
+    BenchLog("Starting benchmark from MN %s for %s(vtype:%s, ctype:%s, dimension:%hu, distance:%s): index-file:%s",
+             self_id.ToString().ToCStr(),
+             DATASET_NAME, DIVF_MACRO_TO_STR(VECTOR_TYPE), DIVF_MACRO_TO_STR(CENTROID_TYPE), DIMENSION,
+             divftree::DISTANCE_TYPE_NAME[(int8_t)DISTANCE_ALG], index_file_path.c_str());
 
-    FatalAssert(build_size <= total_num_vectors, LOG_TAG_TEST,
-                "Build size (%u) cannot be larger than total number of vectors (%u)!",
-                build_size, total_num_vectors);
-
-    data_set = new divftree::VTYPE[(size_t)build_size * DIMENSION];
-    bench_batch_size = build_size;
-
-    size_t read_size = ReadNextBatch(file, data_set);
-    FatalAssert(read_size == build_size, LOG_TAG_TEST,
-                "Error reading data for build! requested: %zu, read: %zu", build_size, read_size);
-
-    CloseFile(file);
-
-    BenchLog("Start Build...");
+    BenchLog("Start Load...");
     auto start_time = std::chrono::high_resolution_clock::now();
-    vector_index = new divftree::MN_DIVFIndex(data_set, build_size, num_clusters, insert_duplicates,
-                                              max_iters, DIMENSION, page_size, num_threads);
+    vector_index = new divftree::MN_DIVFIndex(index_file_path);
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-    size_t build_time = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+    size_t load_time = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
 
-    delete[] data_set;
-    data_set = nullptr;
-
-    BenchLog("Build Time: %lu(ms)", build_time);
+    BenchLog("Load Time: %lu(ms)", load_time);
     BenchLog("Start Listening for queries...");
     vector_index->Start();
     BenchLog("All CNs disconnected. Stopping benchmark...");

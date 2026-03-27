@@ -295,15 +295,16 @@ public:
                 uintptr_t nextInternal = nextAvailableInternalSlot.load(std::memory_order_acquire);
                 uintptr_t nextLeaf = nextAvailableLeafSlot.load(std::memory_order_acquire);
                 size_t available = (nextInternal > nextLeaf) ? (nextInternal - nextLeaf) / leafSlotSize : 0;
-                if (available > 0) {
-                    uintptr_t begin = nextAvailableLeafSlot.fetch_add(available * leafSlotSize);
-                    uintptr_t end = begin + available * leafSlotSize;
+                size_t to_allocate = std::min(available, count - allocated);
+                if (to_allocate > 0) {
+                    uintptr_t begin = nextAvailableLeafSlot.fetch_add(to_allocate * leafSlotSize);
+                    uintptr_t end = begin + to_allocate * leafSlotSize;
                     uintptr_t boundry = nextAvailableInternalSlot.load(std::memory_order_acquire);
                     if (begin >= boundry) {
                         // no available slots
                         begin = 0;
                         end = 0;
-                        nextAvailableLeafSlot.fetch_sub(available * leafSlotSize);
+                        nextAvailableLeafSlot.fetch_sub(to_allocate * leafSlotSize);
                     } else if (end > boundry) {
                         size_t num_invalid = (end - boundry + leafSlotSize - 1) / leafSlotSize;
                         nextAvailableLeafSlot.fetch_sub(num_invalid * leafSlotSize);
@@ -364,15 +365,16 @@ public:
                 uintptr_t nextLeaf = nextAvailableLeafSlot.load(std::memory_order_acquire);
                 size_t available = (nextInternal > nextLeaf) ?
                                    (nextInternal - nextLeaf) / internalSlotSize : 0;
-                if (available > 0) {
-                    uintptr_t begin = nextAvailableInternalSlot.fetch_sub(available * internalSlotSize);
-                    uintptr_t end = begin - (available * internalSlotSize);
+                size_t to_allocate = std::min(available, count - allocated);
+                if (to_allocate > 0) {
+                    uintptr_t begin = nextAvailableInternalSlot.fetch_sub(to_allocate * internalSlotSize);
+                    uintptr_t end = begin - (to_allocate * internalSlotSize);
                     uintptr_t boundry = nextAvailableLeafSlot.load(std::memory_order_acquire);
                     if (begin <= boundry) {
                         // no available slots
                         begin = 0;
                         end = 0;
-                        nextAvailableInternalSlot.fetch_add(available * internalSlotSize);
+                        nextAvailableInternalSlot.fetch_add(to_allocate * internalSlotSize);
                     } else if (end < boundry) {
                         size_t num_invalid = (boundry - end + internalSlotSize - 1) / internalSlotSize;
                         nextAvailableInternalSlot.fetch_add(num_invalid * internalSlotSize);
@@ -542,6 +544,26 @@ public:
         }
 
         memset(ptr_array, 0, sizeof(void*) * count);
+    }
+
+    void* GetBaseAddress() {
+        return base;
+    }
+
+    size_t GetPageSize(bool is_leaf) const {
+        FatalAssert(leafObjectSize < UINT32_MAX, LOG_TAG_MEMORY,
+                    "Page size exceeds UINT32_MAX in MemoryPool::GetPageSize()");
+        FatalAssert(leafObjectSize > 0, LOG_TAG_MEMORY,
+                    "Page size is zero in MemoryPool::GetPageSize()");
+        FatalAssert(internalObjectSize < UINT32_MAX, LOG_TAG_MEMORY,
+                    "Page size exceeds UINT32_MAX in MemoryPool::GetPageSize()");
+        FatalAssert(internalObjectSize > 0, LOG_TAG_MEMORY,
+                    "Page size is zero in MemoryPool::GetPageSize()");
+        return is_leaf ? leafObjectSize : internalObjectSize;
+    }
+
+    size_t GetPoolSize() const {
+        return poolSize;
     }
 
 protected:

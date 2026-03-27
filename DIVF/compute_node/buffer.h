@@ -4,11 +4,21 @@
 #include "common.h"
 #include "debug.h"
 
-#include "utils/single_page_memory_pool.h"
+#include "utils/memory_pool.h"
 #include "utils/rdma_manager.h"
 #include "utils/concurrent_datastructures.h"
 
 namespace divftree {
+
+struct IndexMeta {
+    IndexType type;
+    uint32_t num_points;
+    uint8_t num_levels;
+    std::vector<CentroidData> top_centroids;
+
+    uint32_t leaf_size_cap;
+    uint32_t internal_size_cap;
+};
 
 enum class BufferEntryState : uint8_t {
     BUFFER_ENTRY_CACHED,
@@ -27,6 +37,25 @@ struct MemoryStatsNode {
     MemoryStatsNode() : num_allocated_pages(0), num_bytes_in_use(0), next(nullptr) {}
 };
 
+inline size_t ComputeClusterSize(bool is_leaf, uint32_t num_elements) {
+    return ALIGNED_SIZE((size_t)(num_elements) * (is_leaf ? sizeof(VectorData) : sizeof(CentroidData))) +
+           ALIGNED_SIZE(sizeof(ClusterHeaderData));
+}
+
+inline size_t ComputeSubClusterSize(bool is_leaf, bool first_page, bool has_single_page, uint32_t num_elements_in_page) {
+    if (has_single_page) {
+        FatalAssert(first_page, LOG_TAG_BUFFER, "if the cluster has a single page then this should be the first page!");
+        return ComputeClusterSize(is_leaf, num_elements_in_page);
+    }
+
+    if (first_page) {
+        return ALIGNED_SIZE(sizeof(ClusterHeaderData)) +
+               (size_t)(num_elements_in_page) * (is_leaf ? sizeof(VectorData) : sizeof(CentroidData));
+    }
+
+    return (size_t)(num_elements_in_page) * (is_leaf ? sizeof(VectorData) : sizeof(CentroidData));
+}
+
 struct BufferEntry {
     SXSpinLock lock;
     size_t pin = 0;
@@ -41,6 +70,8 @@ struct BufferEntry {
     size_t cache_list_idx;
 
     std::vector<IVFSearchTaskFactory*> pending;
+
+    VectorID id;
 #ifdef ENABLE_STAT_COLLECTION
     size_t num_read_local = 0;
     size_t num_read_remote_in_progress = 0;
@@ -52,25 +83,31 @@ struct BufferEntry {
     size_t num_evicted = 0;
 #endif
 
-    BufferEntry(uintptr_t raddr, size_t size_bytes, size_t page_size, uint16_t dimension, bool is_leaf) :
+    BufferEntry(VectorID cluster_id, uintptr_t raddr, size_t size_bytes, size_t num_elements, size_t page_size) :
         state(BufferEntryState::BUFFER_ENTRY_EVICTED),
-        remote_addr(raddr), total_size_bytes(size_bytes) {
+        remote_addr(raddr), total_size_bytes(size_bytes), id(cluster_id) {
         FatalAssert(page_size > 0, LOG_TAG_BUFFER,
                     "Page size must be greater than 0 in BufferEntry constructor");
+        FatalAssert(id.IsCentroid(), LOG_TAG_BUFFER, "cannot create a buffer entry for raw vectors.");
+        const bool is_leaf = id.IsLeaf();
         /* todo: alignment */
-        size_t element_size = (is_leaf ? sizeof(IVFVectorID) : sizeof(VectorID)) + sizeof(VTYPE) * dimension;
-        size_t num_vectors_per_page = page_size / element_size;
-        FatalAssert(total_size_bytes % element_size == 0, LOG_TAG_BUFFER,
+        FatalAssert(page_size > ALIGNED_SIZE(sizeof(ClusterHeaderData)), LOG_TAG_BUFFER,
+                    "Page size must be greater than cluster header size in BufferEntry constructor");
+        size_t raw_data_size = page_size - ALIGNED_SIZE(sizeof(ClusterHeaderData));
+        size_t element_size = (is_leaf ? sizeof(VectorData) : sizeof(CentroidData));
+        size_t num_vectors_per_page = raw_data_size / element_size;
+        FatalAssert(num_vectors_per_page > 0, LOG_TAG_BUFFER,
+                    "Page size must be large enough to hold at least one vector in BufferEntry constructor");
+        FatalAssert(total_size_bytes == ComputeClusterSize(id.IsLeaf(), num_elements), LOG_TAG_BUFFER,
                     "Cluster size is not aligned with vector size in BufferEntry constructor");
-        size_t total_num_vectors = total_size_bytes / element_size;
-        num_pages = (total_num_vectors + num_vectors_per_page - 1) / num_vectors_per_page;
+        num_pages = (num_elements + num_vectors_per_page - 1) / num_vectors_per_page;
         FatalAssert(num_pages <= MAX_NUM_PAGE_PER_CLUSTER, LOG_TAG_BUFFER,
                     "Cluster requires more than MAX_NUM_PAGE_PER_CLUSTER pages in BufferEntry constructor");
-        FatalAssert(total_num_vectors > 0, LOG_TAG_BUFFER,
+        FatalAssert(num_elements > 0, LOG_TAG_BUFFER,
                     "Cluster must contain at least one vector in BufferEntry constructor");
         for (size_t p = 0; p < num_pages; ++p) {
             if (p == num_pages - 1) {
-                page_num_elements[p] = total_num_vectors - (num_vectors_per_page * p);
+                page_num_elements[p] = num_elements - (num_vectors_per_page * p);
             } else {
                 page_num_elements[p] = num_vectors_per_page;
             }
@@ -87,6 +124,7 @@ struct BufferEntry {
         total_size_bytes = other.total_size_bytes;
         cache_list_idx = other.cache_list_idx;
         pending = std::move(other.pending);
+        id = other.id;
         for (size_t p = 0; p < num_pages; ++p) {
             pages[p] = other.pages[p];
             page_num_elements[p] = other.page_num_elements[p];
@@ -109,6 +147,7 @@ struct BufferEntry {
         total_size_bytes = other.total_size_bytes;
         cache_list_idx = other.cache_list_idx;
         pending = std::move(other.pending);
+        id = other.id;
         for (size_t p = 0; p < num_pages; ++p) {
             pages[p] = other.pages[p];
             page_num_elements[p] = other.page_num_elements[p];
@@ -121,21 +160,19 @@ struct BufferEntry {
     }
 };
 
-class CacheMetaContainer {
+class CacheMetaContainerDetail {
 public:
-    CacheMetaContainer(size_t capacity, size_t num_buckets, MemoryPool* pool) :
+    CacheMetaContainerDetail(size_t capacity, size_t num_buckets, LocalMemoryPool& pool) :
         _num_buckets(num_buckets), _bucket_cap(std::max((size_t)1, capacity / num_buckets)),
         _page_pool(pool), _hash(PtrHash<BufferEntry>()),
         _num_hot_entries(0) {
         FatalAssert(capacity > 0, LOG_TAG_BUFFER,
-                    "CacheMetaContainer capacity must be greater than 0");
+                    "CacheMetaContainerDetail capacity must be greater than 0");
         FatalAssert(num_buckets > 0, LOG_TAG_BUFFER,
-                    "CacheMetaContainer num_buckets must be greater than 0");
+                    "CacheMetaContainerDetail num_buckets must be greater than 0");
         FatalAssert(capacity >= num_buckets,
                     LOG_TAG_BUFFER,
-                    "CacheMetaContainer capacity must be at least num_buckets");
-        FatalAssert(pool != nullptr, LOG_TAG_BUFFER,
-                    "CacheMetaContainer memory pool cannot be null");
+                    "CacheMetaContainerDetail capacity must be at least num_buckets");
 
         _hot_entries = new std::vector<BufferEntry*>[num_buckets];
         _cooling_entries = new BufferEntry*[capacity];
@@ -145,7 +182,7 @@ public:
         _locks = new SXSpinLock[num_buckets];
     }
 
-    ~CacheMetaContainer() {
+    ~CacheMetaContainerDetail() {
         delete[] _hot_entries;
         delete[] _cooling_entries;
         delete[] _cooling_bucket_next_idx;
@@ -154,7 +191,7 @@ public:
 
     bool TryLockAndPinEntry(BufferEntry* entry) {
         FatalAssert(entry != nullptr, LOG_TAG_BUFFER,
-                    "Cannot pin a null entry in CacheMetaContainer");
+                    "Cannot pin a null entry in CacheMetaContainerDetail");
         size_t hash_value = _hash(entry);
         size_t bucket_idx = hash_value % _num_buckets;
         _locks[bucket_idx].Lock(SX_EXCLUSIVE);
@@ -165,12 +202,12 @@ public:
 
         entry->pin += entry->num_pages;
         FatalAssert(entry->pin >= entry->num_pages, LOG_TAG_BUFFER,
-                    "Pin count overflow in CacheMetaContainer::TryLockAndPinEntry()");
+                    "Pin count overflow in CacheMetaContainerDetail::TryLockAndPinEntry()");
         if (entry->pin > entry->num_pages) {
             FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED ||
                         entry->state == BufferEntryState::BUFFER_ENTRY_LOADING,
                         LOG_TAG_BUFFER,
-                        "Pinned entry must be in CACHED state in CacheMetaContainer::TryLockAndPinEntry()");
+                        "Pinned entry must be in CACHED state in CacheMetaContainerDetail::TryLockAndPinEntry()");
             _locks[bucket_idx].Unlock();
             return true;
         }
@@ -178,10 +215,10 @@ public:
         if (entry->state == BufferEntryState::BUFFER_ENTRY_CACHED) {
             FatalAssert(_hot_entries[bucket_idx].size() > entry->cache_list_idx,
                         LOG_TAG_BUFFER,
-                        "Pinned entry's cache list index is out of bounds in CacheMetaContainer::TryLockAndPinEntry()");
+                        "Pinned entry's cache list index is out of bounds in CacheMetaContainerDetail::TryLockAndPinEntry()");
             FatalAssert(entry == _hot_entries[bucket_idx][entry->cache_list_idx],
                         LOG_TAG_BUFFER,
-                        "Pinned entry must be in hot entries list in CacheMetaContainer::TryLockAndPinEntry()");
+                        "Pinned entry must be in hot entries list in CacheMetaContainerDetail::TryLockAndPinEntry()");
             if (entry->cache_list_idx != _hot_entries[bucket_idx].size() - 1) {
                 BufferEntry* last_entry = _hot_entries[bucket_idx].back();
                 _hot_entries[bucket_idx][entry->cache_list_idx] = last_entry;
@@ -193,11 +230,11 @@ public:
             size_t idx = entry->cache_list_idx;
             FatalAssert(_cooling_entries[idx] == entry,
                         LOG_TAG_BUFFER,
-                        "Pinned entry must be in cooling entries list in CacheMetaContainer::TryLockAndPinEntry()");
+                        "Pinned entry must be in cooling entries list in CacheMetaContainerDetail::TryLockAndPinEntry()");
             FatalAssert(idx >= bucket_idx * _bucket_cap &&
                         idx < (bucket_idx + 1) * _bucket_cap,
                         LOG_TAG_BUFFER,
-                        "Pinned entry's cache list index is out of bounds in CacheMetaContainer::TryLockAndPinEntry()");
+                        "Pinned entry's cache list index is out of bounds in CacheMetaContainerDetail::TryLockAndPinEntry()");
             size_t last_b_idx = (_cooling_bucket_next_idx[bucket_idx] == 0 ? _bucket_cap - 1 :
                                                                              _cooling_bucket_next_idx[bucket_idx] - 1);
             size_t last_idx = bucket_idx * _bucket_cap + last_b_idx;
@@ -216,7 +253,7 @@ public:
         } else {
             FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_EVICTED,
                         LOG_TAG_BUFFER,
-                        "Pinned entry must be in EVICTED state in CacheMetaContainer::TryLockAndPinEntry()");
+                        "Pinned entry must be in EVICTED state in CacheMetaContainerDetail::TryLockAndPinEntry()");
         }
         _locks[bucket_idx].Unlock();
         return true;
@@ -225,10 +262,10 @@ public:
     void UnpinEntry(BufferEntry* entry) {
         CHECK_NOT_NULLPTR(entry, LOG_TAG_BUFFER);
         FatalAssert(entry->pin > 0, LOG_TAG_BUFFER,
-                    "Cannot unpin an entry with pin count 0 in CacheMetaContainer::UnpinEntry()");
+                    "Cannot unpin an entry with pin count 0 in CacheMetaContainerDetail::UnpinEntry()");
         FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED,
                     LOG_TAG_BUFFER,
-                    "Unpinned entry must be in CACHED state in CacheMetaContainer::UnpinEntry()");
+                    "Unpinned entry must be in CACHED state in CacheMetaContainerDetail::UnpinEntry()");
         size_t hash_value = _hash(entry);
         size_t bucket_idx = hash_value % _num_buckets;
         _locks[bucket_idx].Lock(SX_EXCLUSIVE);
@@ -246,12 +283,12 @@ public:
     size_t TryMoveToCooling(uint64_t num_pages, void** freed_pages, size_t max_pages_needed, size_t& bytes_freed,
                             size_t& pages_freed) {
         FatalAssert(num_pages > 0, LOG_TAG_BUFFER,
-                    "num_pages must be greater than 0 in CacheMetaContainer::TryMoveToCooling()");
+                    "num_pages must be greater than 0 in CacheMetaContainerDetail::TryMoveToCooling()");
         FatalAssert(num_pages <= ((_num_buckets * _bucket_cap) / 2), LOG_TAG_BUFFER,
-                    "num_pages exceeds total capacity in CacheMetaContainer::TryMoveToCooling()");
+                    "num_pages exceeds total capacity in CacheMetaContainerDetail::TryMoveToCooling()");
         CHECK_NOT_NULLPTR(freed_pages, LOG_TAG_BUFFER);
         FatalAssert(max_pages_needed > 0, LOG_TAG_BUFFER,
-                    "max_pages_needed must be greater than 0 in CacheMetaContainer::TryMoveToCooling()");
+                    "max_pages_needed must be greater than 0 in CacheMetaContainerDetail::TryMoveToCooling()");
 
         /* todo: check stats */
         size_t num_cooling = 0;
@@ -289,13 +326,13 @@ public:
             _hot_entries[bucket_idx].pop_back();
             _num_hot_entries.fetch_sub(1);
             FatalAssert(entry != nullptr, LOG_TAG_BUFFER,
-                        "Hot entry is null in CacheMetaContainer::TryMoveToCooling()");
+                        "Hot entry is null in CacheMetaContainerDetail::TryMoveToCooling()");
             FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED,
                         LOG_TAG_BUFFER,
-                        "Hot entry is not in CACHED state in CacheMetaContainer::TryMoveToCooling()");
+                        "Hot entry is not in CACHED state in CacheMetaContainerDetail::TryMoveToCooling()");
             FatalAssert(entry->pin == 0,
                         LOG_TAG_BUFFER,
-                        "Hot entry is pinned in CacheMetaContainer::TryMoveToCooling()");
+                        "Hot entry is pinned in CacheMetaContainerDetail::TryMoveToCooling()");
             entry->lock.Lock(SX_EXCLUSIVE);
 
             // move to cooling list
@@ -304,10 +341,10 @@ public:
             if (_cooling_entries[idx] != nullptr) {
                 FatalAssert(_cooling_entries[idx]->state == BufferEntryState::BUFFER_ENTRY_COOLING,
                             LOG_TAG_BUFFER,
-                            "Cooling entry slot is occupied by a non-cooling entry in CacheMetaContainer::TryMoveToCooling()");
+                            "Cooling entry slot is occupied by a non-cooling entry in CacheMetaContainerDetail::TryMoveToCooling()");
                 FatalAssert(_cooling_entries[idx]->pin == 0,
                             LOG_TAG_BUFFER,
-                            "Cooling entry slot is occupied by a pinned entry in CacheMetaContainer::TryMoveToCooling()");
+                            "Cooling entry slot is occupied by a pinned entry in CacheMetaContainerDetail::TryMoveToCooling()");
                 _cooling_entries[idx]->state = BufferEntryState::BUFFER_ENTRY_EVICTED;
 #ifdef ENABLE_STAT_COLLECTION
                 (entry->num_moved_to_cool)++;
@@ -320,12 +357,12 @@ public:
                         freed_pages[num_freed++] = _cooling_entries[idx]->pages[p];
                     }
                     if (num_needed < _cooling_entries[idx]->num_pages) {
-                        _page_pool->BatchFree(_cooling_entries[idx]->pages + num_needed,
-                                              _cooling_entries[idx]->num_pages - num_needed);
+                        _page_pool.BatchFree(_cooling_entries[idx]->pages + num_needed,
+                                             _cooling_entries[idx]->num_pages - num_needed);
                         pages_freed += (_cooling_entries[idx]->num_pages - num_needed);
                     }
                 } else {
-                    _page_pool->BatchFree(_cooling_entries[idx]->pages, _cooling_entries[idx]->num_pages);
+                    _page_pool.BatchFree(_cooling_entries[idx]->pages, _cooling_entries[idx]->num_pages);
                     pages_freed += _cooling_entries[idx]->num_pages;
                 }
             }
@@ -342,22 +379,18 @@ public:
         return num_freed;
     }
 
-    inline size_t NumHotEntries() {
-        return _num_hot_entries.load(std::memory_order_acquire);
-    }
-
     inline void FreeAll() {
         for (size_t i = 0; i < _num_buckets; ++i) {
             _locks[i].Lock(SX_EXCLUSIVE);
             for (BufferEntry* entry : _hot_entries[i]) {
                 FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED,
                             LOG_TAG_BUFFER,
-                            "Hot entry must be in CACHED state in CacheMetaContainer::FreeAll()");
+                            "Hot entry must be in CACHED state in CacheMetaContainerDetail::FreeAll()");
                 FatalAssert(entry->pin == 0,
                             LOG_TAG_BUFFER,
-                            "Hot entry must be unpinned in CacheMetaContainer::FreeAll()");
+                            "Hot entry must be unpinned in CacheMetaContainerDetail::FreeAll()");
                 entry->state = BufferEntryState::BUFFER_ENTRY_EVICTED;
-                _page_pool->BatchFree(entry->pages, entry->num_pages);
+                _page_pool.BatchFree(entry->pages, entry->num_pages);
             }
             _hot_entries[i].clear();
             _locks[i].Unlock();
@@ -366,12 +399,12 @@ public:
             if (_cooling_entries[i] != nullptr) {
                 FatalAssert(_cooling_entries[i]->state == BufferEntryState::BUFFER_ENTRY_COOLING,
                             LOG_TAG_BUFFER,
-                            "Cooling entry must be in COOLING state in CacheMetaContainer::FreeAll()");
+                            "Cooling entry must be in COOLING state in CacheMetaContainerDetail::FreeAll()");
                 FatalAssert(_cooling_entries[i]->pin == 0,
                             LOG_TAG_BUFFER,
-                            "Cooling entry must be unpinned in CacheMetaContainer::FreeAll()");
+                            "Cooling entry must be unpinned in CacheMetaContainerDetail::FreeAll()");
                 _cooling_entries[i]->state = BufferEntryState::BUFFER_ENTRY_EVICTED;
-                _page_pool->BatchFree(_cooling_entries[i]->pages, _cooling_entries[i]->num_pages);
+                _page_pool.BatchFree(_cooling_entries[i]->pages, _cooling_entries[i]->num_pages);
                 _cooling_entries[i] = nullptr;
             }
         }
@@ -380,7 +413,7 @@ public:
 protected:
     const size_t _num_buckets;
     const size_t _bucket_cap;
-    MemoryPool* _page_pool;
+    LocalMemoryPool& _page_pool;
     PtrHash<BufferEntry> _hash;
 
     std::atomic<size_t> _num_hot_entries;
@@ -390,16 +423,86 @@ protected:
     SXSpinLock* _locks;
 };
 
+class CacheMetaContainer {
+public:
+    static constexpr double COOLING_SIZE_RATIO = 0.2;
+
+    CacheMetaContainer(size_t pool_bytes, size_t page_bytes, size_t num_buckets, LocalMemoryPool& pool) :
+        _leaf_meta_container(new CacheMetaContainerDetail(
+            std::max((size_t)((pool_bytes / page_bytes) * COOLING_SIZE_RATIO), 1lu),
+            num_buckets, pool)), _internal_meta_container(nullptr) {}
+
+    CacheMetaContainer(size_t pool_bytes, size_t leaf_bytes, size_t internal_bytes,
+                       size_t num_buckets, LocalMemoryPool& pool) :
+        _leaf_meta_container(new CacheMetaContainerDetail(
+            std::max((size_t)((pool_bytes / leaf_bytes) * COOLING_SIZE_RATIO), 1lu),
+            num_buckets, pool)),
+        _internal_meta_container(new CacheMetaContainerDetail(
+            std::max((size_t)((pool_bytes / internal_bytes) * COOLING_SIZE_RATIO), 1lu),
+            num_buckets, pool)) {}
+
+    ~CacheMetaContainer() {
+        CHECK_NOT_NULLPTR(_leaf_meta_container, LOG_TAG_BUFFER);
+        delete _leaf_meta_container;
+        if (_internal_meta_container != nullptr) {
+            delete _internal_meta_container;
+        }
+    }
+
+    bool TryLockAndPinEntry(BufferEntry* entry) {
+        CHECK_NOT_NULLPTR(entry, LOG_TAG_BUFFER);
+        CHECK_NOT_NULLPTR(_leaf_meta_container, LOG_TAG_BUFFER);
+        if (entry->id.IsLeaf()) {
+            return _leaf_meta_container->TryLockAndPinEntry(entry);
+        }
+        CHECK_NOT_NULLPTR(_internal_meta_container, LOG_TAG_BUFFER);
+        return _internal_meta_container->TryLockAndPinEntry(entry);
+    }
+
+    void UnpinEntry(BufferEntry* entry) {
+        CHECK_NOT_NULLPTR(entry, LOG_TAG_BUFFER);
+        CHECK_NOT_NULLPTR(_leaf_meta_container, LOG_TAG_BUFFER);
+        if (entry->id.IsLeaf()) {
+            return _leaf_meta_container->UnpinEntry(entry);
+        }
+        CHECK_NOT_NULLPTR(_internal_meta_container, LOG_TAG_BUFFER);
+        return _internal_meta_container->UnpinEntry(entry);
+    }
+
+    size_t TryMoveToCooling(uint64_t num_pages, void** freed_pages, size_t max_pages_needed, size_t& bytes_freed,
+                            size_t& pages_freed, bool is_leaf) {
+        CHECK_NOT_NULLPTR(_leaf_meta_container, LOG_TAG_BUFFER);
+        if (is_leaf) {
+            return _leaf_meta_container->TryMoveToCooling(num_pages, freed_pages, max_pages_needed,
+                                                          bytes_freed, pages_freed);
+        }
+        CHECK_NOT_NULLPTR(_internal_meta_container, LOG_TAG_BUFFER);
+        return _internal_meta_container->TryMoveToCooling(num_pages, freed_pages, max_pages_needed,
+                                                          bytes_freed, pages_freed);
+    }
+
+    inline void FreeAll() {
+        CHECK_NOT_NULLPTR(_leaf_meta_container, LOG_TAG_BUFFER);
+        _leaf_meta_container->FreeAll();
+        if (_internal_meta_container != nullptr) {
+            _internal_meta_container->FreeAll();
+        }
+    }
+
+protected:
+    CacheMetaContainerDetail* _leaf_meta_container;
+    CacheMetaContainerDetail* _internal_meta_container;
+};
+
 class BufferMgr {
 public:
     /* constructs the memory pool and connection manager + connects to MNs + gets the metadata */
     static RetStatus Init(size_t page_size, size_t pool_size, BlockingQueue<IVFSearchTask*>* search_task_queue,
-                          uint16_t dim, size_t num_user_threads,
-                          ClusterMeta*& centroids, VTYPE*& centroid_data, size_t& num_centroids) {
+                          size_t num_user_threads, IndexMeta& index_meta) {
         FatalAssert(instance == nullptr, LOG_TAG_BUFFER,
                     "BufferMgr is already initialized!");
-        instance = new BufferMgr(page_size, pool_size, search_task_queue, dim,
-                                 num_user_threads, centroids, centroid_data, num_centroids);
+        instance = new BufferMgr(page_size, pool_size, search_task_queue,
+                                 num_user_threads, index_meta);
         return RetStatus::Success();
     }
 
@@ -430,7 +533,7 @@ public:
         BufferEntry& entry = it->second;
         FatalAssert(entry.pin > 0, LOG_TAG_BUFFER,
                     "Cannot unpin a cluster with pin count 0 in BufferMgr::UnpinCluster()");
-        _cache_meta_container.UnpinEntry(&entry);
+        _cache_meta_container->UnpinEntry(&entry);
     }
 
     RetStatus PrefetchClustersForSearch(const VectorID* cluster_ids, size_t num_clusters,
@@ -448,7 +551,11 @@ public:
 
         std::vector<size_t> current_indices;
         current_indices.reserve(num_clusters);
+        uint8_t level = cluster_ids[0]._level;
+        bool is_leaf = cluster_ids[0].IsLeaf();
         for (size_t i = 0; i < num_clusters; ++i) {
+            FatalAssert(cluster_ids[i]._level == level, LOG_TAG_BUFFER,
+                        "All cluster IDs must be on the same level in BufferMgr::PrefetchClusters()");
             auto it = _buffer_map.find(cluster_ids[i]);
             FatalAssert(it != _buffer_map.end(), LOG_TAG_BUFFER,
                         "Cluster ID not found in BufferMgr::PrefetchClusters()");
@@ -460,7 +567,6 @@ public:
         in_cache_tasks.reserve(task_factory->num_sibling_tasks);
         std::vector<VectorID> to_load;
         to_load.reserve(num_clusters);
-        size_t element_size = (task_factory->is_leaf ? sizeof(IVFVectorID) : sizeof(VectorID)) + sizeof(VTYPE) * _dim;
         std::vector<size_t> remaining;
         remaining.reserve(num_clusters);
         size_t num_pages_to_load = 0;
@@ -468,7 +574,9 @@ public:
             for (size_t i : current_indices) {
                 auto it = _buffer_map.find(cluster_ids[i]);
                 BufferEntry& entry = it->second;
-                if (!_cache_meta_container.TryLockAndPinEntry(&entry)) {
+                FatalAssert(entry.id == cluster_ids[i], LOG_TAG_BUFFER,
+                            "BufferEntry ID does not match cluster ID in BufferMgr::PrefetchClusters()");
+                if (!_cache_meta_container->TryLockAndPinEntry(&entry)) {
                     remaining.push_back(i);
                     continue;
                 }
@@ -506,13 +614,23 @@ public:
                                     "Page must contain at least one element in BufferMgr::PrefetchClusters()");
                         FatalAssert(entry.pages[p] != nullptr, LOG_TAG_BUFFER,
                                     "Page pointer cannot be null in BufferMgr::PrefetchClusters()");
-                        FatalAssert(entry.page_num_elements[p] * element_size <= _cache.GetPageSize(),
+                        FatalAssert(ComputeSubClusterSize(is_leaf, p == 0, entry.num_pages == 1,
+                                                          entry.page_num_elements[p]) <= _cache->GetPageSize(is_leaf),
                                     LOG_TAG_BUFFER,
                                     "Page size is smaller than number of elements in BufferMgr::PrefetchClusters()");
+                        void* data_ptr = nullptr;
+                        if (p == 0) {
+                            IVFCluster* cluster = reinterpret_cast<IVFCluster*>(entry.pages[p]);
+                            FatalAssert(cluster->header.id == entry.id, LOG_TAG_BUFFER,
+                                        "Cluster header ID does not match entry ID in BufferMgr::PrefetchClusters()");
+                            data_ptr = cluster->data;
+                        } else {
+                            data_ptr = entry.pages[p];
+                        }
                         IVFSearchTask* task = task_factory->CreateTask(
                             cluster_ids[i],
                             entry.page_num_elements[p],
-                            reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(entry.pages[p])));
+                            data_ptr);
                         in_cache_tasks.push_back(task);
                     }
                     entry.lock.Unlock();
@@ -538,7 +656,7 @@ public:
         }
 
         if (!to_load.empty()) {
-            status = ReadFromRemote(std::move(to_load), element_size, num_pages_to_load);
+            status = ReadFromRemote(std::move(to_load), num_pages_to_load);
             FatalAssert(status.IsOK(), LOG_TAG_BUFFER,
                         "Failed to issue RDMA reads in BufferMgr::PrefetchClusters(): %s",
                         status.Msg());
@@ -569,6 +687,8 @@ public:
             FatalAssert(it != _buffer_map.end(), LOG_TAG_BUFFER,
                         "Cluster ID not found in BufferMgr::PollRemoteReads()");
             BufferEntry& entry = it->second;
+            FatalAssert(entry.id == cluster_id, LOG_TAG_BUFFER,
+                        "BufferEntry ID does not match cluster ID in BufferMgr::PollRemoteReads()");
             entry.lock.Lock(SX_EXCLUSIVE);
             FatalAssert(entry.state == BufferEntryState::BUFFER_ENTRY_LOADING, LOG_TAG_BUFFER,
                         "BufferEntry must be in LOADING state in BufferMgr::PollRemoteReads()");
@@ -577,22 +697,31 @@ public:
             FatalAssert(entry.pin > 0, LOG_TAG_BUFFER,
                         "BufferEntry must be pinned in BufferMgr::PollRemoteReads()");
             entry.state = BufferEntryState::BUFFER_ENTRY_CACHED;
+            bool is_leaf = cluster_id.IsLeaf();
 
             for (IVFSearchTaskFactory* task_factory : entry.pending) {
-                size_t element_size = (task_factory->is_leaf ? sizeof(IVFVectorID) : sizeof(VectorID)) + sizeof(VTYPE) * _dim;
-                UNUSED_VARIABLE(element_size);
                 for (size_t p = 0; p < entry.num_pages; ++p) {
                     FatalAssert(entry.page_num_elements[p] > 0, LOG_TAG_BUFFER,
                                 "Page must contain at least one element in BufferMgr::PollRemoteReads()");
                     FatalAssert(entry.pages[p] != nullptr, LOG_TAG_BUFFER,
                                 "Page pointer cannot be null in BufferMgr::PollRemoteReads()");
-                    FatalAssert(entry.page_num_elements[p] * element_size <= _cache.GetPageSize(),
+                    FatalAssert(ComputeSubClusterSize(is_leaf, p == 0, entry.num_pages == 1,
+                                                      entry.page_num_elements[p]) <= _cache->GetPageSize(is_leaf),
                                 LOG_TAG_BUFFER,
                                 "Page size is smaller than number of elements in BufferMgr::PollRemoteReads()");
+                    void* data_ptr = nullptr;
+                    if (p == 0) {
+                        IVFCluster* cluster = reinterpret_cast<IVFCluster*>(entry.pages[p]);
+                        FatalAssert(cluster->header.id == entry.id, LOG_TAG_BUFFER,
+                                    "Cluster header ID does not match entry ID in BufferMgr::PrefetchClusters()");
+                        data_ptr = cluster->data;
+                    } else {
+                        data_ptr = entry.pages[p];
+                    }
                     IVFSearchTask* task = task_factory->CreateTask(
                         cluster_id,
                         entry.page_num_elements[p],
-                        reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(entry.pages[p])));
+                        data_ptr);
                     new_tasks.push_back(task);
                 }
 
@@ -685,14 +814,10 @@ public:
     }
 
 protected:
-    static constexpr double COOLING_SIZE_RATIO = 0.2;
 
-    BufferMgr(size_t page_size, size_t pool_size, BlockingQueue<IVFSearchTask*>* search_task_queue, uint16_t dim,
-              size_t num_user_threads, ClusterMeta*& centroids, VTYPE*& centroid_data,
-              size_t& num_centroids) :
-        _dim(dim), _cache(page_size, pool_size),
-        _cache_meta_container(std::max((size_t)((pool_size / page_size) * COOLING_SIZE_RATIO), 1lu),
-                              num_user_threads * 2, &_cache),
+    BufferMgr(size_t page_size, size_t pool_size, BlockingQueue<IVFSearchTask*>* search_task_queue,
+              size_t num_user_threads, IndexMeta& index_meta) :
+        _cache(nullptr), _cache_meta_container(nullptr),
         _search_task_queue(search_task_queue) {
         FatalAssert(_search_task_queue != nullptr, LOG_TAG_BUFFER,
                     "search_task_queue cannot be null in BufferMgr constructor");
@@ -700,18 +825,63 @@ protected:
                     "num_user_threads must be greater than 0 in BufferMgr constructor");
         FatalAssert(IS_COMPUTE_NODE(), LOG_TAG_BUFFER,
                     "BufferMgr can only be initialized on compute nodes");
-        FatalAssert(page_size > 0, LOG_TAG_BUFFER,
-                    "page_size must be greater than 0 in BufferMgr constructor");
-        FatalAssert(pool_size >= page_size, LOG_TAG_BUFFER,
-                    "pool_size must be at least equal to page_size in BufferMgr constructor");
-        FatalAssert(pool_size % page_size == 0, LOG_TAG_BUFFER,
-                    "pool_size must be multiple of page_size in BufferMgr constructor");
-        FatalAssert(dim > 0, LOG_TAG_BUFFER,
-                    "dim must be greater than 0 in BufferMgr constructor");
-        FatalAssert(centroids == nullptr, LOG_TAG_BUFFER,
-                    "centroids must be null in BufferMgr constructor");
-        FatalAssert(centroid_data == nullptr, LOG_TAG_BUFFER,
-                    "centroid_data must be null in BufferMgr constructor");
+        size_t internal_page_size = 0;
+        size_t leaf_page_size = 0;
+
+        if (index_meta.type == IndexType::IVF_FLAT) {
+            FatalAssert(page_size > 0, LOG_TAG_BUFFER, "page_size cannot be 0");
+            page_size = ALIGNED_SIZE(page_size);
+            FatalAssert(pool_size > page_size, LOG_TAG_BUFFER, "pool_size cannot be 0");
+            pool_size = ALIGNED_SIZE(pool_size, page_size + CACHE_LINE_SIZE);
+            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
+                    "Initializing BufferMgr with IVF_FLAT index. page_size: %zu, pool_size: %zu",
+                    page_size, pool_size);
+            _cache = new LocalMemoryPool(page_size, page_size, pool_size);
+            _cache_meta_container = new CacheMetaContainer(pool_size, page_size, 2 * num_user_threads, *_cache);
+            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
+                    "BufferMgr initialized with IVF_FLAT index. page_size: %zu, pool_size: %zu",
+                    page_size, pool_size);
+        } else if (index_meta.type == IndexType::IVF_CAPPED) {
+            FatalAssert(index_meta.leaf_size_cap > 1, LOG_TAG_BUFFER,
+                        "leaf_size_cap must be greater than 1 for IVF_CAPPED index in BufferMgr constructor");
+            leaf_page_size = ALIGNED_SIZE(ComputeClusterSize(true, index_meta.leaf_size_cap));
+            FatalAssert(pool_size > leaf_page_size, LOG_TAG_BUFFER,
+                        "pool_size must be greater than leaf_page_size for IVF_CAPPED index in BufferMgr constructor");
+            pool_size = ALIGNED_SIZE(pool_size, leaf_page_size + CACHE_LINE_SIZE);
+            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
+                    "Initializing BufferMgr with IVF_CAPPED index. leaf_page_size: %zu, pool_size: %zu",
+                    leaf_page_size, pool_size);
+            _cache = new LocalMemoryPool(leaf_page_size, leaf_page_size, pool_size);
+            _cache_meta_container = new CacheMetaContainer(pool_size, leaf_page_size,
+                                                           2 * num_user_threads, *_cache);
+            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
+                    "BufferMgr initialized with IVF_CAPPED index. page_size: %zu, pool_size: %zu",
+                    leaf_page_size, pool_size);
+        } else {
+            FatalAssert(index_meta.type == IndexType::IVF_TREE, LOG_TAG_BUFFER,
+                        "Unsupported index type in BufferMgr constructor");
+            FatalAssert(index_meta.leaf_size_cap > 1, LOG_TAG_BUFFER,
+                        "leaf_size_cap must be greater than 1 for IVF_TREE index in BufferMgr constructor");
+            FatalAssert(index_meta.internal_size_cap > 1, LOG_TAG_BUFFER,
+                        "internal_size_cap must be greater than 1 for IVF_TREE index in BufferMgr constructor");
+            leaf_page_size = ALIGNED_SIZE(ComputeClusterSize(true, index_meta.leaf_size_cap));
+            internal_page_size = ALIGNED_SIZE(ComputeClusterSize(false, index_meta.internal_size_cap));
+            FatalAssert(pool_size > leaf_page_size + internal_page_size + 2*CACHE_LINE_SIZE,
+                        LOG_TAG_BUFFER,
+                        "pool_size must be greater than the sum of leaf_page_size and internal_page_size for IVF_TREE index in BufferMgr constructor");
+            pool_size = ALIGNED_SIZE(pool_size, std::lcm(leaf_page_size + CACHE_LINE_SIZE,
+                                                         internal_page_size + CACHE_LINE_SIZE));
+            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
+                    "Initializing BufferMgr with IVF_TREE index. leaf_page_size: %zu, internal_page_size: %zu, pool_size: %zu",
+                    leaf_page_size, internal_page_size, pool_size);
+            _cache = new LocalMemoryPool(internal_page_size, leaf_page_size, pool_size);
+            _cache_meta_container = new CacheMetaContainer(pool_size, leaf_page_size, internal_page_size,
+                                                           2 * num_user_threads, *_cache);
+            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
+                    "BufferMgr initialized with IVF_TREE index. leaf_page_size: %zu, internal_page_size: %zu, pool_size: %zu",
+                    leaf_page_size, internal_page_size, pool_size);
+        }
+
         RetStatus status = RetStatus::Success();
         status =
             RDMA_Manager::Initialize(
@@ -735,7 +905,7 @@ protected:
                     status.Msg());
         RDMA_Manager* rdma_mgr = RDMA_Manager::GetInstance();
         CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BUFFER);
-        status = rdma_mgr->RegisterMemory(_cache.GetBaseAddress(), _cache.GetPoolSize());
+        status = rdma_mgr->RegisterMemory(_cache->GetBaseAddress(), _cache->GetPoolSize());
         FatalAssert(status.IsOK(), LOG_TAG_BUFFER,
                     "Failed to register memory in BufferMgr::Init(): %s",
                     status.Msg());
@@ -747,47 +917,118 @@ protected:
         DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
                 "RDMA_Manager initialized successfully in BufferMgr::Init(). Waiting to receive centroids...");
         NodeID mnode_id = rdma_mgr->GetMemoryNodeID();
-        rdma_mgr->ReceiveMessage(mnode_id, &num_centroids, sizeof(num_centroids));
-        FatalAssert(num_centroids > 0, LOG_TAG_BUFFER,
-                    "Number of centroids must be greater than 0 in BufferMgr::Init()");
+        IndexInfo index_info;
+        rdma_mgr->ReceiveMessage(mnode_id, &index_info, sizeof(index_info));
+        FatalAssert(index_info.type == index_meta.type, LOG_TAG_BUFFER,
+                    "Received index type does not match expected index type in BufferMgr::Init()");
+        FatalAssert(index_info.num_points > 0, LOG_TAG_BUFFER,
+                    "Received number of points must be greater than 0 in BufferMgr::Init()");
+        index_meta.num_points = index_info.num_points;
+        if (index_info.type != IndexType::IVF_TREE) {
+            FatalAssert(index_info.type == IndexType::IVF_FLAT || index_info.type == IndexType::IVF_CAPPED, LOG_TAG_BUFFER,
+                        "Received unsupported index type in BufferMgr::Init()");
+            FatalAssert((index_info.type == IndexType::IVF_FLAT && index_info.ivf_flat_info.num_clusters > 0) ||
+                        (index_info.type == IndexType::IVF_CAPPED && index_info.ivf_capped_info.num_clusters > 0 &&
+                         index_info.ivf_capped_info.cluster_capacity > 0 &&
+                         index_info.ivf_capped_info.cluster_capacity == index_meta.leaf_size_cap), LOG_TAG_BUFFER,
+                        "Received number of clusters must be greater than 0 for IVF_FLAT or IVF_CAPPED index in BufferMgr::Init()");
+            index_meta.num_levels = 1;
+            uint32_t num_clusters = 0;
+            if (index_info.type == IndexType::IVF_FLAT) {
+                num_clusters = index_info.ivf_flat_info.num_clusters;
+                FatalAssert(index_info.ivf_flat_info.num_clusters > 0, LOG_TAG_BUFFER,
+                            "Received number of clusters must be greater than 0 for IVF_FLAT index in BufferMgr::Init()");
+            } else {
+                num_clusters = index_info.ivf_capped_info.num_clusters;
+                FatalAssert(index_info.ivf_capped_info.num_clusters > 0 &&
+                            index_info.ivf_capped_info.cluster_capacity > 0 &&
+                            index_info.ivf_capped_info.cluster_capacity == index_meta.leaf_size_cap, LOG_TAG_BUFFER,
+                            "Received number of clusters must be greater than 0 for IVF_CAPPED index in BufferMgr::Init()");
+            }
+            index_meta.top_centroids.resize(num_clusters);
 
-        centroids = new ClusterMeta[num_centroids];
-        centroid_data = new VTYPE[num_centroids * dim];
+            for (uint32_t c = 0; c < num_clusters; ++c) {
+                ClusterMeta cluster_meta;
+                rdma_mgr->ReceiveMessage(mnode_id, &cluster_meta, sizeof(cluster_meta));
+                FatalAssert(cluster_meta.remote_size > 0, LOG_TAG_BUFFER,
+                                "Received remote size must be greater than 0 for IVF_TREE index in BufferMgr::Init()");
+                FatalAssert(cluster_meta.remote_addr != 0, LOG_TAG_BUFFER,
+                            "Received remote address cannot be 0 for IVF_TREE index in BufferMgr::Init()");
+                FatalAssert(cluster_meta.centroid_id._level == 1, LOG_TAG_BUFFER,
+                            "Received centroid ID level does not match expected level for index in BufferMgr::Init()");
+                _buffer_map.emplace(
+                    cluster_meta.centroid_id,
+                    BufferEntry(cluster_meta.centroid_id, cluster_meta.remote_addr, cluster_meta.remote_size,
+                                cluster_meta.num_elements, _cache->GetPageSize(true))
+                );
+                index_meta.top_centroids[c].id = cluster_meta.centroid_id;
+            }
 
-        rdma_mgr->ReceiveMessage(mnode_id, centroids, sizeof(ClusterMeta) * num_centroids);
-        rdma_mgr->ReceiveMessage(mnode_id, centroid_data, sizeof(VTYPE) * num_centroids * dim);
-        SANITY_CHECK(
-        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
-            "Received centroids successfully in BufferMgr::Init(). num_centroids: %zu", num_centroids);
-        );
-        for (size_t c = 0; c < num_centroids; ++c) {
-            SANITY_CHECK(
-                String centroid_info = String(VECTORID_LOG_FMT ": remote_addr: %p, remote_size: %zu data=[",
-                                            VECTORID_LOG(centroids[c].centroid_id),
-                                            (void*)(uintptr_t)(centroids[c].remote_addr),
-                                            centroids[c].remote_size);
-                for (uint16_t d = 0; d < dim; ++d) {
-                    centroid_info += String(VTYPE_FMT "%s", centroid_data[c * dim + d], (d == dim - 1) ? "]" : ", ");
+            for (uint32_t c = 0; c < num_clusters; ++c) {
+                rdma_mgr->ReceiveMessage(mnode_id, &index_meta.top_centroids[c].data,
+                                         sizeof(index_meta.top_centroids[c].data));
+            }
+
+        } else {
+            FatalAssert(index_info.ivf_tree_info.leaf_cluster_capacity == index_meta.leaf_size_cap, LOG_TAG_BUFFER,
+                        "Received leaf cluster capacity does not match expected leaf cluster capacity for IVF_TREE index in BufferMgr::Init()");
+            FatalAssert(index_info.ivf_tree_info.internal_cluster_capacity == index_meta.internal_size_cap, LOG_TAG_BUFFER,
+                        "Received internal cluster capacity does not match expected internal cluster capacity for IVF_TREE index in BufferMgr::Init()");
+            rdma_mgr->ReceiveMessage(mnode_id, &index_meta.num_levels, sizeof(index_meta.num_levels));
+            FatalAssert(index_meta.num_levels > 0, LOG_TAG_BUFFER,
+                        "Received number of levels must be greater than 0 for IVF_TREE index in BufferMgr::Init()");
+            for (uint8_t level_idx = index_meta.num_levels - 1; level_idx != UINT8_MAX; --level_idx) {
+                uint32_t num_clusters = 0;
+                rdma_mgr->ReceiveMessage(mnode_id, &num_clusters, sizeof(num_clusters));
+                FatalAssert(num_clusters > 0, LOG_TAG_BUFFER,
+                            "Received number of clusters must be greater than 0 for each level of IVF_TREE index in BufferMgr::Init()");
+                if (level_idx == index_meta.num_levels  - 1) {
+                    index_meta.top_centroids.resize(num_clusters);
                 }
-                DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER, "Centroid %zu: %s", c, centroid_info.ToCStr());
-            );
-            _buffer_map.emplace(
-                centroids[c].centroid_id,
-                BufferEntry(centroids[c].remote_addr, centroids[c].remote_size, _cache.GetPageSize(), dim, true)
-            );
-        }
 
+                for (uint32_t c = 0; c < num_clusters; ++c) {
+                    ClusterMeta cluster_meta;
+                    rdma_mgr->ReceiveMessage(mnode_id, &cluster_meta, sizeof(cluster_meta));
+                    FatalAssert(cluster_meta.remote_size > 0, LOG_TAG_BUFFER,
+                                "Received remote size must be greater than 0 for IVF_TREE index in BufferMgr::Init()");
+                    FatalAssert(cluster_meta.remote_addr != 0, LOG_TAG_BUFFER,
+                                "Received remote address cannot be 0 for IVF_TREE index in BufferMgr::Init()");
+                    FatalAssert(cluster_meta.centroid_id._level == level_idx + 1, LOG_TAG_BUFFER,
+                                "Received centroid ID level does not match expected level for IVF_TREE index in BufferMgr::Init()");
+                    _buffer_map.emplace(
+                        cluster_meta.centroid_id,
+                        BufferEntry(cluster_meta.centroid_id, cluster_meta.remote_addr, cluster_meta.remote_size,
+                                    cluster_meta.num_elements, _cache->GetPageSize(true))
+                    );
+                    if (level_idx == index_meta.num_levels - 1) {
+                        index_meta.top_centroids[c].id = cluster_meta.centroid_id;
+                    }
+                }
+
+                if (level_idx == index_meta.num_levels - 1) {
+                    for (uint32_t c = 0; c < num_clusters; ++c) {
+                        rdma_mgr->ReceiveMessage(mnode_id, &index_meta.top_centroids[c].data,
+                                                sizeof(index_meta.top_centroids[c].data));
+                    }
+                }
+            }
+        }
     }
 
     ~BufferMgr() {
-        _cache_meta_container.FreeAll();
+        _cache_meta_container->FreeAll();
+        delete _cache_meta_container;
+        delete _cache;
     }
 
-    RetStatus ReadFromRemote(std::vector<VectorID>&& cluster_ids, size_t element_size, size_t num_pages_to_load) {
+    RetStatus ReadFromRemote(std::vector<VectorID>&& cluster_ids, size_t num_pages_to_load) {
         RetStatus status = RetStatus::Success();
         RDMA_Manager* rdma_mgr = RDMA_Manager::GetInstance();
         CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BUFFER);
         NodeID mnode_id = rdma_mgr->GetMemoryNodeID();
+        FatalAssert(!cluster_ids.empty(), LOG_TAG_BUFFER, "id set is empty!");
+        const bool is_leaf = cluster_ids[0].IsLeaf();
+        const SlotType slotType = is_leaf ? SlotType::Leaf : SlotType::Internal;
         bool use_sg = (num_pages_to_load != cluster_ids.size());
         void** local_buffers = new void*[num_pages_to_load];
         size_t num_allocated = 0;
@@ -812,15 +1053,16 @@ protected:
         while (num_allocated < num_pages_to_load) {
             ++num_tries;
             size_t num_to_alloc = num_pages_to_load - num_allocated;
-            size_t current_allocated = _cache_meta_container.TryMoveToCooling(num_to_alloc, local_buffers + num_allocated,
-                                                                    num_to_alloc, bytes_freed_from_cool, num_pages_freed);
+            size_t current_allocated =
+                _cache_meta_container->TryMoveToCooling(num_to_alloc, local_buffers + num_allocated,
+                                                        num_to_alloc, bytes_freed_from_cool, num_pages_freed, is_leaf);
             num_allocated += current_allocated;
             num_from_cool += current_allocated;
             if (num_allocated < num_pages_to_load) {
                 num_to_alloc = num_pages_to_load - num_allocated;
                 current_allocated =
-                    _cache.BatchAllocate(local_buffers + num_allocated, num_to_alloc,
-                                         AllocationFlags{.clear = 0, .non_blocking = 1, .atomic = 0, .unused = 0});
+                    _cache->BatchAllocate(slotType, local_buffers + num_allocated, num_to_alloc,
+                                          AllocationFlags{.clear = 0, .non_blocking = 1, .atomic = 0, .unused = 0});
                 num_from_pool += current_allocated;
                 num_allocated += current_allocated;
             }
@@ -870,6 +1112,8 @@ protected:
             uint32_t* num_sge = new uint32_t[cluster_ids.size()];
             uintptr_t* remote_addrs = new uintptr_t[cluster_ids.size()];
             for (size_t i = 0; i < cluster_ids.size(); ++i) {
+                FatalAssert(is_leaf == cluster_ids[i].IsLeaf(), LOG_TAG_BUFFER,
+                            "All cluster IDs must be of the same type in BufferMgr::ReadFromRemote()");
                 auto it = _buffer_map.find(cluster_ids[i]);
                 FatalAssert(it != _buffer_map.end(), LOG_TAG_BUFFER,
                             "Cluster ID not found in BufferMgr::ReadFromRemote()");
@@ -880,10 +1124,11 @@ protected:
                 sizes[i] = new uint32_t[entry.num_pages];
                 for (size_t p = 0; p < entry.num_pages; ++p) {
                     entry.pages[p] = local_buffers[num_used + p];
-                    sizes[i][p] = entry.page_num_elements[p] * element_size;
+                    sizes[i][p] = ComputeSubClusterSize(is_leaf, p == 0,
+                                                        entry.num_pages == 1, entry.page_num_elements[p]);
                     FatalAssert(sizes[i][p] > 0, LOG_TAG_BUFFER,
                                 "Page size must be greater than 0 in BufferMgr::ReadFromRemote()");
-                    FatalAssert(sizes[i][p] <= _cache.GetPageSize(), LOG_TAG_BUFFER,
+                    FatalAssert(sizes[i][p] <= _cache->GetPageSize(is_leaf), LOG_TAG_BUFFER,
                                 "Page size is smaller than number of elements in BufferMgr::ReadFromRemote()");
                 }
                 num_used += entry.num_pages;
@@ -903,24 +1148,26 @@ protected:
             uintptr_t* remote_addrs = new uintptr_t[cluster_ids.size()];
             uint32_t* sizes = new uint32_t[cluster_ids.size()];
             for (size_t i = 0; i < cluster_ids.size(); ++i) {
+                FatalAssert(is_leaf == cluster_ids[i].IsLeaf(), LOG_TAG_BUFFER,
+                            "All cluster IDs must be of the same type in BufferMgr::ReadFromRemote()");
                 auto it = _buffer_map.find(cluster_ids[i]);
                 FatalAssert(it != _buffer_map.end(), LOG_TAG_BUFFER,
                             "Cluster ID not found in BufferMgr::ReadFromRemote()");
                 BufferEntry& entry = it->second;
                 remote_addrs[i] = entry.remote_addr;
                 sizes[i] = entry.total_size_bytes;
-                FatalAssert(sizes[i] <= _cache.GetPageSize() * entry.num_pages, LOG_TAG_BUFFER,
+                FatalAssert(sizes[i] <= _cache->GetPageSize(is_leaf) * entry.num_pages, LOG_TAG_BUFFER,
                             "Total cluster size exceeds allocated pages in BufferMgr::ReadFromRemote()");
                 FatalAssert(sizes[i] > 0, LOG_TAG_BUFFER,
                             "Cluster size must be greater than 0 in BufferMgr::ReadFromRemote()");
                 FatalAssert(entry.num_pages == 1, LOG_TAG_BUFFER,
                             "Cluster with multiple pages must use scatter-gather RDMA read in BufferMgr::ReadFromRemote()");
-                FatalAssert(entry.page_num_elements[0] * element_size == sizes[i], LOG_TAG_BUFFER,
+                FatalAssert(ComputeClusterSize(is_leaf, entry.page_num_elements[0]) == sizes[i], LOG_TAG_BUFFER,
                             "Cluster size does not match number of elements in BufferMgr::ReadFromRemote()");
                 entry.pages[0] = local_buffers[i];
             }
             status = rdma_mgr->RDMARead(mnode_id, local_buffers, remote_addrs, sizes,
-                                       cluster_ids.size(), std::move(cluster_ids));
+                                        cluster_ids.size(), std::move(cluster_ids));
             FatalAssert(status.IsOK(), LOG_TAG_BUFFER,
                         "Failed to issue RDMA read in BufferMgr::ReadFromRemote(): %s",
                         status.Msg());
@@ -933,10 +1180,9 @@ protected:
     }
 
     inline static BufferMgr* instance;
-    const uint16_t _dim;
-    MemoryPool _cache;
+    LocalMemoryPool* _cache;
+    CacheMetaContainer* _cache_meta_container;
     std::unordered_map<VectorID, BufferEntry, VectorIDHash> _buffer_map;
-    CacheMetaContainer _cache_meta_container;
     SXSpinLock _poll_lock;
     BlockingQueue<IVFSearchTask*>* _search_task_queue;
 

@@ -11,6 +11,7 @@
 #include <sstream>
 #include <charconv>
 #include <typeinfo>
+#include <filesystem>
 
 inline constexpr char config_path[] = "disaggregated_bench/compute_node/run.conf";
 
@@ -49,7 +50,7 @@ void ReadConfigs() {
                 }
             }
             list_configs[key] = std::move(list);
-        } else if (!value.empty()) {
+        } else if (!value.empty() && (var_configs.find(key) == var_configs.end() || var_configs[key].empty())) {
             var_configs[key] = std::move(value);
         }
     }
@@ -116,14 +117,30 @@ void ParseConfigs(divftree::NodeID self_id) {
         throw std::runtime_error("Stat file path not provided!");
     }
 
-    vit = var_configs.find("n-probes");
+    vit = var_configs.find("ground-truth-path");
     if (vit != var_configs.end()) {
-        if (!parseUnsignedInt(vit->second, n_probes) ||
-            n_probes < 1) {
-            throw std::runtime_error("Invalid number of probes!");
-        }
+        exact_neighbours_path = vit->second;
     } else {
-        throw std::runtime_error("Number of probes not provided!");
+        throw std::runtime_error("Ground truth file path not provided!");
+    }
+
+    vit = var_configs.find("latency-sample-rate");
+    if (vit != var_configs.end()) {
+        if (!parseUnsignedInt(vit->second, sample_rate_for_latency)) {
+            throw std::runtime_error("Invalid latency sample rate!");
+        }
+
+        if (sample_rate_for_latency != 0) {
+            vit = var_configs.find("latency-sample-base");
+            if (vit != var_configs.end()) {
+                if (!parseUnsignedInt(vit->second, sample_base_for_latency) ||
+                    sample_base_for_latency <= sample_rate_for_latency) {
+                    throw std::runtime_error("Invalid latency sample base!");
+                }
+            } else {
+                throw std::runtime_error("Latency sample base not provided!");
+            }
+        }
     }
 
     vit = var_configs.find("default-k");
@@ -138,29 +155,11 @@ void ParseConfigs(divftree::NodeID self_id) {
 
     vit = var_configs.find("num-client-threads");
     if (vit != var_configs.end()) {
-        if (!parseUnsignedInt(vit->second, num_threads) || (num_threads < 1)) {
+        if (!parseUnsignedInt(vit->second, index_attr.num_user_threads) || (index_attr.num_user_threads < 1)) {
             throw std::runtime_error("Invalid number of client threads!");
         }
     } else {
         throw std::runtime_error("Number of client threads not provided!");
-    }
-
-    vit = var_configs.find("page-size");
-    if (vit != var_configs.end()) {
-        if (!parseUnsignedInt(vit->second, page_size) || (page_size < 1)) {
-            throw std::runtime_error("Invalid page size!");
-        }
-    } else {
-        throw std::runtime_error("Page size not provided!");
-    }
-
-    vit = var_configs.find("pool-size");;
-    if (vit != var_configs.end()) {
-        if (!parseUnsignedInt(vit->second, pool_size) || (pool_size < 1)) {
-            throw std::runtime_error("Invalid pool size!");
-        }
-    } else {
-        throw std::runtime_error("Pool size not provided!");
     }
 
     vit = var_configs.find("warmup-time");

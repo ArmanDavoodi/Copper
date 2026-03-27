@@ -49,7 +49,7 @@ void ReadConfigs() {
                 }
             }
             list_configs[key] = std::move(list);
-        } else if (!value.empty()) {
+        } else if (!value.empty() && (var_configs.find(key) == var_configs.end() || var_configs[key].empty())) {
             var_configs[key] = std::move(value);
         }
     }
@@ -107,61 +107,6 @@ void ParseConfigs(divftree::NodeID self_id) {
                     divftree::String("Could not open the output log file! errno %d, errno msg: %s",
                                      errno, strerror(errno)).ToCStr());
         }
-    }
-
-    vit = var_configs.find("num-clusters");
-    if (vit != var_configs.end()) {
-        if (!parseUnsignedInt(vit->second, num_clusters) ||
-            num_clusters < 1) {
-            throw std::runtime_error("Invalid number of clusters!");
-        }
-    } else {
-        throw std::runtime_error("Number of clusters not provided!");
-    }
-
-    vit = var_configs.find("kmeans-max-iters");
-    if (vit != var_configs.end()) {
-        if (!parseUnsignedInt(vit->second, max_iters)) {
-            throw std::runtime_error("Invalid kmeans max iters!");
-        }
-    } else {
-        throw std::runtime_error("kmeans max iters not provided!");
-    }
-
-    vit = var_configs.find("insert-duplicates");;
-    if (vit != var_configs.end()) {
-        if (!parseBool(vit->second, insert_duplicates)) {
-            throw std::runtime_error("Invalid insert duplicates!");
-        }
-    } else {
-        throw std::runtime_error("Insert duplicates not provided!");
-    }
-
-    vit = var_configs.find("page-size");
-    if (vit != var_configs.end()) {
-        if (!parseUnsignedInt(vit->second, page_size) || (page_size < 1)) {
-            throw std::runtime_error("Invalid page size!");
-        }
-    } else {
-        throw std::runtime_error("Page size not provided!");
-    }
-
-    vit = var_configs.find("num-build-threads");
-    if (vit != var_configs.end()) {
-        if (!parseUnsignedInt(vit->second, num_threads) || (num_threads < 1)) {
-            throw std::runtime_error("Invalid number of build threads!");
-        }
-    } else {
-        throw std::runtime_error("Number of build threads not provided!");
-    }
-
-    vit = var_configs.find("build-size");
-    if (vit != var_configs.end()) {
-        if (!parseUnsignedInt(vit->second, build_size)) {
-            throw std::runtime_error("Invalid build size!");
-        }
-    } else {
-        throw std::runtime_error("Build size not provided!");
     }
 
 }

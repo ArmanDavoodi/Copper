@@ -6,16 +6,9 @@
 
 #include <cstdint>
 #include <atomic>
+#include <string>
 
-inline size_t num_clusters;
-inline size_t num_threads;
-inline size_t bench_batch_size;
-inline size_t max_iters;
-inline bool insert_duplicates;
-inline size_t page_size;
-
-inline uint32_t build_size;
-
-inline divftree::VTYPE* data_set = nullptr;
+inline std::string index_file_path;
+inline uint32_t bench_batch_size; /* dummy */
 
 #endif

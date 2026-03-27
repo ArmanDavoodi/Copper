@@ -13,19 +13,8 @@ using SimilarityComparator = int (*)(const ANNVectorInfo&, const ANNVectorInfo&)
 
 namespace L2 {
 
-inline constexpr DTYPE Distance(const VTYPE* a, const VTYPE* b, uint16_t dim) {
-    CHECK_NOT_NULLPTR(a, LOG_TAG_BASIC);
-    CHECK_NOT_NULLPTR(b, LOG_TAG_BASIC);
-
-    DTYPE dist = 0;
-    for (size_t i = 0; i < dim; ++i) {
-        const DTYPE abs = static_cast<DTYPE>(a[i]) - static_cast<DTYPE>(b[i]);
-        dist += abs * abs;
-    }
-    return static_cast<DTYPE>(dist);
-}
-
-inline constexpr DTYPE Distance(const VTYPE* a, const MVTYPE* b, uint16_t dim) {
+template<typename V1, typename V2>
+inline constexpr DTYPE Distance(const V1* a, const V2* b, uint16_t dim) {
     CHECK_NOT_NULLPTR(a, LOG_TAG_BASIC);
     CHECK_NOT_NULLPTR(b, LOG_TAG_BASIC);
 
@@ -264,19 +253,8 @@ inline void ComputeCentroids(const VTYPE* cluster_vectors, const VTYPE* batch_ve
     }
 }
 
-
-inline constexpr DTYPE Distance(const VTYPE* a, const VTYPE* b, uint16_t dim, DistanceType distanceAlg) {
-    switch (distanceAlg) {
-    case DistanceType::L2:
-        return L2::Distance(a, b, dim);
-    default:
-        DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC,
-             "Distance: Invalid distance type: %s", DISTANCE_TYPE_NAME[(int8_t)distanceAlg]);
-    }
-    return 0; // Return 0 if the distance type is invalid
-}
-
-inline constexpr DTYPE Distance(const VTYPE* a, const MVTYPE* b, uint16_t dim, DistanceType distanceAlg) {
+template<typename V1, typename V2>
+inline constexpr DTYPE Distance(const V1* a, const V2* b, uint16_t dim, DistanceType distanceAlg) {
     switch (distanceAlg) {
     case DistanceType::L2:
         return L2::Distance(a, b, dim);
@@ -312,7 +290,10 @@ inline constexpr SimilarityComparator GetDistancePairSimilarityComparator(Distan
 struct L2DTYPEIDPairCMP {
     inline bool operator()(const std::pair<DTYPE, IVFVectorID>& a,
                           const std::pair<DTYPE, IVFVectorID>& b) const {
-        return (L2::MoreSimilar(a.first, b.first) >= 0);
+        return (L2::MoreSimilar(a.first, b.first) > 0) ||
+               (a.first == b.first && (a.second.vector_hash < b.second.vector_hash ||
+                                       (a.second.vector_hash == b.second.vector_hash &&
+                                        a.second.value < b.second.value)));
     }
 
     inline bool operator()(const std::pair<DTYPE, VectorID>& a,

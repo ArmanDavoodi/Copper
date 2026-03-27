@@ -10,12 +10,14 @@
 #include <atomic>
 #include <mutex>
 
-inline size_t n_probes;
+inline uint32_t leaf_n_probes;
+inline uint32_t internal_n_probes;
 inline uint8_t default_k;
-inline size_t num_threads;
-inline size_t page_size;
-inline size_t pool_size;
-inline size_t bench_batch_size; /* unused */
+inline divftree::DIVFIndexAttr index_attr;
+
+inline std::string exact_neighbours_path;
+
+inline uint32_t bench_batch_size; /* dummy */
 
 inline uint32_t warmup_time;
 inline uint32_t run_time;
@@ -23,6 +25,8 @@ inline uint32_t throughput_report_time;
 inline bool show_runtime_report_for_build_and_warmup;
 
 inline bool collect_avg_distances;
+inline uint64_t sample_rate_for_latency = 0;
+inline uint64_t sample_base_for_latency = 1;
 
 inline char stat_file[256] = "";
 

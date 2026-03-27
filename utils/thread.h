@@ -489,10 +489,15 @@ public:
         return (_next_task_id++);
     }
 
+    inline void IncrementNumQueries() {
+#ifdef ENABLE_STAT_COLLECTION
+        ++cnt_num_queries;
+#endif
+    }
+
     inline void UpdateSearchStats(size_t n_tasks_created, size_t n_tasks_completed,
                                   size_t n_triggered_polls, size_t n_empty_queue_induced_polls) {
 #ifdef ENABLE_STAT_COLLECTION
-        ++cnt_num_queries;
         cnt_num_tasks_created += n_tasks_created;
         cnt_num_search_queue_polls += n_tasks_completed;
         cnt_num_triggered_polls += n_triggered_polls;

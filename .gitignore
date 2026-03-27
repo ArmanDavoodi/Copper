@@ -43,6 +43,7 @@
 **/raw_data/*
 **/unique_identified/*
 **/datasets/**/index/*
+**/datasets/**/exact/*
 
 #configurations
 *.conf

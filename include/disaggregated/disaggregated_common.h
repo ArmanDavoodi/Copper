@@ -35,7 +35,10 @@
 #define DIVF_IS_COMPUTE_NODE
 #endif
 
+#ifndef MAX_NUM_PAGE_PER_CLUSTER
+#error "MAX_NUM_PAGE_PER_CLUSTER is not defined! Please define it to specify the maximum number of pages that can be allocated for a single cluster in the DIVF index."
 #define MAX_NUM_PAGE_PER_CLUSTER 8
+#endif
 namespace divftree {
 
 inline constexpr bool IS_MEMORY_NODE() {
@@ -206,6 +209,78 @@ struct ClusterMeta {
     VectorID centroid_id;
     uintptr_t remote_addr;
     size_t remote_size;
+    size_t num_elements; // number of vectors in the cluster (for leaf clusters) or number of child clusters (for internal clusters)
+};
+
+struct VectorData {
+    divftree::IVFVectorID id;
+    divftree::VTYPE data[DIMENSION];
+};
+
+struct CentroidData {
+    divftree::VectorID id;
+    divftree::CTYPE data[DIMENSION];
+};
+
+struct alignas(CACHE_LINE_SIZE) ClusterHeaderData {
+    VectorID id;
+    size_t num_points;
+};
+
+struct alignas(CACHE_LINE_SIZE) IVFCluster {
+    ClusterHeaderData header;
+    alignas(CACHE_LINE_SIZE) char data[]; /* is either VectorData or CentroidData depending on the index type and cluster level */
+};
+
+enum class ClusterType : uint8_t {
+    Leaf = 0,
+    Internal = 1
+};
+
+struct LeafClusterTypes {
+    using IDType = IVFVectorID;
+    using ElementType = VectorData;
+    static inline constexpr size_t ElementSize = sizeof(VectorData);
+};
+
+template<ClusterType CT>
+struct ClusterTraits;
+
+template<>
+struct ClusterTraits<ClusterType::Leaf> {
+    using IDType = IVFVectorID;
+    using ElementType = VectorData;
+    static inline constexpr size_t ElementSize = sizeof(VectorData);
+};
+
+template<>
+struct ClusterTraits<ClusterType::Internal> {
+    using IDType = VectorID;
+    using ElementType = CentroidData;
+    static inline constexpr size_t ElementSize = sizeof(CentroidData);
+};
+
+struct IndexInfo {
+    IndexType type;
+    uint32_t num_points;
+    union {
+        struct {
+            uint32_t num_clusters;
+        } ivf_flat_info;
+
+        struct {
+            uint32_t num_clusters;
+            uint32_t cluster_capacity;
+        } ivf_capped_info;
+
+        struct {
+            uint8_t num_levels;
+            uint32_t leaf_cluster_capacity;
+            uint32_t internal_cluster_capacity;
+            size_t leaf_bytes_cap;
+            size_t internal_bytes_cap;
+        } ivf_tree_info;
+    };
 };
 
 };

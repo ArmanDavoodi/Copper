@@ -104,6 +104,49 @@ struct NodeInfo {
     uint16_t port;
 };
 
+struct BlockedReadTask {
+    uint32_t num_pages;
+    union {
+        struct {
+            void** local_buffers;
+            uint32_t* sizes;
+        } sg_read;
+        struct {
+            void* local_buffer;
+            uint32_t size;
+        } normal_read;
+    };
+    uintptr_t remote_addr;
+    VectorID cluster_id;
+
+    BlockedReadTask() : num_pages(0), normal_read{nullptr, 0}, remote_addr(0), cluster_id() {}
+
+    BlockedReadTask(uint32_t num_sge, void** local_addrs, uint32_t* sizes, uintptr_t raddr,
+                    VectorID id) : num_pages(num_sge), remote_addr(raddr), cluster_id(id) {
+        FatalAssert(num_pages > 0, LOG_TAG_RDMA, "num_pages must be greater than 0 in BlockedReadTask constructor");
+        if (num_pages == 1) {
+            normal_read.local_buffer = local_addrs[0];
+            normal_read.size = sizes[0];
+        } else {
+            sg_read.local_buffers = new void*[num_pages];
+            sg_read.sizes = new uint32_t[num_pages];
+            for (uint32_t i = 0; i < num_pages; ++i) {
+                sg_read.local_buffers[i] = local_addrs[i];
+                sg_read.sizes[i] = sizes[i];
+            }
+        }
+    }
+
+    inline void Destory() {
+        if (num_pages > 1) {
+            delete[] sg_read.local_buffers;
+            delete[] sg_read.sizes;
+            sg_read.local_buffers = nullptr;
+            sg_read.sizes = nullptr;
+        }
+    }
+};
+
 struct ConnectionInfo {
     uint32_t remote_qp_num = 0;
     uint32_t local_psn = 0;
@@ -153,6 +196,7 @@ struct ConnectionContext {
     size_t remote_region_size;
     uint32_t remote_region_rkey;
     std::atomic<uint8_t> next_connection_idx;
+    BlockingQueue<BlockedReadTask> blocked_reads;
     ConnectionInfo connections[MAX_CONN_PER_NODE];
 
     ConnectionContext(NodeID id, in_addr_t ip, uint16_t port) :
@@ -296,6 +340,7 @@ public:
         FatalAssert(memory_nodes.size() == 1, LOG_TAG_RDMA,
                     "Expected exactly one memory node for stats collection.");
         stat_lock.Lock(SX_EXCLUSIVE);
+        /* todo: num blocked? */
         String stats_str = String("RDMA stats: total_num_requests=%zu(normal:%.2f(%zu), sg:%.2f(%zu)), total_posts=%zu, "
                             "total_num_work_requests=%zu, total_sge=%zu, total_rdma_read=(%zuGB = %zuMB = %zuKB = %zuB), "
                             "total_num_tries_to_grab_connection=%zu | avg_posts_per_req=%.2f, avg_wr_per_post=%.2f, "
@@ -335,6 +380,8 @@ public:
                             (double)(total_num_tries_to_grab_connection) / (double)(total_rdma_sp_reads + total_rdma_sg_reads),
                             (double)(total_num_tries_to_grab_connection) / (double)(total_rdma_posts)
                         );
+
+        stats_str += String("num_blocked=%zu", total_num_blocked_tasks);
         if (clear_after_fetch) {
             total_rdma_sp_reads = 0;
             total_rdma_sg_reads = 0;
@@ -343,6 +390,7 @@ public:
             total_sge = 0;
             total_rdma_read_bytes = 0;
             total_num_tries_to_grab_connection = 0;
+            total_num_blocked_tasks = 0;
         }
         stat_lock.Unlock();
         return stats_str;
@@ -450,6 +498,12 @@ EXIT:
         }
         RetStatus rs = RetStatus::Success();
 
+        /* just to make sure if there are other reads that are blocked, they go first */
+        rs = TryReadBlockedTasks(target_node);
+        FatalAssert(rs.IsOK(), LOG_TAG_RDMA, "could not read blocked tasks");
+
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_RDMA, "Start RDMARead for %zu clusters.", num_clusters);
+    
         uint8_t num_resources_acquired = 0;
         uint8_t num_remaining = num_clusters;
         auto it = memory_nodes.find(target_node);
@@ -466,14 +520,28 @@ EXIT:
 #endif
         while (num_remaining > 0) {
             ++num_posts;
+            size_t total_acquired = num_clusters - num_remaining;
             uint8_t connection_idx = GrabConnection(target_node, num_remaining, num_resources_acquired,
                                                     num_tries_to_grab_connection);
+            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_RDMA, "Grabbed connection %hhu. %zu/%zu clusters have conn",
+                    connection_idx, total_acquired + (size_t)num_resources_acquired, num_clusters);
+            if (num_resources_acquired == 0) {
+                std::vector<BlockedReadTask> blocked_tasks_vec;
+                blocked_tasks_vec.reserve(num_remaining);
+                for (size_t i = total_acquired; i < num_clusters; ++i) {
+                    blocked_tasks_vec.emplace_back(1, &local_buffers[i], &sizes[i], remote_addresses[i],
+                                                   cluster_ids[i]);
+                }
+
+                DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_RDMA, "Pushing %zu tasks to blocked.", num_remaining);
+                ctx.blocked_reads.BatchPush(blocked_tasks_vec.data(), blocked_tasks_vec.size());
+                break;
+            }
             FatalAssert(num_resources_acquired > 0, LOG_TAG_RDMA,
                         "Failed to acquire any RDMA resources for RDMA read.");
             FatalAssert(num_resources_acquired <= num_remaining, LOG_TAG_RDMA,
                         "Acquired more RDMA resources than remaining clusters to read.");
             TaskID task_id(ctx.connections[connection_idx].next_task_id.fetch_add(1), connection_idx, target_node);
-            size_t total_acquired = num_clusters - num_remaining;
             if (num_resources_acquired == num_clusters) {
                 pending_tasks.BatchInsert(task_id, std::move(cluster_ids));
             } else {
@@ -487,7 +555,7 @@ EXIT:
             num_remaining -= num_resources_acquired;
         }
 
-        UpdateStats(num_clusters, num_posts, totl_size, num_tries_to_grab_connection);
+        UpdateStats(num_clusters, num_posts, totl_size, num_tries_to_grab_connection, num_remaining);
 
         return rs;
     }
@@ -511,6 +579,10 @@ EXIT:
         }
 
         RetStatus rs = RetStatus::Success();
+        /* just to make sure if there are other reads that are blocked, they go first */
+        rs = TryReadBlockedTasks(target_node);
+        FatalAssert(rs.IsOK(), LOG_TAG_RDMA, "could not read blocked tasks");
+
         uint8_t num_resources_acquired = 0;
         uint8_t num_remaining = num_clusters;
         auto it = memory_nodes.find(target_node);
@@ -531,14 +603,26 @@ EXIT:
 #endif
         while (num_remaining > 0) {
             ++num_posts;
+            size_t total_acquired = num_clusters - num_remaining;
             uint8_t connection_idx = GrabConnection(target_node, num_remaining, num_resources_acquired,
                                                     num_tries_to_grab_connection);
+            if (num_resources_acquired == 0) {
+                std::vector<BlockedReadTask> blocked_tasks_vec;
+                blocked_tasks_vec.reserve(num_remaining);
+                for (size_t i = total_acquired; i < num_clusters; ++i) {
+                    blocked_tasks_vec.emplace_back(num_sge[i], local_buffers[i], sizes[i],
+                                                   remote_addresses[i], cluster_ids[i]);
+                }
+
+                DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_RDMA, "Pushing %zu tasks to blocked.", num_remaining);
+                ctx.blocked_reads.BatchPush(blocked_tasks_vec.data(), blocked_tasks_vec.size());
+                break;
+            }
             FatalAssert(num_resources_acquired > 0, LOG_TAG_RDMA,
                         "Failed to acquire any RDMA resources for RDMA scatter-gather read.");
             FatalAssert(num_resources_acquired <= num_remaining, LOG_TAG_RDMA,
                         "Acquired more RDMA resources than remaining clusters to read.");
             TaskID task_id(ctx.connections[connection_idx].next_task_id.fetch_add(1), connection_idx, target_node);
-            size_t total_acquired = num_clusters - num_remaining;
             if (num_resources_acquired == num_clusters) {
                 pending_tasks.BatchInsert(task_id, std::move(cluster_ids));
             } else {
@@ -553,7 +637,7 @@ EXIT:
             num_remaining -= num_resources_acquired;
         }
 
-        UpdateSGStats(num_clusters, totl_num_sge, num_posts, totl_size, num_tries_to_grab_connection);
+        UpdateSGStats(num_clusters, totl_num_sge, num_posts, totl_size, num_tries_to_grab_connection, num_remaining);
         return rs;
     }
 
@@ -575,7 +659,7 @@ EXIT:
         // } else if (!poll_lock.TryLock(SX_EXCLUSIVE)) {
         //     return RetStatus::Success();
         // }
-
+        RetStatus rs = RetStatus::Success();
         bool done = false;
         while (!done) {
             done = true;
@@ -613,12 +697,23 @@ EXIT:
                 size_t num_completed = completed_tasks.size() - old_size;
                 FatalAssert(num_completed > 0, LOG_TAG_RDMA,
                             "Number of completed tasks should be greater than 0 after erasing from pending tasks!");
-                uint16_t num_pending =
-                    conn_info.num_pending_requests.fetch_sub(num_completed);
-                FatalAssert(num_pending >= num_completed, LOG_TAG_RDMA,
-                            "Number of pending requests underflowed!");
-                if (destroying && ((num_pending - num_completed) > 0)) {
-                    done = false;
+
+                rs = ReadBlockedTasks(target_node, task_id.connection_idx, num_completed, 0);
+                FatalAssert(rs.IsOK(), LOG_TAG_RDMA, "could not read blocked tasks");
+                if (destroying) {
+                    if (conn_info.num_pending_requests.load(std::memory_order_acquire) > 0) {
+                        done = false;
+                    }
+                }
+            }
+
+            if (destroying) {
+                for (auto& [node_id, conn_ctx] : memory_nodes) {
+                    if (conn_ctx.blocked_reads.Size() > 0) {
+                        rs = TryReadBlockedTasks(node_id);
+                        FatalAssert(rs.IsOK(), LOG_TAG_RDMA, "could not read blocked tasks");
+                        done = false;
+                    }
                 }
             }
 
@@ -632,7 +727,7 @@ EXIT:
         }
 
         // poll_lock.Unlock();
-        return RetStatus::Success();
+        return rs;
     }
 
     void SendMessage(NodeID target, const void* msg, size_t size, bool end_message = false) {
@@ -721,27 +816,30 @@ EXIT:
         ConnectionContext& ctx = it->second;
         FatalAssert(ctx.socket != -1, LOG_TAG_RDMA,
                     "Socket to source node is not established.");
-        size_t msg_size = 0;
-        ssize_t ret = recv(ctx.socket, &msg_size, sizeof(msg_size), 0);
-        FatalAssert(ret == sizeof(msg_size), LOG_TAG_RDMA,
-                    "Failed to receive message size from source node. recv_bytes=%zd, expected_bytes=%zu, errno=(%d)%s",
-                    ret, sizeof(msg_size), errno, strerror(errno));
-        FatalAssert(msg_size <= buffer_size, LOG_TAG_RDMA,
-                    "Received message size exceeds buffer size. msg_size=%zu, buffer_size=%zu",
-                    msg_size, buffer_size);
+        if (recv_buffer_size == 0) {
+            ssize_t ret = recv(ctx.socket, &recv_buffer_size, sizeof(recv_buffer_size), 0);
+            FatalAssert(ret == sizeof(recv_buffer_size), LOG_TAG_RDMA,
+                        "Failed to receive message size from source node. recv_bytes=%zd, expected_bytes=%zu, errno=(%d)%s",
+                        ret, sizeof(recv_buffer_size), errno, strerror(errno));
+        }
 
+        FatalAssert(recv_buffer_size >= buffer_size, LOG_TAG_RDMA,
+                    "Received message size from source node is larger than buffer size. recv_buffer_size=%zu, buffer_size=%zu",
+                    recv_buffer_size, buffer_size);
         ssize_t recieved = 0;
-        while (recieved < static_cast<ssize_t>(msg_size)) {
+        int ret = 0;
+        while (recieved < static_cast<ssize_t>(buffer_size)) {
             ret = recv(ctx.socket, static_cast<uint8_t*>(buffer) + recieved,
-                       std::min(static_cast<ssize_t>(MAX_MESSAGE_SIZE), static_cast<ssize_t>(msg_size) - recieved), 0);
+                       std::min(static_cast<ssize_t>(MAX_MESSAGE_SIZE), static_cast<ssize_t>(buffer_size) - recieved), 0);
             FatalAssert(ret >= 0, LOG_TAG_RDMA,
                         "Failed to receive message from source node. recv_bytes=%zd, expected_bytes=%zu, errno=(%d)%s",
-                        ret, msg_size - recieved, errno, strerror(errno));
+                        ret, buffer_size - recieved, errno, strerror(errno));
             recieved += ret;
         }
-        FatalAssert(recieved == static_cast<ssize_t>(msg_size), LOG_TAG_RDMA,
+        FatalAssert(recieved == static_cast<ssize_t>(buffer_size), LOG_TAG_RDMA,
                     "Failed to receive message from source node. recv_bytes=%zd, expected_bytes=%zu, errno=(%d)%s",
-                    recieved, msg_size, errno, strerror(errno));
+                    recieved, buffer_size, errno, strerror(errno));
+        recv_buffer_size -= buffer_size;
     }
 
     size_t GetNumMemoryNodes() const {
@@ -1725,37 +1823,43 @@ EXIT:
         ConnectionContext& ctx = it->second;
         uint8_t idx = ctx.next_connection_idx.fetch_add(1) % MAX_CONN_PER_NODE;
         uint64_t num_iterations = 0;
+        num_resources_acquired = 0;
+        uint32_t num_pending = 0;
         while (true) {
+            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_RDMA, "Iteration %lu - conn %hhu: num_acq = %hhu, num_pending=%u",
+                num_iterations, idx, num_resources_acquired,
+                num_pending);
             if ((num_iterations > 0) && (num_iterations % MAX_CONN_PER_NODE == 0)) {
-                usleep(1);
+                break;
             }
             ++num_iterations;
 
             if ((uint32_t)(ctx.connections[idx].num_pending_requests.load(std::memory_order_acquire)) >=
                 MAX_SEND_WR[COMPUTE_NODE_IDX]) {
                 idx = (idx + 1) % MAX_CONN_PER_NODE;
-                DIVFTREE_YIELD();
                 continue;
             }
 
-            uint32_t num_pending = ctx.connections[idx].num_pending_requests.fetch_add(num_clusters);
+            num_pending = ctx.connections[idx].num_pending_requests.fetch_add(num_clusters);
             if (num_pending >= MAX_SEND_WR[COMPUTE_NODE_IDX]) {
-                ctx.connections[idx].num_pending_requests.fetch_sub(num_clusters);
+                num_pending = ctx.connections[idx].num_pending_requests.fetch_sub(num_clusters) - num_clusters;
                 idx = (idx + 1) % MAX_CONN_PER_NODE;
-                DIVFTREE_YIELD();
                 continue;
             } else if (num_pending + num_clusters > MAX_SEND_WR[COMPUTE_NODE_IDX]) {
                 uint32_t to_free = (num_pending + num_clusters) - MAX_SEND_WR[COMPUTE_NODE_IDX];
-                ctx.connections[idx].num_pending_requests.fetch_sub(to_free);
+                num_pending = ctx.connections[idx].num_pending_requests.fetch_sub(to_free) - to_free;
                 num_resources_acquired = static_cast<uint8_t>(num_clusters - to_free);
             } else {
                 num_resources_acquired = static_cast<uint8_t>(num_clusters);
+                num_pending += num_clusters;
             }
-
             break;
         }
         num_tries_to_grab_connection += num_iterations;
-
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_RDMA, "Grabbed %hhu tasks from conn %hhu: num_pending=%u",
+                num_resources_acquired, idx,
+                num_pending);
+        
         return idx;
     }
 
@@ -1819,6 +1923,7 @@ EXIT:
             std::map<std::pair<void*, uint32_t>, size_t> remote_buffers_map;
         );
 
+        String dummy_log = String("RDMARead %u clusters: [", num_clusters);
         for (size_t i = 0; i < num_clusters; ++i) {
             FatalAssert(local_buffers[i] != nullptr, LOG_TAG_RDMA,
                         "local_buffer[%zu] is null in RDMARead", i);
@@ -1861,9 +1966,12 @@ EXIT:
             sge_list[i].length = sizes[i];
             sge_list[i].lkey = mr->lkey;
 
+            dummy_log += String("{local_addr=%p, size=%u, remote_address=%p}%s",
+                                local_buffers[i], sizes[i], remote_addresses[i], (i == num_clusters - 1) ? "]" : ", ");
+
             memset(&wr_list[i], 0, sizeof(wr_list[i]));
             wr_list[i].wr_id = id.raw;
-            wr_list[i].sg_list = sge_list;
+            wr_list[i].sg_list = &sge_list[i];
             wr_list[i].num_sge = 1;
             wr_list[i].opcode = IBV_WR_RDMA_READ;
             wr_list[i].wr.rdma.remote_addr = remote_addresses[i];
@@ -1877,6 +1985,7 @@ EXIT:
             }
         }
 
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_RDMA, "%s", dummy_log.ToCStr());
         int ret = ibv_post_send(conn_ctx.connections[connection_idx].qp, &wr_list[0], &bad_wr);
         if (ret != 0) {
             String error_msg = String("Failed to post RDMA Read send work request. ret=(%d)%s errno=(%d)%s",
@@ -1924,6 +2033,7 @@ EXIT:
         struct ibv_sge** sge_list = new ibv_sge*[num_clusters];
         struct ibv_send_wr* bad_wr = nullptr;
 
+        String dummy_log = String("RDMAReadSG %u clusters: [", num_clusters);
         for (size_t i = 0; i < num_clusters; ++i) {
             FatalAssert(num_sge[i] > 0, LOG_TAG_RDMA,
                         "num_sge[%zu] is zero in RDMASGRead", i);
@@ -1934,6 +2044,7 @@ EXIT:
             sge_list[i] = new ibv_sge[num_sge[i]];
             size_t total_size = 0;
             UNUSED_VARIABLE(total_size);
+            String dummy_tmp = "[";
             for (size_t j = 0; j < num_sge[i]; ++j) {
                 total_size += sizes[i][j];
                 FatalAssert(local_buffers[i][j] != nullptr, LOG_TAG_RDMA,
@@ -1949,6 +2060,8 @@ EXIT:
                 sge_list[i][j].addr = reinterpret_cast<uintptr_t>(local_buffers[i][j]);
                 sge_list[i][j].length = sizes[i][j];
                 sge_list[i][j].lkey = mr->lkey;
+
+                dummy_tmp += String("{addr=%p, length=%u}%s", local_buffers[i][j], sizes[i][j], (j == num_sge[i] - 1) ? "]" : ", ");
             }
 
             FatalAssert(remote_addresses[i] >= conn_ctx.remote_region_addr &&
@@ -1956,6 +2069,9 @@ EXIT:
                         (conn_ctx.remote_region_addr + conn_ctx.remote_region_size),
                         LOG_TAG_RDMA,
                         "remote_address[%zu] is out of remote registered memory region in RDMASGRead", i);
+            dummy_log += String("{num_pages=%u, remote_addr=%p, total_size=%lu, pages=%s}%s",
+                                num_sge[i], (void*)remote_addresses[i], total_size, dummy_tmp.ToCStr(),
+                                (i == num_clusters - 1) ? "]" : ", ");
 
             memset(&wr_list[i], 0, sizeof(wr_list[i]));
             wr_list[i].wr_id = id.raw;
@@ -1973,6 +2089,7 @@ EXIT:
             }
         }
 
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_RDMA, "%s", dummy_log.ToCStr());
         int ret = ibv_post_send(conn_ctx.connections[connection_idx].qp, &wr_list[0], &bad_wr);
         if (ret != 0) {
             String error_msg = String("Failed to post RDMA Read send work request. ret=(%d)%s errno=(%d)%s",
@@ -1989,11 +2106,167 @@ EXIT:
         return rs;
     }
 
-    inline void UpdateStats(size_t num_wr, size_t num_posts, size_t bytes, size_t num_retries) {
+    RetStatus TryReadBlockedTasks(NodeID target_node) {
+        auto it = memory_nodes.find(target_node);
+        FatalAssert(it != memory_nodes.end(), LOG_TAG_RDMA,
+                    "Target memory node not found!");
+        ConnectionContext& ctx = it->second;
+        RetStatus rs = RetStatus::Success();
+
+        while (true) {
+            size_t appr_num_blocked = ctx.blocked_reads.Size();
+            if (appr_num_blocked == 0) {
+                break;
+            }
+
+            uint8_t num_acquired = 0;
+            size_t num_tries = 0;
+            uint8_t connection_idx = GrabConnection(target_node, appr_num_blocked, num_acquired, num_tries);
+            if (num_acquired == 0) {
+                break;
+            }
+
+            rs = ReadBlockedTasks(target_node, connection_idx, num_acquired, num_tries);
+            FatalAssert(rs.IsOK(), LOG_TAG_RDMA, "could not read blocked tasks");
+        }
+
+        return rs;
+    }
+
+    RetStatus ReadBlockedTasks(NodeID target_node, uint8_t connection_idx, uint8_t num_acquired, size_t num_tries) {
+        auto it = memory_nodes.find(target_node);
+        FatalAssert(it != memory_nodes.end(), LOG_TAG_RDMA,
+                    "Target memory node not found!");
+        ConnectionContext& ctx = it->second;
+        RetStatus rs = RetStatus::Success();
+
+        BlockedReadTask* tasks = new BlockedReadTask[num_acquired];
+        size_t num_tasks = ctx.blocked_reads.TryBatchPopHead(tasks, num_acquired);
+        FatalAssert(num_tasks <= (size_t)num_acquired, LOG_TAG_RDMA, "cannot acquire more than asked!");
+        if (num_tasks < (size_t)num_acquired) {
+            uint16_t num_pending =
+                ctx.connections[connection_idx].num_pending_requests.fetch_sub((size_t)num_acquired - num_tasks);
+            FatalAssert((size_t)num_pending >= ((size_t)num_acquired - num_tasks), LOG_TAG_RDMA,
+                        "num_pending_requests underflow in ReadBlockedTasks. pending=%u, to_release=%u",
+                        num_pending, ((size_t)num_acquired - num_tasks));
+
+            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_RDMA, "Freed %zu tasks from conn %hhu: num_pending=%hu",
+                    (size_t)num_acquired - num_tasks, connection_idx,
+                    num_pending - uint16_t((size_t)num_acquired - num_tasks));
+        }
+
+        if (num_tasks == 0) {
+            delete[] tasks;
+            return rs;
+        }
+
+        bool is_sg = false;
+        std::vector<VectorID> cluster_ids;
+        std::vector<uintptr_t> raddr;
+        TaskID task_id(ctx.connections[connection_idx].next_task_id.fetch_add(1), connection_idx, target_node);
+        cluster_ids.reserve(num_tasks);
+        raddr.reserve(num_tasks);
+        size_t num_pages = 0;
+        size_t bytes = 0;
+        for (size_t i = 0; i < num_tasks; ++i) {
+            FatalAssert(tasks[i].num_pages > 0, LOG_TAG_RDMA,
+                        "Invalid number of pages in blocked read task. num_pages=%u", tasks[i].num_pages);
+            if (tasks[i].num_pages > 1) {
+                is_sg = true;
+            }
+            num_pages += tasks[i].num_pages;
+            cluster_ids.emplace_back(tasks[i].cluster_id);
+            raddr.emplace_back(tasks[i].remote_addr);
+        }
+
+        if (is_sg) {
+            void*** local_buffers = new void**[num_tasks];
+            uint32_t** sizes = new uint32_t*[num_tasks];
+            uint32_t* num_sge = new uint32_t[num_tasks];
+
+            for (size_t i = 0; i < num_tasks; ++i) {
+                if (tasks[i].num_pages == 1) {
+                    local_buffers[i] = &tasks[i].normal_read.local_buffer;
+                    sizes[i] = &tasks[i].normal_read.size;
+                    num_sge[i] = 1;
+                    bytes += tasks[i].normal_read.size;
+                    continue;
+                }
+                local_buffers[i] = tasks[i].sg_read.local_buffers;
+                sizes[i] = tasks[i].sg_read.sizes;
+                num_sge[i] = tasks[i].num_pages;
+                for (uint32_t p = 0; p < num_sge[i]; ++p) {
+                    bytes += sizes[i][p];
+                }
+            }
+
+            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_RDMA, "Using conn %hhu to read %zu blocked tasks.", connection_idx, num_tasks);
+            pending_tasks.BatchInsert(task_id, std::move(cluster_ids));
+
+            rs = RDMASGReadInternal(target_node, connection_idx, task_id,
+                                    local_buffers, raddr.data(),
+                                    sizes, num_sge, num_tasks);
+            FatalAssert(rs.IsOK(), LOG_TAG_RDMA,
+                        "RDMASGReadInternal() failed. %s", rs.Msg());
+
+            for (size_t i = 0; i < num_tasks; ++i) {
+                tasks[i].Destory();
+            }
+            delete[] local_buffers;
+            delete[] sizes;
+            delete[] num_sge;
+        } else {
+            // NodeID target_node, uint8_t connection_idx, TaskID id,
+            //                    void** local_buffers, uintptr_t* remote_addresses,
+            //                    uint32_t* sizes, size_t num_clusters
+            void** local_buffers = new void*[num_tasks];
+            uint32_t* sizes = new uint32_t[num_tasks];
+
+            for (size_t i = 0; i < num_tasks; ++i) {
+                local_buffers[i] = tasks[i].normal_read.local_buffer;
+                sizes[i] = tasks[i].normal_read.size;
+                bytes += sizes[i];
+            }
+
+            pending_tasks.BatchInsert(task_id, std::move(cluster_ids));
+
+            rs = RDMAReadInternal(target_node, connection_idx, task_id,
+                                  local_buffers, raddr.data(),
+                                  sizes, num_tasks);
+            FatalAssert(rs.IsOK(), LOG_TAG_RDMA,
+                        "RDMASGReadInternal() failed. %s", rs.Msg());
+            delete[] local_buffers;
+            delete[] sizes;
+        }
+
+        delete[] tasks;
+        UpdateBlockedStats(num_tasks, num_pages, bytes, num_tries);
+
+        return rs;
+    }
+
+    inline void UpdateBlockedStats(size_t num_wr, size_t num_pages, size_t bytes, size_t num_retries) {
+        UNUSED_VARIABLE(num_wr);
+        UNUSED_VARIABLE(num_pages);
+        UNUSED_VARIABLE(bytes);
+#ifdef ENABLE_STAT_COLLECTION
+        stat_lock.Lock(SX_EXCLUSIVE);
+        total_rdma_sg_reads += (num_pages > num_wr);
+        total_num_wr += num_wr;
+        total_sge += num_pages;
+        total_rdma_posts += 1;
+        total_rdma_read_bytes += bytes;
+        total_num_tries_to_grab_connection += num_retries;
+        stat_lock.Unlock();
+#endif
+    }
+
+    inline void UpdateStats(size_t num_wr, size_t num_posts, size_t bytes, size_t num_retries, size_t num_remaining) {
         UNUSED_VARIABLE(num_wr);
         UNUSED_VARIABLE(num_posts);
         UNUSED_VARIABLE(bytes);
         UNUSED_VARIABLE(num_retries);
+        UNUSED_VARIABLE(num_remaining);
 #ifdef ENABLE_STAT_COLLECTION
         stat_lock.Lock(SX_EXCLUSIVE);
         total_rdma_sp_reads += 1;
@@ -2002,16 +2275,19 @@ EXIT:
         total_rdma_posts += num_posts;
         total_rdma_read_bytes += bytes;
         total_num_tries_to_grab_connection += num_retries;
+        total_num_blocked_tasks += num_remaining;
         stat_lock.Unlock();
 #endif
     }
 
-    inline void UpdateSGStats(size_t num_wr, size_t num_sge, size_t num_posts, size_t bytes, size_t num_retries) {
+    inline void UpdateSGStats(size_t num_wr, size_t num_sge, size_t num_posts, size_t bytes, size_t num_retries,
+                              size_t num_remaining) {
         UNUSED_VARIABLE(num_wr);
         UNUSED_VARIABLE(num_sge);
         UNUSED_VARIABLE(num_posts);
         UNUSED_VARIABLE(bytes);
         UNUSED_VARIABLE(num_retries);
+        UNUSED_VARIABLE(num_remaining);
 #ifdef ENABLE_STAT_COLLECTION
         stat_lock.Lock(SX_EXCLUSIVE);
         total_rdma_sg_reads += 1;
@@ -2020,6 +2296,7 @@ EXIT:
         total_rdma_posts += num_posts;
         total_rdma_read_bytes += bytes;
         total_num_tries_to_grab_connection += num_retries;
+        total_num_blocked_tasks += num_remaining;
         stat_lock.Unlock();
 #endif
     }
@@ -2044,6 +2321,8 @@ EXIT:
     std::atomic<bool> ready = false;
     std::atomic<size_t> num_connected_nodes = 0;
 
+    size_t recv_buffer_size = 0;
+
 #ifdef ENABLE_STAT_COLLECTION
     SXSpinLock stat_lock;
     size_t total_rdma_sp_reads = 0; /* this how many times the RDMARead API itself was called not ibv_post_send */
@@ -2053,6 +2332,7 @@ EXIT:
     size_t total_sge = 0;
     size_t total_rdma_read_bytes = 0;
     size_t total_num_tries_to_grab_connection = 0;
+    size_t total_num_blocked_tasks = 0;
 #endif
 };
 

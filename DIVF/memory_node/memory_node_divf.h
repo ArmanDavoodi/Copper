@@ -1,7 +1,6 @@
 #ifndef MN_DIVF_H_
 #define MN_DIVF_H_
 
-
 #include "common.h"
 #include "vector_utils.h"
 #include "distance.h"
@@ -13,57 +12,26 @@
 #include "utils/rdma_manager.h"
 
 #include <sys/mman.h>
-
+#include <filesystem>
 
 namespace divftree {
 
-struct IVFCluster {
-    VectorID centroid_id = INVALID_VECTOR_ID;
-    union {
-        VTYPE* centroid = nullptr;
-        MVTYPE* centroid_tmp;
-    };
-    size_t num_points = 0;
-    char* data = nullptr; /* data points stored in a flat array */
-};
+inline constexpr size_t MEMORY_POOL_PADDING = 4096;
 
+struct ClusterInfo {
+    VectorID id;
+    uint32_t offset; // number of points before the data of this cluster
+    uint32_t num_points;
+    IVFCluster* cluster_ptr;
+    size_t bytes;
+    CTYPE centroid_vector[DIMENSION];
+};
 
 class MN_DIVFIndex {
 public:
-    MN_DIVFIndex(const VTYPE* data, size_t num_points, size_t num_clusters, bool insert_duplicates,
-                 size_t max_iterations, uint16_t dim, size_t page_size, size_t num_threads = 0) :
-             dim(dim), size(0),
-             vectorDirectory(num_points, dim, (num_threads == 0 ? std::thread::hardware_concurrency() :
-                                                                  num_threads) * 2) {
-        if (dim == 0) {
-            DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "MN_DIVFIndex dimension cannot be zero!");
-        }
+    MN_DIVFIndex(const std::string& index_path) {
+        RetStatus status = LoadIndex(index_path);
 
-        pool_size = ALIGNED_SIZE(num_points * ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID)), CACHE_LINE_SIZE) +
-                          num_clusters * CACHE_LINE_SIZE + ALIGNED_SIZE(page_size, CACHE_LINE_SIZE);
-
-#ifdef USE_HUGETLB
-        memory_pool = mmap64(nullptr, pool_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-#else
-        memory_pool = mmap64(nullptr, pool_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-#endif
-
-        if (memory_pool == MAP_FAILED) {
-            DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_MEMORY, "Failed to allocate memory for MemoryPool."
-                    "errno %d, errno msg: %s", errno, strerror(errno));
-        }
-
-        if (memory_pool == nullptr) {
-            DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_MEMORY, "MemoryPool mmap returned nullptr");
-        }
-
-        if (!ALIGNED(memory_pool)) {
-            DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_MEMORY,
-                    "MemoryPool memory_pool is not properly aligned. Requested alignment: %lu, memory_pool address: %p",
-                    CACHE_LINE_SIZE, memory_pool);
-        }
-
-        RetStatus status = RetStatus::Success();
         status =
             RDMA_Manager::Initialize(
                 network_config::num_memory_nodes,
@@ -93,15 +61,6 @@ public:
         FatalAssert(status.IsOK(), LOG_TAG_BASIC,
                     "Failed to establish RDMA connections: %s",
                     status.Msg());
-
-        IVFVectorID* out_vector_ids = new IVFVectorID[num_points];
-        status = Build(data, num_points, num_clusters, insert_duplicates,
-                       out_vector_ids, max_iterations, num_threads);
-
-        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
-                "MN_DIVFIndex created with dimension %hu, max vectors %zu, and %zu threads.",
-                dim, num_points, num_threads == 0 ? std::thread::hardware_concurrency() : num_threads);
-        delete[] out_vector_ids;
     }
 
     ~MN_DIVFIndex() {
@@ -109,20 +68,23 @@ public:
         RDMA_Manager::DestroyInstance(tasks);
         FatalAssert(tasks.size() == 0, LOG_TAG_BASIC,
                     "There should be no pending tasks when destroying MN_DIVFIndex!");
-        for (auto& cluster : clusters) {
-            if (cluster.centroid_tmp != nullptr) {
-                delete[] cluster.centroid_tmp;
-                cluster.centroid_tmp = nullptr;
-            }
-            if (cluster.data != nullptr) {
-                FatalAssert(cluster.data >= memory_pool &&
-                            (reinterpret_cast<uint8_t*>(cluster.data) <
-                             reinterpret_cast<uint8_t*>(memory_pool) + pool_size),
-                            LOG_TAG_BASIC,
-                            "Cluster data pointer is out of bounds of the memory pool!");
-                cluster.data = nullptr;
+
+        for (uint8_t level = 0; level < num_levels; ++level) {
+            if (cluster_infos[level] != nullptr) {
+                for (uint32_t c = 0; c < num_clusters[level]; ++c) {
+                    if (clusters[level][c] != nullptr) {
+                        delete clusters[level][c];
+                        clusters[level][c] = nullptr;
+                    }
+                }
+                delete[] cluster_infos[level];
+                cluster_infos[level] = nullptr;
+                delete[] clusters[level];
+                clusters[level] = nullptr;
             }
         }
+        delete[] num_clusters;
+
         if (munmap(memory_pool, pool_size) != 0) {
             DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_BASIC, "Failed to free memory for MemoryPool. "
                     "errno %d, errno msg: %s", errno, strerror(errno));
@@ -148,661 +110,388 @@ public:
     }
 
 protected:
-    const uint16_t dim;
-    size_t size;
-    std::vector<IVFCluster> clusters;
-    SXSpinLock vector_directory_lock;
-    VectorDirectory vectorDirectory;
+    IndexType index_type;
+
     void* memory_pool = nullptr;
     size_t pool_size = 0;
-    std::atomic<size_t> next_memory_offset = 0;
 
-    RetStatus Build(const VTYPE* data, size_t num_points, size_t num_clusters, bool insert_duplicates,
-                    IVFVectorID* out_vector_ids, size_t max_iterations, size_t num_threads) {
-        if (data == nullptr || num_points == 0 || num_clusters < 2 ||
-            num_clusters > num_points || clusters.size() != 0 || out_vector_ids == nullptr ||
-            num_threads > num_points) {
-            FatalAssert(false, LOG_TAG_BASIC, "Invalid arguments to MN_DIVFIndex::Build()");
-            return RetStatus::Fail("Invalid arguments to MN_DIVFIndex::Build()");
+    uint8_t num_levels = 0;
+    ClusterInfo** cluster_infos = nullptr;
+
+    uint32_t leaf_cap = 0;
+    uint32_t internal_cap = 0;
+    size_t leaf_bytes = 0;
+    size_t internal_bytes = 0;
+
+    IVFCluster*** clusters = nullptr;
+
+    uint32_t* num_clusters = nullptr;
+    uint32_t num_points = 0;
+
+    RetStatus LoadIndex(const std::string& index_path) {
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Reading the index from file...");
+
+        if (!std::filesystem::exists(index_path)) {
+            FatalAssert(false, LOG_TAG_BASIC, "Input file does not exist: %s", index_path.c_str());
+            return RetStatus::Fail("Input file does not exist");
         }
 
-        if (num_threads == 0) {
-            num_threads = std::min((size_t)(std::thread::hardware_concurrency()), num_points / 8);
-            if (num_threads == 0) {
-                num_threads = 1;
+        if (!std::filesystem::is_regular_file(index_path)) {
+            FatalAssert(false, LOG_TAG_BASIC, "Input path is not a regular file: %s", index_path.c_str());
+            return RetStatus::Fail("Input path is not a regular file");
+        }
+        // Now open the file
+        FILE* file = fopen(index_path.c_str(), "rb");
+        if (!file) {
+            FatalAssert(false, LOG_TAG_BASIC, "Failed to open input file: %s. errno: %d, msg: %s",
+                        index_path.c_str(), errno, strerror(errno));
+            return RetStatus::Fail("Failed to open input file");
+        }
+
+        size_t ret = fread(&index_type, sizeof(IndexType), 1, file);
+        if (ret != 1) {
+            fclose(file);
+            FatalAssert(false, LOG_TAG_BASIC, "Failed to read index type from index file: %s", index_path.c_str());
+            return RetStatus::Fail("Failed to read index type from index file");
+        }
+
+        switch (index_type) {
+            case IndexType::IVF_FLAT:
+                DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Index type: IVF_FLAT");
+                break;
+            case IndexType::IVF_CAPPED:
+                ret = fread(&leaf_cap, sizeof(uint32_t), 1, file);
+                if (ret != 1) {
+                    fclose(file);
+                    FatalAssert(false, LOG_TAG_BASIC, "Failed to read cluster capacity for IVF_CAPPED from index file: %s", index_path.c_str());
+                    return RetStatus::Fail("Failed to read cluster capacity for IVF_CAPPED from index file");
+                }
+                FatalAssert(leaf_cap > 0, LOG_TAG_BASIC, "Cluster capacity for IVF_CAPPED must be greater than 0: %s", index_path.c_str());
+                DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Index type: IVF_CAPPED with cluster capacity %u", leaf_cap);
+                break;
+            case IndexType::IVF_TREE:
+                ret = fread(&leaf_cap, sizeof(uint32_t), 1, file);
+                if (ret != 1) {
+                    fclose(file);
+                    FatalAssert(false, LOG_TAG_BASIC, "Failed to read leaf cluster capacity for IVF_TREE from index file: %s", index_path.c_str());
+                    return RetStatus::Fail("Failed to read leaf cluster capacity for IVF_TREE from index file");
+                }
+                FatalAssert(leaf_cap > 0, LOG_TAG_BASIC, "Leaf cluster capacity for IVF_TREE must be greater than 0: %s", index_path.c_str());
+                ret = fread(&internal_cap, sizeof(uint32_t), 1, file);
+                if (ret != 1) {
+                    fclose(file);
+                    FatalAssert(false, LOG_TAG_BASIC, "Failed to read internal cluster capacity for IVF_TREE from index file: %s", index_path.c_str());
+                    return RetStatus::Fail("Failed to read internal cluster capacity for IVF_TREE from index file");
+                }
+                FatalAssert(internal_cap > 0, LOG_TAG_BASIC, "Internal cluster capacity for IVF_TREE must be greater than 0: %s", index_path.c_str());
+                DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Index type: IVF_TREE with leaf cluster capacity %u and internal cluster capacity %u", leaf_cap, internal_cap);
+                break;
+            default:
+                fclose(file);
+                FatalAssert(false, LOG_TAG_BASIC, "Invalid index type in index file: %s", index_path.c_str());
+                return RetStatus::Fail("Invalid index type in index file");
+        }
+
+        uint32_t tmp;
+        ret = fread(&tmp, sizeof(uint32_t), 1, file);
+        if (ret != 1) {
+            fclose(file);
+            FatalAssert(false, LOG_TAG_BASIC, "Failed to read num_points from index file: %s", index_path.c_str());
+            return RetStatus::Fail("Failed to read num_points from index file");
+        }
+
+        FatalAssert(tmp > 0, LOG_TAG_BASIC, "Number of points in index file must be greater than 0: %s", index_path.c_str());
+
+        ret = fread(&num_points, sizeof(uint32_t), 1, file);
+        if (ret != 1) {
+            fclose(file);
+            FatalAssert(false, LOG_TAG_BASIC, "Failed to read num_unique points from index file: %s", index_path.c_str());
+            return RetStatus::Fail("Failed to read num_unique points from index file");
+        }
+
+        FatalAssert(num_points > 0, LOG_TAG_BASIC, "Number of unique points in index file must be greater than 0: %s", index_path.c_str());
+        FatalAssert(num_points <= tmp, LOG_TAG_BASIC, "Number of unique points cannot be greater than total points: %s", index_path.c_str());
+
+        uint16_t dimension;
+        ret = fread(&dimension, sizeof(uint16_t), 1, file);
+        if (ret != 1) {
+            fclose(file);
+            FatalAssert(false, LOG_TAG_BASIC, "Failed to read dimension from index file: %s", index_path.c_str());
+            return RetStatus::Fail("Failed to read dimension from index file");
+        }
+        FatalAssert(dimension == DIMENSION, LOG_TAG_BASIC,
+                    "Dimension in index file (%hu) does not match expected dimension (%hu): %s",
+                    dimension, DIMENSION, index_path.c_str());
+
+        ret = fread(&num_levels, sizeof(uint8_t), 1, file);
+        if (ret != 1) {
+            fclose(file);
+            FatalAssert(false, LOG_TAG_BASIC, "Failed to read num_levels from index file: %s", index_path.c_str());
+            return RetStatus::Fail("Failed to read num_levels from index file");
+        }
+        FatalAssert(num_levels > 0, LOG_TAG_BASIC, "Number of levels in index file must be greater than 0: %s", index_path.c_str());
+
+        cluster_infos = new ClusterInfo*[num_levels];
+        num_clusters = new uint32_t[num_levels];
+        clusters = new IVFCluster**[num_levels];
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Reading cluster data...");
+        for (uint8_t level = num_levels; level > 0; --level) {
+            uint8_t level_idx = level - 1;
+            ret = fread(&num_clusters[level_idx], sizeof(uint32_t), 1, file);
+            if (ret != 1) {
+                fclose(file);
+                FatalAssert(false, LOG_TAG_BASIC, "Failed to read num_clusters from index file: %s", index_path.c_str());
+                return RetStatus::Fail("Failed to read num_clusters from index file");
+            }
+            FatalAssert(num_clusters[level_idx] > 0, LOG_TAG_BASIC, "Number of clusters in index file must be greater than 0: %s", index_path.c_str());
+            if (level_idx != num_levels - 1) {
+                FatalAssert(num_clusters[level_idx] >= num_clusters[level_idx + 1], LOG_TAG_BASIC, "Number of clusters at level %u cannot be greater than number of clusters at level %u: %s",
+                            level, level + 1, index_path.c_str());
+                if (level_idx == 0) {
+                    FatalAssert(num_clusters[level_idx] <= num_points, LOG_TAG_BASIC, "Number of clusters at leaf level cannot be greater than number of unique points: %s", index_path.c_str());
+                }
+            }
+
+            cluster_infos[level_idx] = new ClusterInfo[num_clusters[level_idx]];
+            for (uint32_t cluster_idx = 0; cluster_idx < num_clusters[level_idx]; ++cluster_idx) {
+                ret = fread(&cluster_infos[level_idx][cluster_idx].id, sizeof(VectorID), 1, file);
+                FatalAssert(ret == 1, LOG_TAG_BASIC, "Failed to read cluster_id for cluster %u in level %u from index file: %s",
+                            cluster_idx, level, index_path.c_str());
+                FatalAssert(cluster_infos[level_idx][cluster_idx].id._level == level, LOG_TAG_BASIC,
+                            "Cluster ID level does not match expected level for cluster %u in level %u in index file: %s",
+                            cluster_idx, level, index_path.c_str());
+                ret = fread(&cluster_infos[level_idx][cluster_idx].num_points, sizeof(uint32_t), 1, file);
+                FatalAssert(ret == 1, LOG_TAG_BASIC, "Failed to read num_points_in_cluster for cluster %u in level %u from index file: %s",
+                            cluster_idx, level, index_path.c_str());
+                if (level == VectorID::LEAF_LEVEL) {
+                    uint32_t num_total_points_in_cluster;
+                    ret = fread(&num_total_points_in_cluster, sizeof(uint32_t), 1, file);
+                    FatalAssert(ret == 1, LOG_TAG_BASIC, "Failed to read num_total_points_in_cluster for cluster %u in level %u from index file: %s",
+                                cluster_idx, level, index_path.c_str());
+                    FatalAssert(num_total_points_in_cluster >= cluster_infos[level_idx][cluster_idx].num_points, LOG_TAG_BASIC,
+                                "num_total_points_in_cluster should be greater than or equal to num_points in the cluster for cluster %u in level %u in index file: %s",
+                                cluster_idx, level, index_path.c_str());
+                }
+                ret = fread(&cluster_infos[level_idx][cluster_idx].offset, sizeof(uint32_t), 1, file);
+                FatalAssert(ret == 1, LOG_TAG_BASIC, "Failed to read cluster_vector_offset for cluster %u in level %u from index file: %s",
+                            cluster_idx, level, index_path.c_str());
+
+                ret = fread(cluster_infos[level_idx][cluster_idx].centroid_vector, sizeof(CTYPE), DIMENSION, file);
+                FatalAssert(ret == DIMENSION, LOG_TAG_BASIC, "Failed to read centroid_vector for cluster %u in level %u from index file: %s",
+                            cluster_idx, level, index_path.c_str());
             }
         }
 
-        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
-                "Starting MN_DIVFIndex::Build() with %zu data points, %zu clusters, %zu max iterations, "
-                "%s duplicate insertion, and %zu threads.",
-                num_points, num_clusters, max_iterations,
-                insert_duplicates ? "allowing" : "disallowing", num_threads);
 
-        clusters.resize(num_clusters);
-        DIVF_MEMSET(out_vector_ids, UINT8_MAX, num_points * sizeof(IVFVectorID));
-        size_t data_seen = 0;
-        bool duplicate = false;
-        bool* valid = new bool[num_points];
-        SXSpinLock* cluster_build_locks = new SXSpinLock[num_clusters];
-        MVTYPE* temp_storage = new MVTYPE[dim * clusters.size() * num_threads];
-        size_t* cluster_sizes = new size_t[clusters.size() * num_threads];
-
-        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Choosing the first centroids from the existing data points...");
-        for (size_t c = 0; c < num_clusters; c++) {
-            FatalAssert(data_seen < num_points, LOG_TAG_BASIC,
-                        "Not enough unique data points to initialize centroids!");
-            FatalAssert(clusters[c].centroid_tmp == nullptr, LOG_TAG_BASIC,
-                        "Centroid temporary storage should be null at this point!");
-            FatalAssert(out_vector_ids[data_seen] == INVALID_IVF_VECTOR_ID, LOG_TAG_BASIC,
-                        "Output vector IDs should be invalid at this point!");
-            out_vector_ids[data_seen] =
-                vectorDirectory.Insert(data + (data_seen * dim), insert_duplicates, &duplicate);
-            if (duplicate) {
-                FatalAssert(insert_duplicates == (out_vector_ids[data_seen] != INVALID_IVF_VECTOR_ID),
-                            LOG_TAG_BASIC, "Duplicate found when insert_duplicates is false!");
-                valid[data_seen] = false;
-                data_seen++;
-                c--;
-                duplicate = false;
-                continue;
-            }
-
-            valid[data_seen] = true;
-            IVFVectorInfo* info = vectorDirectory.Find(out_vector_ids[data_seen]);
-            CHECK_NOT_NULLPTR(info, LOG_TAG_BASIC);
-
-            clusters[c].centroid_id = VectorID::AsID(c);
-            clusters[c].centroid_tmp = new MVTYPE[dim];
-            for (size_t d = 0; d < dim; d++) {
-                clusters[c].centroid_tmp[d] = static_cast<MVTYPE>(data[(data_seen * dim) + d]);
-            }
-            clusters[c].num_points = 1;
-            clusters[c].data = nullptr;
-            info->centroid_id = clusters[c].centroid_id;
-            info->vector = const_cast<VTYPE*>(data + (data_seen * dim));
-
-            DIVFLOG(LOG_LEVEL_DEBUG, LOG_TAG_BASIC, "%zu-th vector was chosen as the %zu-th centroid.", data_seen, c);
-            data_seen++;
-        }
-
-        std::vector<Thread*> builder_threads;
-        std::atomic<size_t>* current_size = new std::atomic<size_t>[clusters.size()];
-        for (size_t c = 0; c < clusters.size(); c++) {
-            current_size[c].store(0, std::memory_order_relaxed);
-        }
-
-        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Starting clustering process...");
-        if (num_threads == 1) {
-            SequentialBuild(data, data_seen, num_points, valid,
-                            insert_duplicates, out_vector_ids, temp_storage, cluster_sizes, current_size,
-                            max_iterations);
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Allocating enough memory for clusters and vectors...");
+        if (index_type == IndexType::IVF_FLAT) {
+            FatalAssert(num_levels == 1, LOG_TAG_BASIC, "IVFFlat has only a single level");
+            pool_size = ALIGNED_SIZE((num_clusters[0] * sizeof(ClusterHeaderData)) +
+                                     (num_points * sizeof(VectorData)) +
+                                     (num_clusters[0] * CACHE_LINE_SIZE) +
+                                     (MEMORY_POOL_PADDING * 2)); // extra padding to ensure we have enough space for alignment and any metadata
+        } else if (index_type == IndexType::IVF_CAPPED) {
+            FatalAssert(num_levels == 1, LOG_TAG_BASIC, "IVFCapped has only a single level");
+            leaf_bytes = ALIGNED_SIZE(sizeof(ClusterHeaderData) + ((size_t)leaf_cap * sizeof(VectorData)));
+            pool_size = ALIGNED_SIZE((num_clusters[0] * leaf_bytes) + (MEMORY_POOL_PADDING * 2)); // extra padding to ensure we have enough space for alignment and any metadata
         } else {
-            builder_threads.reserve(num_threads - 1);
-            uint64_t thread_range = (num_points / num_threads);
-            size_t thread_step = std::max(1lu, thread_range / 8lu);
-            std::atomic<size_t> seen_idx(data_seen);
-            std::atomic<bool> converged(true);
-            std::barrier<> sync_point(num_threads);
-            for (size_t t = 1; t < num_threads; t++) {
-                builder_threads.emplace_back(new Thread(100));
-                Thread* thrd = builder_threads.back();
-                thrd->StartMemberFunction(&MN_DIVFIndex::ParallelBuilder, this, data, &seen_idx, num_points,
-                                         thread_step, valid, insert_duplicates,
-                                         out_vector_ids, cluster_build_locks,
-                                         &(temp_storage[t * dim * clusters.size()]),
-                                         &(cluster_sizes[t * clusters.size()]), &sync_point, &converged,
-                                         current_size, max_iterations);
+            FatalAssert(index_type == IndexType::IVF_TREE, LOG_TAG_BASIC, "Invalid index type specified in index file!");
+            leaf_bytes = ALIGNED_SIZE(sizeof(ClusterHeaderData) + ((size_t)leaf_cap * sizeof(VectorData)));
+            internal_bytes = ALIGNED_SIZE(sizeof(ClusterHeaderData) + ((size_t)internal_cap * sizeof(CentroidData)));
+            size_t num_leaf_clusters = num_clusters[0];
+            size_t num_internal_clusters = 0;
+            for (uint8_t level = 1; level < num_levels; ++level) {
+                num_internal_clusters += num_clusters[level];
             }
-            ParallelBuild(data, seen_idx, num_points, thread_step,
-                          valid, insert_duplicates, out_vector_ids, cluster_build_locks,
-                          temp_storage, cluster_sizes, true, &sync_point, &converged, current_size, max_iterations);
-
-            for (Thread* t : builder_threads) {
-                delete t;
-            }
-            builder_threads.clear();
+            pool_size = ALIGNED_SIZE(ALIGNED_SIZE(num_leaf_clusters * leaf_bytes) +
+                                     ALIGNED_SIZE((num_internal_clusters + 1) * internal_bytes) + // one addtional cluster for root
+                                     (MEMORY_POOL_PADDING * 2)); // extra padding to ensure we have enough space for alignment and any metadata
         }
 
-        delete[] valid;
-        delete[] cluster_build_locks;
-        delete[] temp_storage;
-        delete[] cluster_sizes;
-        delete[] current_size;
+#ifdef USE_HUGETLB
+        memory_pool = mmap64(nullptr, pool_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+#else
+        memory_pool = mmap64(nullptr, pool_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
 
-        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "MN_DIVFIndex::Build() completed successfully with %zu unique vectors and"
-                "%lu total size.", vectorDirectory.Size(true), vectorDirectory.Size());
-        size = vectorDirectory.Size();
+        if (memory_pool == MAP_FAILED || memory_pool == nullptr) {
+            fclose(file);
+            FatalAssert(false, LOG_TAG_BASIC, "Failed to allocate memory for MemoryPool. errno: %d, errno msg: %s",
+                        errno, strerror(errno));
+            return RetStatus::Fail("Failed to allocate memory for MemoryPool");
+        }
+
+        FatalAssert(ALIGNED(memory_pool), LOG_TAG_BASIC,
+                    "MemoryPool memory_pool is not properly aligned. Requested alignment: %lu, memory_pool address: %p",
+                    CACHE_LINE_SIZE, memory_pool);
+        RetStatus rs = RetStatus::Success();
+        if (index_type == IndexType::IVF_FLAT) {
+            rs = BuildIVFFlat(file);
+        } else if (index_type == IndexType::IVF_CAPPED) {
+            rs = BuildIVFCapped(file);
+        } else {
+            FatalAssert(index_type == IndexType::IVF_TREE, LOG_TAG_BASIC, "Invalid index type specified in index file!");
+            rs = BuildIVFTree(file);
+        }
+
+        FatalAssert(rs.IsOK(), LOG_TAG_BASIC, "failed to build index");
+
+        fclose(file);
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Finished loading the index from file.");
+        return rs;
+    }
+
+    void ReadVectorDataFromFile(FILE* file, uint64_t file_offset, VectorData* data_arr, uint32_t num_points_to_read) {
+        fseek(file, file_offset, SEEK_SET);
+        ReadVectorDataFromFile(file, data_arr, num_points_to_read);
+    }
+
+    void ReadVectorDataFromFile(FILE* file, VectorData* data_arr, uint32_t num_points_to_read) {
+        for (uint32_t p = 0; p < num_points_to_read; ++p) {
+            size_t ret = fread(&data_arr[p].id, sizeof(IVFVectorID), 1, file);
+            FatalAssert(ret == 1, LOG_TAG_BASIC, "Failed to read vector_id for point");
+            uint32_t nd = 0;
+            ret = fread(&nd, sizeof(uint32_t), 1, file);
+            FatalAssert(ret == 1, LOG_TAG_BASIC, "Failed to read num_duplicate for point");
+            ret = fread(data_arr[p].data, sizeof(VTYPE), DIMENSION, file);
+            FatalAssert(ret == DIMENSION, LOG_TAG_BASIC, "Failed to read vector data for point");
+        }
+    }
+
+    RetStatus BuildIVFFlat(FILE* file) {
+        clusters[0] = new IVFCluster*[num_clusters[0]];
+        uint32_t n_clusters = num_clusters[0];
+        IVFCluster** cluster_ptr_arr = clusters[0];
+        ClusterInfo* info = cluster_infos[0];
+
+        uint32_t num_seen = 0;
+        size_t bytes_offset = MEMORY_POOL_PADDING;
+        for (uint32_t c = 0; c < n_clusters; ++c) {
+            FatalAssert(info[c].offset == num_seen, LOG_TAG_BASIC, "invalid offset!");
+            void* cluster_mem = reinterpret_cast<uint8_t*>(memory_pool) + bytes_offset;
+            FatalAssert(ALIGNED(cluster_mem), LOG_TAG_BASIC, "cluster memory should be cache aligned");
+            FatalAssert(bytes_offset < pool_size - MEMORY_POOL_PADDING, LOG_TAG_BASIC, "Not enough memory in pool for cluster!");
+            cluster_ptr_arr[c] = new (cluster_mem) IVFCluster();
+            cluster_ptr_arr[c]->header.id = info[c].id;
+            cluster_ptr_arr[c]->header.num_points = info[c].num_points;
+            info[c].bytes = ALIGNED_SIZE(sizeof(ClusterHeaderData) + (info[c].num_points * sizeof(VectorData)));
+            info[c].cluster_ptr = cluster_ptr_arr[c];
+            num_seen += info[c].num_points;
+            bytes_offset += info[c].bytes;
+
+            ReadVectorDataFromFile(file, reinterpret_cast<VectorData*>(cluster_ptr_arr[c]->data), info[c].num_points);
+        }
+
+        FatalAssert(num_seen == num_points, LOG_TAG_BASIC, "Number of points seen while building IVF_FLAT index does not match expected num_points from index file!");
         return RetStatus::Success();
     }
 
-    inline void* AllocateMemory(size_t size_in_bytes) {
-        size_t aligned_size = ALIGNED_SIZE(size_in_bytes, CACHE_LINE_SIZE);
-        size_t offset = next_memory_offset.fetch_add(aligned_size);
-        FatalAssert((offset + aligned_size) <= pool_size,
-                    LOG_TAG_MEMORY, "MN_DIVFIndex memory pool out of memory!");
-        return static_cast<void*>(static_cast<char*>(memory_pool) + offset);
+    RetStatus BuildIVFCapped(FILE* file) {
+        clusters[0] = new IVFCluster*[num_clusters[0]];
+        uint32_t n_clusters = num_clusters[0];
+        IVFCluster** cluster_ptr_arr = clusters[0];
+        ClusterInfo* info = cluster_infos[0];
+
+        uint32_t num_seen = 0;
+        size_t bytes_offset = MEMORY_POOL_PADDING;
+        for (uint32_t c = 0; c < n_clusters; ++c) {
+            FatalAssert(info[c].offset == num_seen, LOG_TAG_BASIC, "invalid offset!");
+            void* cluster_mem = reinterpret_cast<uint8_t*>(memory_pool) + bytes_offset;
+            FatalAssert(ALIGNED(cluster_mem), LOG_TAG_BASIC, "cluster memory should be cache aligned");
+            FatalAssert(bytes_offset < pool_size - MEMORY_POOL_PADDING, LOG_TAG_BASIC, "Not enough memory in pool for cluster!");
+            cluster_ptr_arr[c] = new (cluster_mem) IVFCluster();
+            cluster_ptr_arr[c]->header.id = info[c].id;
+            cluster_ptr_arr[c]->header.num_points = info[c].num_points;
+            info[c].bytes = ALIGNED_SIZE(sizeof(ClusterHeaderData) + (info[c].num_points * sizeof(VectorData)));
+            FatalAssert(leaf_bytes >= info[c].bytes, LOG_TAG_BASIC, "cluster size exceeds capacity!");
+            FatalAssert(leaf_cap >= info[c].num_points, LOG_TAG_BASIC, "cluster size exceeds capacity!");
+            info[c].cluster_ptr = cluster_ptr_arr[c];
+            num_seen += info[c].num_points;
+            bytes_offset += leaf_bytes;
+
+            ReadVectorDataFromFile(file, reinterpret_cast<VectorData*>(cluster_ptr_arr[c]->data), info[c].num_points);
+        }
+
+        FatalAssert(num_seen == num_points, LOG_TAG_BASIC, "Number of points seen while building IVF_FLAT index does not match expected num_points from index file!");
+        return RetStatus::Success();
     }
 
-    inline void ClearClusterData() {
-        FatalAssert(clusters.size() >= 2, LOG_TAG_BASIC,
-                    "There should be at least 2 clusters to clear data!");
-        for (size_t c = 0; c < clusters.size(); c++) {
-            CHECK_NOT_NULLPTR(clusters[c].centroid_tmp, LOG_TAG_BASIC);
-            DIVF_MEMSET(clusters[c].centroid_tmp, 0, sizeof(MVTYPE) * dim);
-            clusters[c].num_points = 0;
-        }
-    }
-
-    inline void PartialFirstAssignments(const VTYPE* data, size_t start_idx, size_t end_idx,
-                                        bool* is_valid, bool insert_duplicates, IVFVectorID* out_vector_ids) {
-        FatalAssert(start_idx < end_idx, LOG_TAG_BASIC,
-                    "Invalid start and end indices for PartialFirstAssignments()");
-        DIVFLOG(LOG_LEVEL_DEBUG, LOG_TAG_BASIC, "First Assignments from %zu to %zu...", start_idx, end_idx);
-        bool duplicate = false;
-        for (size_t i = start_idx; i < end_idx; i++) {
-            FatalAssert(out_vector_ids[i] == INVALID_IVF_VECTOR_ID, LOG_TAG_BASIC,
-                        "Output vector IDs should be invalid at this point!");
-            uint64_t vector_hash = vectorDirectory.GetVectorHash(data + (i * dim));
-            vectorDirectory.LockVector(vector_hash, SX_EXCLUSIVE);
-            out_vector_ids[i] = vectorDirectory.Insert(vector_hash, data + (i * dim), insert_duplicates, &duplicate);
-            FatalAssert((out_vector_ids[i] != INVALID_IVF_VECTOR_ID) || (insert_duplicates && duplicate), LOG_TAG_BASIC,
-                        "Duplicate found when insert_duplicates is false!");
-            FatalAssert((out_vector_ids[i] == INVALID_IVF_VECTOR_ID) || (out_vector_ids[i].vector_hash == vector_hash),
-                        LOG_TAG_BASIC, "Inserted vector hash does not match!");
-            if (duplicate) {
-                is_valid[i] = false;
-                duplicate = false;
-                vectorDirectory.UnlockVector(vector_hash);
-                continue;
+    RetStatus BuildIVFTree(FILE* file) {
+        uint32_t num_seen = 0;
+        size_t bytes_offset = MEMORY_POOL_PADDING;
+        long file_data_start_offset = 0;
+        std::map<uint32_t, uint32_t> old_offsets, new_offsets;
+        for (uint8_t level_idx = num_levels - 1; level_idx != UINT8_MAX; --level_idx) {
+            uint8_t level = level_idx + 1;
+            clusters[level_idx] = new IVFCluster*[num_clusters[level_idx]];
+            num_seen = 0;
+            if (level == VectorID::LEAF_LEVEL) {
+                file_data_start_offset = ftell(file);
             }
-            is_valid[i] = true;
-            IVFVectorInfo* info = vectorDirectory.Find(out_vector_ids[i]);
-            CHECK_NOT_NULLPTR(info, LOG_TAG_BASIC);
-            info->vector = const_cast<VTYPE*>(data + (i * dim));
-            vectorDirectory.UnlockVector(vector_hash);
-
-            size_t closest_idx = 0;
-            DTYPE closest_dist = Distance(data + (i * dim), clusters[0].centroid_tmp, dim, DistanceType::L2);
-            FatalAssert(closest_dist > 0, LOG_TAG_BASIC,
-                        "Distance computation returned 0!");
-            for (size_t c = 1; c < clusters.size(); c++) {
-                DTYPE dist = Distance(data + (i * dim), clusters[c].centroid_tmp, dim, DistanceType::L2);
-                FatalAssert(dist > 0, LOG_TAG_BASIC,
-                            "Distance computation returned 0!");
-                if (MoreSimilar(dist, closest_dist, DistanceType::L2) > 0) {
-                    closest_dist = dist;
-                    closest_idx = c;
-                }
-            }
-
-            info->centroid_id = clusters[closest_idx].centroid_id;
-        }
-    }
-
-    inline void PartialAssignments(const VTYPE* data, size_t start_idx, size_t end_idx,
-                                   const bool* is_valid, const IVFVectorID* out_vector_ids,
-                                   std::atomic<bool>* converged) {
-        FatalAssert(start_idx < end_idx, LOG_TAG_BASIC,
-                    "Invalid start and end indices for PartialAssignments()");
-        DIVFLOG(LOG_LEVEL_DEBUG, LOG_TAG_BASIC, "Assignments from %zu to %zu...", start_idx, end_idx);
-        for (size_t i = start_idx; i < end_idx; i++) {
-            if (!is_valid[i]) {
-                continue;
-            }
-
-            IVFVectorInfo* info = vectorDirectory.Find(out_vector_ids[i]);
-            CHECK_NOT_NULLPTR(info, LOG_TAG_BASIC);
-            size_t old_cent = info->centroid_id._val;
-            size_t closest_idx = 0;
-            DTYPE closest_dist = Distance(data + (i * dim), clusters[0].centroid_tmp, dim, DistanceType::L2);
-            FatalAssert(closest_dist > 0, LOG_TAG_BASIC,
-                        "Distance computation returned 0!");
-            for (size_t c = 1; c < clusters.size(); c++) {
-                DTYPE dist = Distance(data + (i * dim), clusters[c].centroid_tmp, dim, DistanceType::L2);
-                // FatalAssert(dist > 0, LOG_TAG_BASIC,
-                //             "Distance computation returned 0!");
-                if (MoreSimilar(dist, closest_dist, DistanceType::L2) > 0) {
-                    closest_dist = dist;
-                    closest_idx = c;
-                }
-            }
-
-            if (old_cent != closest_idx) {
-                converged->store(false, std::memory_order_release);
-            }
-            info->centroid_id = clusters[closest_idx].centroid_id;
-        }
-    }
-
-    inline void PartialUpdateCentroids(const VTYPE* data, size_t start_idx, size_t end_idx, const bool* is_valid,
-                                       const IVFVectorID* out_vector_ids, SXSpinLock* cluster_locks,
-                                       MVTYPE* temp_storage, size_t* cluster_sizes) {
-        DIVFLOG(LOG_LEVEL_DEBUG, LOG_TAG_BASIC, "Updating Centroids by checking vectors %zu to %zu...",
-                start_idx, end_idx);
-        DIVF_MEMSET(temp_storage, 0, sizeof(MVTYPE) * dim * clusters.size());
-        DIVF_MEMSET(cluster_sizes, 0, sizeof(size_t) * clusters.size());
-
-        for (size_t i = start_idx; i < end_idx; i++) {
-            if (!is_valid[i]) {
-                continue;
-            }
-
-            IVFVectorInfo* info = vectorDirectory.Find(out_vector_ids[i]);
-            CHECK_NOT_NULLPTR(info, LOG_TAG_BASIC);
-            VectorID centroid_id = info->centroid_id;
-
-            size_t c_idx = centroid_id._val;
-            cluster_sizes[c_idx]++;
-            for (size_t d = 0; d < dim; d++) {
-                temp_storage[(c_idx * dim) + d] += static_cast<MVTYPE>(data[(i * dim) + d]);
-            }
-        }
-
-        size_t checked = 0;
-        while(checked < clusters.size()) {
-            checked = 0;
-            for (size_t c = 0; c < clusters.size(); c++) {
-                if (cluster_sizes[c] == 0) {
-                    ++checked;
-                    continue;
-                }
-
-                if (cluster_locks != nullptr && !cluster_locks[c].TryLock(SX_EXCLUSIVE)) {
-                    continue;
-                }
-
-                clusters[c].num_points += cluster_sizes[c];
-                for (size_t d = 0; d < dim; d++) {
-                    clusters[c].centroid_tmp[d] += temp_storage[(c * dim) + d];
-                }
-                if (cluster_locks != nullptr) {
-                    cluster_locks[c].Unlock();
-                }
-                cluster_sizes[c] = 0;
-                ++checked;
-            }
-            FatalAssert(checked <= clusters.size(), LOG_TAG_BASIC,
-                        "Checked clusters exceeded total number of clusters!");
-            if (checked < clusters.size()) {
-                DIVFTREE_YIELD();
-            }
-        }
-    }
-
-    inline void TakeTask(size_t& start_idx, size_t& size, size_t step_size, size_t end_idx,
-                         std::atomic<size_t>& seen_idx) {
-        size = step_size;
-        start_idx = seen_idx.fetch_add(size);
-        if (start_idx >= end_idx) {
-            size = 0;
-        } else if (end_idx - start_idx < size) {
-            size = end_idx - start_idx;
-        }
-    }
-
-    inline void ParallelFirstIteration(const VTYPE* data, std::atomic<size_t>& seen_idx, size_t end_idx,
-                                       size_t step_size, bool* is_valid, bool insert_duplicates,
-                                       IVFVectorID* out_vector_ids, SXSpinLock* cluster_build_locks,
-                                       MVTYPE* temp_storage, size_t* cluster_sizes,
-                                       bool is_master_thread, std::barrier<>* sync_point) {
-        size_t beg, size;
-        while (true) {
-            TakeTask(beg, size, step_size, end_idx, seen_idx);
-            if (size == 0) {
-                break;
-            }
-            FatalAssert(beg + size <= end_idx, LOG_TAG_BASIC,
-                        "Invalid task taken from the queue!");
-            FatalAssert(size > 0, LOG_TAG_BASIC,
-                        "Invalid task size taken from the queue!");
-            FatalAssert(beg + size > beg, LOG_TAG_BASIC,
-                        "Invalid task range taken from the queue!");
-            PartialFirstAssignments(data, beg, beg + size, is_valid, insert_duplicates, out_vector_ids);
-        }
-        BARRIER(*sync_point, "ParallelFirstIter -> Assignment Phase Completed");
-        if (is_master_thread) {
-            ClearClusterData();
-            seen_idx.store(0, std::memory_order_release);
-        }
-        BARRIER(*sync_point, "ParallelFirstIter -> Master Cleared Cluster Data");
-
-        while (true) {
-            TakeTask(beg, size, step_size, end_idx, seen_idx);
-            if (size == 0) {
-                break;
-            }
-            FatalAssert(beg + size <= end_idx, LOG_TAG_BASIC,
-                        "Invalid task taken from the queue!");
-            FatalAssert(size > 0, LOG_TAG_BASIC,
-                        "Invalid task size taken from the queue!");
-            FatalAssert(beg + size > beg, LOG_TAG_BASIC,
-                        "Invalid task range taken from the queue!");
-            PartialUpdateCentroids(data, beg, beg + size, is_valid, out_vector_ids,
-                                   cluster_build_locks,
-                                   temp_storage, cluster_sizes);
-        }
-        BARRIER(*sync_point, "ParallelFirstIter -> Iteration Completed");
-    }
-
-    inline void ParallelIteration(const VTYPE* data, std::atomic<size_t>& seen_idx, size_t end_idx,
-                                  size_t step_size, const bool* is_valid,
-                                  const IVFVectorID* out_vector_ids, SXSpinLock* cluster_build_locks,
-                                  MVTYPE* temp_storage, size_t* cluster_sizes,
-                                  bool is_master_thread, std::barrier<>* sync_point, std::atomic<bool>* converged) {
-        size_t beg, size;
-        while (true) {
-            TakeTask(beg, size, step_size, end_idx, seen_idx);
-            if (size == 0) {
-                break;
-            }
-            FatalAssert(beg + size <= end_idx, LOG_TAG_BASIC,
-                        "Invalid task taken from the queue!");
-            FatalAssert(size > 0, LOG_TAG_BASIC,
-                        "Invalid task size taken from the queue!");
-            FatalAssert(beg + size > beg, LOG_TAG_BASIC,
-                        "Invalid task range taken from the queue!");
-            PartialAssignments(data, beg, beg + size, is_valid, out_vector_ids, converged);
-        }
-
-        BARRIER(*sync_point, "ParallelIter -> Assignment Phase Completed");
-        if (converged->load(std::memory_order_acquire)) {
-            return;
-        }
-
-        if (is_master_thread) {
-            ClearClusterData();
-            seen_idx.store(0, std::memory_order_release);
-        }
-        BARRIER(*sync_point, "ParallelIter -> Master Cleared Cluster Data");
-
-        while (true) {
-            TakeTask(beg, size, step_size, end_idx, seen_idx);
-            if (size == 0) {
-                break;
-            }
-            FatalAssert(beg + size <= end_idx, LOG_TAG_BASIC,
-                        "Invalid task taken from the queue!");
-            FatalAssert(size > 0, LOG_TAG_BASIC,
-                        "Invalid task size taken from the queue!");
-            FatalAssert(beg + size > beg, LOG_TAG_BASIC,
-                        "Invalid task range taken from the queue!");
-            PartialUpdateCentroids(data, beg, beg + size, is_valid, out_vector_ids,
-                                   cluster_build_locks,
-                                   temp_storage, cluster_sizes);
-        }
-        BARRIER(*sync_point, "ParallelIter -> Iteration Completed");
-    }
-
-    inline void PartialStore(const VTYPE* data, size_t start_idx, size_t end_idx,
-                             const bool* is_valid, const IVFVectorID* out_vector_ids,
-                             std::atomic<size_t>* current_size) {
-        FatalAssert(start_idx < end_idx, LOG_TAG_BASIC,
-                    "Invalid start and end indices for PartialStore()");
-        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Storing vectors from %zu to %zu...", start_idx, end_idx);
-        for (size_t i = start_idx; i < end_idx; i++) {
-            if (!is_valid[i]) {
-                continue;
-            }
-
-            IVFVectorInfo* info = vectorDirectory.Find(out_vector_ids[i]);
-            CHECK_NOT_NULLPTR(info, LOG_TAG_BASIC);
-            size_t c_idx = info->centroid_id._val;
-            info->offset = current_size[c_idx].fetch_add(1);
-            FatalAssert(info->offset < clusters[c_idx].num_points, LOG_TAG_BASIC,
-                        "Cluster data offset exceeded allocated size!");
-            FatalAssert(info->vector == (data + (i * dim)), LOG_TAG_BASIC,
-                        "Vector pointer mismatch during store!");
-            void* add =
-                reinterpret_cast<void*>(clusters[c_idx].data) +
-                (info->offset * (sizeof(IVFVectorID) + (dim * sizeof(VTYPE))));
-            info->vector = reinterpret_cast<VTYPE*>(add + sizeof(IVFVectorID));
-
-            DIVF_MEMCOPY(add, &out_vector_ids[i], sizeof(IVFVectorID));
-            DIVF_MEMCOPY(info->vector, data + (i * dim), sizeof(VTYPE) * dim);
-        }
-    }
-
-    inline void ParallelStore(const VTYPE* data, std::atomic<size_t>& seen_idx, size_t end_idx,
-                              size_t step_size, const bool* is_valid, const IVFVectorID* out_vector_ids,
-                              std::atomic<size_t>* current_size) {
-        size_t beg, size;
-        while (true) {
-            TakeTask(beg, size, step_size, end_idx, seen_idx);
-            if (size == 0) {
-                break;
-            }
-            FatalAssert(beg + size <= end_idx, LOG_TAG_BASIC,
-                        "Invalid task taken from the queue!");
-            FatalAssert(size > 0, LOG_TAG_BASIC,
-                        "Invalid task size taken from the queue!");
-            FatalAssert(beg + size > beg, LOG_TAG_BASIC,
-                        "Invalid task range taken from the queue!");
-            PartialStore(data, beg, beg + size, is_valid, out_vector_ids, current_size);
-        }
-    }
-
-    inline void SequentialBuild(const VTYPE* data, size_t seen_idx, size_t end_idx,
-                                bool* is_valid, bool insert_duplicates,
-                                IVFVectorID* out_vector_ids, MVTYPE* temp_storage, size_t* cluster_sizes,
-                                std::atomic<size_t>* current_size, size_t max_iterations) {
-
-        PartialFirstAssignments(data, seen_idx, end_idx, is_valid, insert_duplicates, out_vector_ids);
-        ClearClusterData();
-        PartialUpdateCentroids(data, 0, end_idx, is_valid, out_vector_ids,
-                               nullptr, temp_storage, cluster_sizes);
-        for (size_t c = 0; c < clusters.size(); c++) {
-            FatalAssert(clusters[c].num_points > 0, LOG_TAG_BASIC,
-                        "Cluster has no points assigned to it!");
-            String centroid_data = "[";
-            for (size_t d = 0; d < dim; d++) {
-                clusters[c].centroid_tmp[d] =
-                    static_cast<MVTYPE>(clusters[c].centroid_tmp[d] / static_cast<MVTYPE>(clusters[c].num_points));
-                centroid_data += String(MVTYPE_FMT "%s", clusters[c].centroid_tmp[d],
-                                       (d + 1 == dim) ? "]" : ", ");
-            }
-            DIVFLOG(LOG_LEVEL_DEBUG, LOG_TAG_BASIC,
-                    "Centroid %zu has %zu points assigned to it. Centroid data: %s",
-                    c, clusters[c].num_points, centroid_data.ToCStr());
-        }
-
-        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "First iteration completed.");
-
-        bool wait_until_converged = (max_iterations == 0);
-        std::atomic<bool> converged = true;
-        for (size_t i = 0; wait_until_converged || i < max_iterations - 1; i++) {
-            converged.store(true, std::memory_order_relaxed);
-            PartialAssignments(data, 0, end_idx, is_valid, out_vector_ids, &converged);
-            if (converged.load(std::memory_order_relaxed)) {
-                break;
-            }
-            ClearClusterData();
-            PartialUpdateCentroids(data, 0, end_idx, is_valid, out_vector_ids,
-                                   nullptr, temp_storage, cluster_sizes);
-
-            for (size_t c = 0; c < clusters.size(); c++) {
-                FatalAssert(clusters[c].num_points > 0, LOG_TAG_BASIC,
-                            "Cluster has no points assigned to it!");
-                for (size_t d = 0; d < dim; d++) {
-                    clusters[c].centroid_tmp[d] =
-                        static_cast<MVTYPE>(clusters[c].centroid_tmp[d] / static_cast<MVTYPE>(clusters[c].num_points));
-                }
-            }
-            if (wait_until_converged) {
-                DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%zu%s iteration completed. converged: %s",
-                        i + 2, (i == 0 ? "ed" : "th"), converged.load(std::memory_order_relaxed) ? "true" : "false");
-            } else {
-                DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%zu/%zu iteration completed. converged: %s",
-                        i + 2, max_iterations, converged.load(std::memory_order_relaxed) ? "true" : "false");
-            }
-        }
-
-
-        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Clustering completed. Finalizing centroids and storing data...");
-
-        for (size_t c = 0; c < clusters.size(); c++) {
-            FatalAssert(clusters[c].num_points > 0, LOG_TAG_BASIC,
-                        "Cluster has no points assigned to it!");
-            VTYPE* final_centroid = new VTYPE[dim];
-            String centroid_data = "[";
-            for (size_t d = 0; d < dim; d++) {
-                if (converged.load(std::memory_order_relaxed)) {
-                    final_centroid[d] = static_cast<VTYPE>(clusters[c].centroid_tmp[d]);
+            for (uint32_t c = 0; c < num_clusters[level_idx]; ++c) {
+                // FatalAssert(cluster_infos[level_idx][c].offset == num_seen, LOG_TAG_BASIC, "invalid offset!");
+                void* cluster_mem = reinterpret_cast<uint8_t*>(memory_pool) + bytes_offset;
+                FatalAssert(ALIGNED(cluster_mem), LOG_TAG_BASIC, "cluster memory should be cache aligned");
+                FatalAssert(bytes_offset < pool_size - MEMORY_POOL_PADDING, LOG_TAG_BASIC, "Not enough memory in pool for cluster!");
+                clusters[level_idx][c] = new (cluster_mem) IVFCluster();
+                clusters[level_idx][c]->header.id = cluster_infos[level_idx][c].id;
+                clusters[level_idx][c]->header.num_points = cluster_infos[level_idx][c].num_points;
+                cluster_infos[level_idx][c].cluster_ptr = clusters[level_idx][c];
+                FatalAssert(new_offsets.find(cluster_infos[level_idx][c].offset) == new_offsets.end(), LOG_TAG_BASIC, "duplicate offset found for cluster %u in level %u while building IVF_TREE index!", c, level);
+                new_offsets[cluster_infos[level_idx][c].offset] = c;
+                if (level == VectorID::LEAF_LEVEL) {
+                    cluster_infos[level_idx][c].bytes = ALIGNED_SIZE(sizeof(ClusterHeaderData) + (cluster_infos[level_idx][c].num_points * sizeof(VectorData)));
+                    FatalAssert(leaf_bytes >= cluster_infos[level_idx][c].bytes, LOG_TAG_BASIC, "cluster size exceeds capacity!");
+                    FatalAssert(leaf_cap >= cluster_infos[level_idx][c].num_points, LOG_TAG_BASIC, "cluster size exceeds capacity!");
+                    constexpr size_t vector_data_size = sizeof(IVFVectorID) + sizeof(uint32_t) + (sizeof(VTYPE) * DIMENSION);
+                    uint64_t file_offset = (uint64_t)file_data_start_offset +
+                                           (cluster_infos[level_idx][c].offset * vector_data_size);
+                    ReadVectorDataFromFile(file, file_offset,
+                                           reinterpret_cast<VectorData*>(clusters[level_idx][c]->data),
+                                           cluster_infos[level_idx][c].num_points);
+                    bytes_offset += leaf_bytes;
                 } else {
-                    final_centroid[d] = static_cast<VTYPE>(clusters[c].centroid_tmp[d] /
-                                                            static_cast<MVTYPE>(clusters[c].num_points));
+                    FatalAssert(level > VectorID::LEAF_LEVEL, LOG_TAG_BASIC, "cannot handle vectors here!");
+                    cluster_infos[level_idx][c].bytes = ALIGNED_SIZE(sizeof(ClusterHeaderData) + (cluster_infos[level_idx][c].num_points * sizeof(CentroidData)));
+                    FatalAssert(internal_bytes >= cluster_infos[level_idx][c].bytes, LOG_TAG_BASIC, "cluster size exceeds capacity!");
+                    FatalAssert(internal_cap >= cluster_infos[level_idx][c].num_points, LOG_TAG_BASIC, "cluster size exceeds capacity!");
+                    bytes_offset += internal_bytes;
                 }
-                centroid_data += String(VTYPE_FMT "%s", final_centroid[d],
-                                       (d + 1 == dim) ? "]" : ", ");
-            }
-            delete[] clusters[c].centroid_tmp;
-            clusters[c].centroid = final_centroid;
-            clusters[c].data =
-                reinterpret_cast<char*>(AllocateMemory(clusters[c].num_points *
-                                                       ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID))));
-            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
-                    "Finalized centroid %zu with %zu points. Centroid data: %s",
-                    c, clusters[c].num_points, centroid_data.ToCStr());
-        }
+                num_seen += cluster_infos[level_idx][c].num_points;
 
-
-        PartialStore(data, 0, end_idx, is_valid, out_vector_ids, current_size);
-        SANITY_CHECK({
-            for (size_t c = 0; c < clusters.size(); c++) {
-                FatalAssert(current_size[c].load(std::memory_order_relaxed) == clusters[c].num_points, LOG_TAG_BASIC,
-                            "Cluster size mismatch after data storage!");
-            }
-        });
-    }
-
-    inline void ParallelBuild(const VTYPE* data, std::atomic<size_t>& seen_idx, size_t end_idx,
-                              size_t step_size, bool* is_valid, bool insert_duplicates,
-                              IVFVectorID* out_vector_ids, SXSpinLock* cluster_build_locks,
-                              MVTYPE* temp_storage, size_t* cluster_sizes,
-                              bool is_master_thread, std::barrier<>* sync_point, std::atomic<bool>* converged,
-                              std::atomic<size_t>* current_size,
-                              size_t max_iterations) {
-        ParallelFirstIteration(data, seen_idx, end_idx, step_size, is_valid,
-                               insert_duplicates, out_vector_ids, cluster_build_locks,
-                               temp_storage, cluster_sizes, is_master_thread, sync_point);
-        if (is_master_thread) {
-            seen_idx.store(0, std::memory_order_release);
-            for (size_t c = 0; c < clusters.size(); c++) {
-                FatalAssert(clusters[c].num_points > 0, LOG_TAG_BASIC,
-                            "Cluster has no points assigned to it!");
-                String centroid_data = "[";
-                for (size_t d = 0; d < dim; d++) {
-                    clusters[c].centroid_tmp[d] =
-                        static_cast<MVTYPE>(clusters[c].centroid_tmp[d] / static_cast<MVTYPE>(clusters[c].num_points));
-                    centroid_data += String(MVTYPE_FMT "%s", clusters[c].centroid_tmp[d],
-                                           (d + 1 == dim) ? "]" : ", ");
-                }
-                DIVFLOG(LOG_LEVEL_DEBUG, LOG_TAG_BASIC,
-                        "Centroid %zu has %zu points assigned to it. Centroid data: %s",
-                        c, clusters[c].num_points, centroid_data.ToCStr());
-            }
-            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "First iteration completed.");
-            converged->store(true, std::memory_order_release);
-        }
-        BARRIER(*sync_point, "ParallelBuild -> First Iteration Completed + Master Reset SeenIdx + Starting Iterations...");
-        bool wait_until_converged = (max_iterations == 0);
-        bool conv = false;
-        for (size_t i = 0; wait_until_converged || i < max_iterations - 1; i++) {
-            ParallelIteration(data, seen_idx, end_idx, step_size, is_valid,
-                              out_vector_ids, cluster_build_locks,
-                              temp_storage, cluster_sizes, is_master_thread, sync_point, converged);
-
-            if (converged->load(std::memory_order_acquire)) {
-                conv = true;
-                break;
-            }
-
-            BARRIER(*sync_point, "ParallelIter -> Not Converged");
-
-            if (is_master_thread) {
-                seen_idx.store(0, std::memory_order_release);
-                for (size_t c = 0; c < clusters.size(); c++) {
-                    FatalAssert(clusters[c].num_points > 0, LOG_TAG_BASIC,
-                                "Cluster has no points assigned to it!");
-                    for (size_t d = 0; d < dim; d++) {
-                        clusters[c].centroid_tmp[d] =
-                            static_cast<MVTYPE>(clusters[c].centroid_tmp[d] / static_cast<MVTYPE>(clusters[c].num_points));
-                    }
-                }
-
-                if (wait_until_converged) {
-                    DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%zu%s iteration completed. converged: %s",
-                            i + 2, (i == 0 ? "ed" : "th"), converged->load(std::memory_order_acquire) ? "true" : "false");
-                } else {
-                    DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%zu/%zu iteration completed. converged: %s",
-                            i + 2, max_iterations, converged->load(std::memory_order_acquire) ? "true" : "false");
-                }
-                converged->store(true, std::memory_order_release);
-            }
-            BARRIER(*sync_point, String("ParallelBuild -> iteration %zu/%zu Completed, Iterating till convergence: %s",
-                                        i + 2, max_iterations,
-                                        wait_until_converged ? "true" : "false").ToCStr());
-        }
-
-        if (is_master_thread) {
-            DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Clustering completed. Finalizing centroids and storing data...");
-
-            seen_idx.store(0, std::memory_order_release);
-            for (size_t c = 0; c < clusters.size(); c++) {
-                FatalAssert(clusters[c].num_points > 0, LOG_TAG_BASIC,
-                            "Cluster has no points assigned to it!");
-                VTYPE* final_centroid = new VTYPE[dim];
-                String centroid_data("(conv:%s)[", conv ? "t" : "f");
-                for (size_t d = 0; d < dim; d++) {
-                    if (!conv) {
-                        final_centroid[d] = static_cast<VTYPE>(clusters[c].centroid_tmp[d]);
+                if (level_idx != num_levels - 1) {
+                    auto it = old_offsets.upper_bound(c);
+                    FatalAssert(it != old_offsets.begin(), LOG_TAG_BASIC, "invalid offset for cluster %u in level %u while building IVF_TREE index!", c, level);
+                    uint32_t parent_offset;
+                    uint32_t parent_idx;
+                    if (it == old_offsets.end()) {
+                        parent_offset = old_offsets.rbegin()->first;
+                        parent_idx = old_offsets.rbegin()->second;
                     } else {
-                        final_centroid[d] = static_cast<VTYPE>(clusters[c].centroid_tmp[d] /
-                                                               static_cast<MVTYPE>(clusters[c].num_points));
+                        parent_offset = std::prev(it)->first;
+                        parent_idx = std::prev(it)->second;
                     }
-                    centroid_data += String(VTYPE_FMT "(" MVTYPE_FMT ")%s", final_centroid[d],
-                                            clusters[c].centroid_tmp[d], (d + 1 == dim) ? "]" : ", ");
+                    FatalAssert(cluster_infos[level_idx + 1][parent_idx].offset == parent_offset, LOG_TAG_BASIC, "invalid offset for parent cluster while building IVF_TREE index!");
+                    FatalAssert(parent_offset <= c, LOG_TAG_BASIC, "invalid parent offset for cluster %u in level %u while building IVF_TREE index!", c, level);
+                    FatalAssert(parent_idx < num_clusters[level_idx + 1], LOG_TAG_BASIC, "invalid parent offset for cluster %u in level %u while building IVF_TREE index!", c, level);
+                    uint32_t child_idx = c - parent_offset;
+                    FatalAssert(child_idx < cluster_infos[level_idx + 1][parent_idx].num_points, LOG_TAG_BASIC, "invalid child index for cluster %u in level %u while building IVF_TREE index!", c, level);
+                    CentroidData* centroid_data_arr =
+                        reinterpret_cast<CentroidData*>(clusters[level_idx + 1][parent_idx]->data);
+                    centroid_data_arr[child_idx].id = cluster_infos[level_idx][c].id;
+                    memcpy(centroid_data_arr[child_idx].data, cluster_infos[level_idx][c].centroid_vector, sizeof(CTYPE) * DIMENSION);
                 }
-                delete[] clusters[c].centroid_tmp;
-                clusters[c].centroid = final_centroid;
-                clusters[c].data =
-                    reinterpret_cast<char*>(AllocateMemory(clusters[c].num_points *
-                                                           ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID))));
-                // clusters[c].data = new char[clusters[c].num_points * ((dim * sizeof(VTYPE)) + sizeof(IVFVectorID))];
-                DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
-                        "Finalized centroid %zu with %zu points. Centroid data: %s",
-                        c, clusters[c].num_points, centroid_data.ToCStr());
+
             }
+            FatalAssert(new_offsets.size() == num_clusters[level_idx], LOG_TAG_BASIC, "new_offsets should not be empty while building IVF_TREE index!");
+            old_offsets.swap(new_offsets);
+            new_offsets.clear();
+            FatalAssert(old_offsets.size() == num_clusters[level_idx], LOG_TAG_BASIC, "new_offsets should not be empty while building IVF_TREE index!");
+            FatalAssert(new_offsets.empty(), LOG_TAG_BASIC, "new_offsets should not be empty while building IVF_TREE index!");
         }
 
-        BARRIER(*sync_point, "ParallelBuild -> KMeans Completed, Starting Data Storage...");
-        ParallelStore(data, seen_idx, end_idx, step_size, is_valid, out_vector_ids,
-                      current_size);
-
-        BARRIER(*sync_point, "ParallelBuild -> Data Storage Completed");
-        SANITY_CHECK({
-            if (is_master_thread) {
-                for (size_t c = 0; c < clusters.size(); c++) {
-                    FatalAssert(current_size[c] == clusters[c].num_points, LOG_TAG_BASIC,
-                                "Cluster size mismatch after data storage!");
-                }
-            }
-        });
-    }
-
-    inline void ParallelBuilder(Thread* self, const VTYPE* data, std::atomic<size_t>* seen_idx, size_t end_idx,
-                                size_t step_size, bool* is_valid, bool insert_duplicates,
-                                IVFVectorID* out_vector_ids, SXSpinLock* cluster_build_locks,
-                                MVTYPE* temp_storage, size_t* cluster_sizes, std::barrier<>* sync_point,
-                                std::atomic<bool>* converged, std::atomic<size_t>* current_size,
-                                size_t max_iterations) {
-        CHECK_NOT_NULLPTR(self, LOG_TAG_DIVFTREE);
-        self->InitDIVFThread();
-        ParallelBuild(data, *seen_idx, end_idx, step_size, is_valid,
-                      insert_duplicates, out_vector_ids, cluster_build_locks,
-                      temp_storage, cluster_sizes, false, sync_point, converged,
-                      current_size, max_iterations);
-        self->DestroyDIVFThread();
+        FatalAssert(num_seen == num_points, LOG_TAG_BASIC, "Number of points seen while building IVF_FLAT index does not match expected num_points from index file!");
+        return RetStatus::Success();
     }
 
     inline void SendIndexInfoToNode(NodeID target_cn) {
@@ -810,24 +499,72 @@ protected:
 
         RDMA_Manager* rdma_mgr = RDMA_Manager::GetInstance();
         CHECK_NOT_NULLPTR(rdma_mgr, LOG_TAG_BUFFER);
-        size_t num_centroids = clusters.size();
-        rdma_mgr->SendMessage(target_cn, &num_centroids, sizeof(num_centroids));
-
-        ClusterMeta* centroids = new ClusterMeta[num_centroids];
-        VTYPE* centroid_data = new VTYPE[num_centroids * dim];
-        for (size_t c = 0; c < num_centroids; ++c) {
-            centroids[c].centroid_id = clusters[c].centroid_id;
-            centroids[c].remote_addr = reinterpret_cast<uintptr_t>(clusters[c].data);
-            centroids[c].remote_size = clusters[c].num_points * (sizeof(IVFVectorID) + (dim * sizeof(VTYPE)));
-            DIVF_MEMCOPY(
-                centroid_data + (c * dim),
-                clusters[c].centroid,
-                sizeof(VTYPE) * dim
-            );
+        IndexInfo index_info;
+        index_info.type = index_type;
+        index_info.num_points = num_points;
+        if (index_type == IndexType::IVF_FLAT) {
+            index_info.ivf_flat_info.num_clusters = num_clusters[0];
+        } else if (index_type == IndexType::IVF_CAPPED) {
+            index_info.ivf_capped_info.num_clusters = num_clusters[0];
+            index_info.ivf_capped_info.cluster_capacity = leaf_cap;
+        } else {
+            index_info.ivf_tree_info.num_levels = num_levels;
+            index_info.ivf_tree_info.leaf_cluster_capacity = leaf_cap;
+            index_info.ivf_tree_info.internal_cluster_capacity = internal_cap;
+            index_info.ivf_tree_info.leaf_bytes_cap = leaf_bytes;
+            index_info.ivf_tree_info.internal_bytes_cap = internal_bytes;
         }
+        rdma_mgr->SendMessage(target_cn, &index_info, sizeof(index_info));
 
-        rdma_mgr->SendMessage(target_cn, centroids, sizeof(ClusterMeta) * num_centroids);
-        rdma_mgr->SendMessage(target_cn, centroid_data, sizeof(VTYPE) * num_centroids * dim);
+        if (index_type == IndexType::IVF_TREE) {
+            rdma_mgr->SendMessage(target_cn, &num_levels, sizeof(num_levels));
+            for (uint8_t level_idx = num_levels - 1; level_idx != UINT8_MAX; --level_idx) {
+                ClusterMeta* centroids = new ClusterMeta[num_clusters[level_idx]];
+                CTYPE* centroid_data = nullptr;
+                if (level_idx == num_levels - 1) {
+                    centroid_data = new CTYPE[num_clusters[level_idx] * DIMENSION];
+                }
+                for (size_t c = 0; c < num_clusters[level_idx]; ++c) {
+                    centroids[c].centroid_id = cluster_infos[level_idx][c].id;
+                    centroids[c].remote_addr = reinterpret_cast<uintptr_t>(cluster_infos[level_idx][c].cluster_ptr);
+                    centroids[c].remote_size = cluster_infos[level_idx][c].bytes;
+                    centroids[c].num_elements = cluster_infos[level_idx][c].num_points;
+                    if (level_idx == num_levels - 1) {
+                        DIVF_MEMCOPY(
+                            centroid_data + (c * DIMENSION),
+                            cluster_infos[level_idx][c].centroid_vector,
+                            sizeof(CTYPE) * DIMENSION
+                        );
+                    }
+                }
+                rdma_mgr->SendMessage(target_cn, &num_clusters[level_idx], sizeof(num_clusters[level_idx]));
+                rdma_mgr->SendMessage(target_cn, centroids, sizeof(ClusterMeta) * num_clusters[level_idx]);
+                if (level_idx == num_levels - 1) {
+                    rdma_mgr->SendMessage(target_cn, centroid_data, sizeof(CTYPE) * num_clusters[level_idx] * DIMENSION);
+                    delete[] centroid_data;
+                }
+                delete[] centroids;
+            }
+        } else {
+            ClusterMeta* centroids = new ClusterMeta[num_clusters[0]];
+            CTYPE* centroid_data = new CTYPE[num_clusters[0] * DIMENSION];
+            for (size_t c = 0; c < num_clusters[0]; ++c) {
+                centroids[c].centroid_id = cluster_infos[0][c].id;
+                centroids[c].remote_addr = reinterpret_cast<uintptr_t>(cluster_infos[0][c].cluster_ptr);
+                centroids[c].remote_size = cluster_infos[0][c].bytes;
+                centroids[c].num_elements = cluster_infos[0][c].num_points;
+                DIVF_MEMCOPY(
+                    centroid_data + (c * DIMENSION),
+                    cluster_infos[0][c].centroid_vector,
+                    sizeof(CTYPE) * DIMENSION
+                );
+            }
+            rdma_mgr->SendMessage(target_cn, centroids, sizeof(ClusterMeta) * num_clusters[0]);
+            rdma_mgr->SendMessage(target_cn, centroid_data, sizeof(CTYPE) * num_clusters[0] * DIMENSION);
+
+            delete[] centroids;
+            delete[] centroid_data;
+        }
 
         DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_DIVFTREE, "Index info sent to CN %u successfully.", target_cn);
     }

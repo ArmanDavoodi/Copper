@@ -856,15 +856,38 @@ might cause deadlock or unnecessary errors*/
 //     }
 // };
 
+#ifndef DIMENSION
+#define DIMENSION 128
+#error "DIMENSION is not defined"
+#endif
+
 #ifndef VECTOR_TYPE
 #define VECTOR_TYPE UINT16
 typedef uint16_t VTYPE;
-typedef uint32_t DTYPE;
-typedef uint64_t MVTYPE;
 #define VTYPE_FMT "%hu"
-#define DTYPE_FMT "%u"
-#define MVTYPE_FMT "%lu"
 #endif
+
+#ifndef CENTROID_TYPE
+#define CENTROID_TYPE UINT16
+typedef uint16_t CTYPE;
+#define CTYPE_FMT "%hu"
+#endif
+
+#ifndef DISTANCE_TYPE
+#define DISTANCE_TYPE FLOAT
+typedef float DTYPE;
+#define DTYPE_FMT "%0.2f"
+#endif
+
+#ifndef CENTROID_TYPE
+#define CENTROID_TYPE UINT16
+typedef uint16_t CENTROID;
+#define CENTROID_FMT "%hu"
+typedef double MVTYPE;
+#define MVTYPE_FMT "%0.2f"
+#endif
+
+
 
 /* todo: use cpuid to get cahceline size */
 // #if defined(__cpp_lib_hardware_interference_size) || defined(__GNUC__) || defined(_MSC_VER)
@@ -939,13 +962,13 @@ struct L2DTYPEIDPairCMP;
 
 struct IVFSearchTask {
     const VTYPE* query_vector;
-    const size_t num_sibling_tasks;
+    const uint32_t num_sibling_tasks;
     const VectorID cluster_id;
-    size_t top_k;
-    size_t cluster_partition_num_elements;
+    uint32_t top_k;
+    uint32_t cluster_partition_num_elements;
     void* cluster_partition_address;
     bool is_leaf;
-    std::atomic<size_t>* num_tasks_completed;
+    std::atomic<uint32_t>* num_tasks_completed;
     SXLock* neighbour_list_lock;
     union {
         SortedList<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP>* top_vectors;
@@ -955,20 +978,20 @@ struct IVFSearchTask {
 
 struct IVFSearchTaskFactory {
     const VTYPE* query_vector;
-    size_t num_sibling_tasks;
-    size_t top_k;
+    uint32_t num_sibling_tasks;
+    uint32_t top_k;
     bool is_leaf;
-    std::atomic<size_t>* num_tasks_completed;
+    std::atomic<uint32_t>* num_tasks_completed;
     SXLock* neighbour_list_lock;
 
     SANITY_CHECK(
-    std::atomic<size_t>* num_tasks_created = new std::atomic<size_t>(0);
+    std::atomic<uint32_t>* num_tasks_created = new std::atomic<uint32_t>(0);
     DIVFThreadID creator_thread_id = DIVF_THREAD_ID;
 
     ~IVFSearchTaskFactory() {
-        size_t expected_tasks = num_sibling_tasks;
-        size_t created_tasks = num_tasks_created->load(std::memory_order_acquire);
-        size_t completed_tasks = num_tasks_completed->load(std::memory_order_acquire);
+        uint32_t expected_tasks = num_sibling_tasks;
+        uint32_t created_tasks = num_tasks_created->load(std::memory_order_acquire);
+        uint32_t completed_tasks = num_tasks_completed->load(std::memory_order_acquire);
         FatalAssert(creator_thread_id == DIVF_THREAD_ID, LOG_TAG_BASIC,
                     "IVFSearchTaskFactory destroyed by a different thread than it was created. Creator thread ID: %u, Destroyer thread ID: %u",
                     creator_thread_id, DIVF_THREAD_ID);
@@ -990,10 +1013,10 @@ struct IVFSearchTaskFactory {
         SortedList<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP>* top_centroids;
     };
 
-    inline IVFSearchTask* CreateTask(VectorID cluster_id, size_t cluster_partition_num_elements,
+    inline IVFSearchTask* CreateTask(VectorID cluster_id, uint32_t cluster_partition_num_elements,
                                      void* cluster_partition_address) {
         SANITY_CHECK(
-            size_t created_tasks = num_tasks_created->fetch_add(1) + 1;
+            uint32_t created_tasks = num_tasks_created->fetch_add(1) + 1;
             FatalAssert(created_tasks <= num_sibling_tasks, LOG_TAG_BASIC,
                         "Created more IVFSearchTasks than expected. Expected: %lu, Created: %lu",
                         num_sibling_tasks, created_tasks);
@@ -1011,6 +1034,12 @@ struct IVFSearchTaskFactory {
             .top_vectors = top_vectors,
         };
     }
+};
+
+enum class IndexType : uint8_t {
+    IVF_FLAT = 0,
+    IVF_CAPPED = 1,
+    IVF_TREE = 2
 };
 
 // enum DataType : int8_t {

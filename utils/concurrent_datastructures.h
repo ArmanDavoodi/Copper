@@ -223,7 +223,7 @@ public:
     }
 
     inline bool PopHead(T& value) {
-        return q.wait_dequeue_timed(value, std::chrono::microseconds(10));
+        return q.wait_dequeue_timed(value, std::chrono::milliseconds(10));
     }
 
     inline bool TryPopHead(T& value) {
@@ -231,7 +231,7 @@ public:
     }
 
     inline size_t BatchPopHead(T* arr, size_t size) {
-        return q.wait_dequeue_bulk_timed(arr, size, std::chrono::microseconds(10));
+        return q.wait_dequeue_bulk_timed(arr, size, std::chrono::milliseconds(10));
     }
 
     inline size_t TryBatchPopHead(T* arr, size_t size) {

@@ -3,6 +3,9 @@
 
 #include <cstdint>
 
+#define DEBUG 0
+#define RELEASE 1
+
 #ifdef TESTING
 #undef BUILD
 #define BUILD DEBUG
