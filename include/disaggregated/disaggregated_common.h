@@ -11,9 +11,9 @@
 #include <infiniband/verbs.h>
 #include <fstream>
 
-#define MEMROY_NODE_ID 0
+#define MEMORY_NODE_ID 0
 
-#define MEMROY_NODE_IDX 0
+#define MEMORY_NODE_IDX 0
 #define COMPUTE_NODE_IDX 1
 #define NUM_NODE_TYPES 2
 
@@ -21,15 +21,15 @@
 #define MAX_MNODE_COUNT 1
 #endif
 #ifndef MAX_CNODE_COUNT
-#define MAX_CNODE_COUNT 1
+#define MAX_CNODE_COUNT 2
 #endif
 #ifndef MAX_CONN_PER_NODE
 #define MAX_CONN_PER_NODE 16
 #endif
 
-#if !defined(DIVF_SELF_NODE_TYPE) || ((DIVF_SELF_NODE_TYPE != MEMROY_NODE_IDX) && (DIVF_SELF_NODE_TYPE != COMPUTE_NODE_IDX))
-#error "DIVF_SELF_NODE_TYPE is not defined or has an invalid value! It should be either MEMROY_NODE_IDX or COMPUTE_NODE_IDX."
-#elif DIVF_SELF_NODE_TYPE == MEMROY_NODE_IDX
+#if !defined(DIVF_SELF_NODE_TYPE) || ((DIVF_SELF_NODE_TYPE != MEMORY_NODE_IDX) && (DIVF_SELF_NODE_TYPE != COMPUTE_NODE_IDX))
+#error "DIVF_SELF_NODE_TYPE is not defined or has an invalid value! It should be either MEMORY_NODE_IDX or COMPUTE_NODE_IDX."
+#elif DIVF_SELF_NODE_TYPE == MEMORY_NODE_IDX
 #define DIVF_IS_MEMORY_NODE
 #else
 #define DIVF_IS_COMPUTE_NODE
@@ -157,7 +157,7 @@ inline std::pair<String, String> ReadNetworkConfigs() {
     FatalAssert(network_config::num_memory_nodes == 1, LOG_TAG_NOT_IMPLEMENTED,
                 "Currently, only one memory node is supported!");
 
-#if DIVF_SELF_NODE_TYPE == MEMROY_NODE_IDX
+#if DIVF_SELF_NODE_TYPE == MEMORY_NODE_IDX
     FatalAssert(network_config::self_idx < network_config::num_memory_nodes, LOG_TAG_BASIC,
                 "Self node index exceeds the number of memory nodes!");
 #else

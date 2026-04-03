@@ -28,13 +28,19 @@ enum class BufferEntryState : uint8_t {
 };
 
 struct MemoryStatsNode {
-    size_t num_allocated_pages;
-    size_t num_bytes_in_use;
+    size_t num_allocated_pages_leaf;
+    size_t num_bytes_in_use_leaf;
+    size_t num_allocated_pages_internal;
+    size_t num_bytes_in_use_internal;
     MemoryStatsNode* next;
 
-    MemoryStatsNode(size_t num_allocated_pages, size_t num_bytes_in_use) :
-        num_allocated_pages(num_allocated_pages), num_bytes_in_use(num_bytes_in_use), next(nullptr) {}
-    MemoryStatsNode() : num_allocated_pages(0), num_bytes_in_use(0), next(nullptr) {}
+    MemoryStatsNode(size_t num_allocated_pages_leaf, size_t num_bytes_in_use_leaf, size_t num_allocated_pages_internal, size_t num_bytes_in_use_internal) :
+        num_allocated_pages_leaf(num_allocated_pages_leaf),
+        num_bytes_in_use_leaf(num_bytes_in_use_leaf),
+        num_allocated_pages_internal(num_allocated_pages_internal),
+        num_bytes_in_use_internal(num_bytes_in_use_internal),
+        next(nullptr) {}
+    MemoryStatsNode() : num_allocated_pages_leaf(0), num_bytes_in_use_leaf(0), num_allocated_pages_internal(0), num_bytes_in_use_internal(0), next(nullptr) {}
 };
 
 inline size_t ComputeClusterSize(bool is_leaf, uint32_t num_elements) {
@@ -281,14 +287,19 @@ public:
     }
 
     size_t TryMoveToCooling(uint64_t num_pages, void** freed_pages, size_t max_pages_needed, size_t& bytes_freed,
-                            size_t& pages_freed) {
+                            size_t& pages_freed, size_t page_size) {
         FatalAssert(num_pages > 0, LOG_TAG_BUFFER,
                     "num_pages must be greater than 0 in CacheMetaContainerDetail::TryMoveToCooling()");
-        FatalAssert(num_pages <= ((_num_buckets * _bucket_cap) / 2), LOG_TAG_BUFFER,
-                    "num_pages exceeds total capacity in CacheMetaContainerDetail::TryMoveToCooling()");
+        // FatalAssert(num_pages <= ((_num_buckets * _bucket_cap) / 2), LOG_TAG_BUFFER,
+        //             "num_pages exceeds total capacity in CacheMetaContainerDetail::TryMoveToCooling()");
         CHECK_NOT_NULLPTR(freed_pages, LOG_TAG_BUFFER);
         FatalAssert(max_pages_needed > 0, LOG_TAG_BUFFER,
                     "max_pages_needed must be greater than 0 in CacheMetaContainerDetail::TryMoveToCooling()");
+        
+        /* to avoid trying to cool too many entries at once and failing to acquire locks */
+        num_pages = std::min(num_pages, (_num_buckets * _bucket_cap) / 4);
+        FatalAssert(num_pages > 0, LOG_TAG_BUFFER,
+                    "num_pages must be greater than 0 after adjustment in CacheMetaContainerDetail::TryMoveToCooling()");
 
         /* todo: check stats */
         size_t num_cooling = 0;
@@ -349,7 +360,6 @@ public:
 #ifdef ENABLE_STAT_COLLECTION
                 (entry->num_moved_to_cool)++;
                 (_cooling_entries[idx]->num_evicted)++;
-                bytes_freed += _cooling_entries[idx]->total_size_bytes;
 #endif
                 if (num_freed < max_pages_needed) {
                     size_t num_needed = std::min(_cooling_entries[idx]->num_pages, max_pages_needed - num_freed);
@@ -357,13 +367,15 @@ public:
                         freed_pages[num_freed++] = _cooling_entries[idx]->pages[p];
                     }
                     if (num_needed < _cooling_entries[idx]->num_pages) {
-                        _page_pool.BatchFree(_cooling_entries[idx]->pages + num_needed,
-                                             _cooling_entries[idx]->num_pages - num_needed);
-                        pages_freed += (_cooling_entries[idx]->num_pages - num_needed);
+                        size_t pf = _cooling_entries[idx]->num_pages - num_needed;
+                        _page_pool.BatchFree(_cooling_entries[idx]->pages + num_needed, pf);
+                        pages_freed += pf;
+                        bytes_freed += _cooling_entries[idx]->total_size_bytes - (num_needed * page_size);
                     }
                 } else {
                     _page_pool.BatchFree(_cooling_entries[idx]->pages, _cooling_entries[idx]->num_pages);
                     pages_freed += _cooling_entries[idx]->num_pages;
+                    bytes_freed += _cooling_entries[idx]->total_size_bytes;
                 }
             }
 
@@ -428,12 +440,15 @@ public:
     static constexpr double COOLING_SIZE_RATIO = 0.2;
 
     CacheMetaContainer(size_t pool_bytes, size_t page_bytes, size_t num_buckets, LocalMemoryPool& pool) :
+        _leaf_page_size(page_bytes),
+        _internal_page_size(0),
         _leaf_meta_container(new CacheMetaContainerDetail(
             std::max((size_t)((pool_bytes / page_bytes) * COOLING_SIZE_RATIO), 1lu),
             num_buckets, pool)), _internal_meta_container(nullptr) {}
 
     CacheMetaContainer(size_t pool_bytes, size_t leaf_bytes, size_t internal_bytes,
                        size_t num_buckets, LocalMemoryPool& pool) :
+        _leaf_page_size(leaf_bytes), _internal_page_size(internal_bytes),
         _leaf_meta_container(new CacheMetaContainerDetail(
             std::max((size_t)((pool_bytes / leaf_bytes) * COOLING_SIZE_RATIO), 1lu),
             num_buckets, pool)),
@@ -474,11 +489,11 @@ public:
         CHECK_NOT_NULLPTR(_leaf_meta_container, LOG_TAG_BUFFER);
         if (is_leaf) {
             return _leaf_meta_container->TryMoveToCooling(num_pages, freed_pages, max_pages_needed,
-                                                          bytes_freed, pages_freed);
+                                                          bytes_freed, pages_freed, _leaf_page_size);
         }
         CHECK_NOT_NULLPTR(_internal_meta_container, LOG_TAG_BUFFER);
         return _internal_meta_container->TryMoveToCooling(num_pages, freed_pages, max_pages_needed,
-                                                          bytes_freed, pages_freed);
+                                                          bytes_freed, pages_freed, _internal_page_size);
     }
 
     inline void FreeAll() {
@@ -490,6 +505,8 @@ public:
     }
 
 protected:
+    const size_t _leaf_page_size;
+    const size_t _internal_page_size;
     CacheMetaContainerDetail* _leaf_meta_container;
     CacheMetaContainerDetail* _internal_meta_container;
 };
@@ -764,22 +781,33 @@ public:
 #endif
 #ifdef ENABLE_STAT_COLLECTION
         String stats = "";
-        size_t total_moved_to_cool = 0;
-        size_t total_removed_from_cool = 0;
-        size_t total_evicted = 0;
-        size_t total_read_local = 0;
-        size_t total_read_remote_in_progress = 0;
-        size_t total_read_remote = 0;
-        size_t total_read = 0;
+        std::vector<size_t> total_moved_to_cool(256, 0);
+        std::vector<size_t> total_removed_from_cool(256, 0);
+        std::vector<size_t> total_evicted(256, 0);
+        std::vector<size_t> total_read_local(256, 0);
+        std::vector<size_t> total_read_remote_in_progress(256, 0);
+        std::vector<size_t> total_read_remote(256, 0);
+        std::vector<size_t> total_read(256, 0);
+        uint8_t max_level = 0;
         for (auto& pair : _buffer_map) {
+            uint8_t level = pair.first._level;
+            max_level = std::max(max_level, level);
             BufferEntry& entry = pair.second;
-            total_moved_to_cool += entry.num_moved_to_cool;
-            total_removed_from_cool += entry.num_removed_from_cool;
-            total_evicted += entry.num_evicted;
-            total_read_local += entry.num_read_local;
-            total_read_remote_in_progress += entry.num_read_remote_in_progress;
-            total_read_remote += entry.num_read_remote;
-            total_read += entry.num_read;
+            total_moved_to_cool[level] += entry.num_moved_to_cool;
+            total_removed_from_cool[level] += entry.num_removed_from_cool;
+            total_evicted[level] += entry.num_evicted;
+            total_read_local[level] += entry.num_read_local;
+            total_read_remote_in_progress[level] += entry.num_read_remote_in_progress;
+            total_read_remote[level] += entry.num_read_remote;
+            total_read[level] += entry.num_read;
+            
+            total_moved_to_cool[0] += entry.num_moved_to_cool;
+            total_removed_from_cool[0] += entry.num_removed_from_cool;
+            total_evicted[0] += entry.num_evicted;
+            total_read_local[0] += entry.num_read_local;
+            total_read_remote_in_progress[0] += entry.num_read_remote_in_progress;
+            total_read_remote[0] += entry.num_read_remote;
+            total_read[0] += entry.num_read;
             stats += String(VECTORID_LOG_FMT ": reads: %zu (local: %.2f%%(%zu), remote in progress: %.2f%%(%zu), remote: %.2f%%(%zu)), moved to cool: %zu, removed from cool: %zu, evicted: %zu\n",
                            VECTORID_LOG(pair.first), entry.num_read,
                            (((double)(entry.num_read_local) / entry.num_read) * 100), entry.num_read_local,
@@ -797,16 +825,30 @@ public:
                 entry.num_read = 0;
             }
         }
+
+        for (uint8_t level = max_level; level > 0; --level) {
+            stats = String(
+                "Level %hhu Stats:\n"
+                "Total reads: %zu (local: %.2f%%(%zu), remote in progress: %.2f%%(%zu), remote: %.2f%%(%zu)), "
+                "total_moved_to_cool: %zu, total_removed_from_cool: %zu, total_evicted: %zu\n",
+                level,
+                total_read[level],
+                (((double)(total_read_local[level]) / total_read[level]) * 100), total_read_local[level],
+                (((double)(total_read_remote_in_progress[level]) / total_read[level]) * 100), total_read_remote_in_progress[level],
+                (((double)(total_read_remote[level]) / total_read[level]) * 100), total_read_remote[level],
+                total_moved_to_cool[level], total_removed_from_cool[level], total_evicted[level]
+            ) + stats + String("\n");
+        }
         return
             String(
                 "BufferMgr Stats:\n"
                 "Total reads: %zu (local: %.2f%%(%zu), remote in progress: %.2f%%(%zu), remote: %.2f%%(%zu)), "
                 "total_moved_to_cool: %zu, total_removed_from_cool: %zu, total_evicted: %zu\n",
                 total_read,
-                (((double)(total_read_local) / total_read) * 100), total_read_local,
-                (((double)(total_read_remote_in_progress) / total_read) * 100), total_read_remote_in_progress,
-                (((double)(total_read_remote) / total_read) * 100), total_read_remote,
-                total_moved_to_cool, total_removed_from_cool, total_evicted
+                (((double)(total_read_local[0]) / total_read[0]) * 100), total_read_local[0],
+                (((double)(total_read_remote_in_progress[0]) / total_read[0]) * 100), total_read_remote_in_progress[0],
+                (((double)(total_read_remote[0]) / total_read[0]) * 100), total_read_remote[0],
+                total_moved_to_cool[0], total_removed_from_cool[0], total_evicted[0]
             ) + stats + String("\n");
 #else
         return "BufferMgr Stats: (enable stat collection to see details)";
@@ -1087,18 +1129,33 @@ protected:
                         "num_pages_freed should be 0 for the first memory stats entry in BufferMgr::ReadFromRemote()");
             FatalAssert(bytes_freed_from_cool == 0, LOG_TAG_BUFFER,
                         "bytes_freed_from_cool should be 0 for the first memory stats entry in BufferMgr::ReadFromRemote()");
-            _memory_stats_head = new MemoryStatsNode(num_allocated, num_bytes_needed);
+            if (is_leaf) {
+                _memory_stats_head = new MemoryStatsNode(num_allocated, num_bytes_needed, 0, 0);
+            } else {
+                _memory_stats_head = new MemoryStatsNode(0, 0, num_allocated, num_bytes_needed);
+            }
             _memory_stats_tail = _memory_stats_head;
         } else {
             FatalAssert(_memory_stats_head != nullptr, LOG_TAG_BUFFER,
                         "Memory stats head should not be null when adding a new entry in BufferMgr::ReadFromRemote()");
-            FatalAssert(_memory_stats_tail->num_allocated_pages >= num_pages_freed, LOG_TAG_BUFFER,
+            MemoryStatsNode* new_node = nullptr;
+            if (is_leaf) {
+                FatalAssert(_memory_stats_tail->num_allocated_pages_leaf >= num_pages_freed, LOG_TAG_BUFFER,
                         "Current pages should be greater than or equal to pages allocated from pool in BufferMgr::ReadFromRemote()");
-            size_t _current_pages = _memory_stats_tail->num_allocated_pages - num_pages_freed + num_from_pool;
-            FatalAssert(_memory_stats_tail->num_bytes_in_use >= bytes_freed_from_cool, LOG_TAG_BUFFER,
-                        "Current bytes should be greater than or equal to bytes freed from cool in BufferMgr::ReadFromRemote()");
-            size_t _current_bytes = _memory_stats_tail->num_bytes_in_use - bytes_freed_from_cool + num_bytes_needed;
-            MemoryStatsNode* new_node = new MemoryStatsNode(_current_pages, _current_bytes);
+                size_t _current_pages = _memory_stats_tail->num_allocated_pages_leaf - num_pages_freed + num_from_pool;
+                FatalAssert(_memory_stats_tail->num_bytes_in_use_leaf >= bytes_freed_from_cool, LOG_TAG_BUFFER,
+                            "Current bytes should be greater than or equal to bytes freed from cool in BufferMgr::ReadFromRemote()");
+                size_t _current_bytes = _memory_stats_tail->num_bytes_in_use_leaf - bytes_freed_from_cool + num_bytes_needed;
+                new_node = new MemoryStatsNode(_current_pages, _current_bytes, _memory_stats_tail->num_allocated_pages_internal, _memory_stats_tail->num_bytes_in_use_internal);
+            } else {
+                FatalAssert(_memory_stats_tail->num_allocated_pages_internal >= num_pages_freed, LOG_TAG_BUFFER,
+                        "Current pages should be greater than or equal to pages allocated from pool in BufferMgr::ReadFromRemote()");
+                size_t _current_pages = _memory_stats_tail->num_allocated_pages_internal - num_pages_freed + num_from_pool;
+                FatalAssert(_memory_stats_tail->num_bytes_in_use_internal >= bytes_freed_from_cool, LOG_TAG_BUFFER,
+                            "Current bytes should be greater than or equal to bytes freed from cool in BufferMgr::ReadFromRemote()");
+                size_t _current_bytes = _memory_stats_tail->num_bytes_in_use_internal - bytes_freed_from_cool + num_bytes_needed;
+                new_node = new MemoryStatsNode(_memory_stats_tail->num_allocated_pages_leaf, _memory_stats_tail->num_bytes_in_use_leaf, _current_pages, _current_bytes);
+            }
             _memory_stats_tail->next = new_node;
             _memory_stats_tail = new_node;
         }

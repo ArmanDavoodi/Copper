@@ -10,7 +10,7 @@ MN_CONF_FILE="disaggregated_bench/memory_node/run.conf"
 
 # VAR_LOG_OUTPUT_PATH=$ROOT/disaggregated_bench/out/logs/
 
-VAR_GT_PATH=$ROOT/bench/datasets/bigann/exact/dtypeu32/4M_K100
+# VAR_GT_PATH=$ROOT/bench/datasets/bigann/exact/dtypeu32/4M_K100
 VAR_LATENCY_BASE=50
 VAR_LATENCY_SAMPLE=1
 
@@ -19,7 +19,7 @@ VAR_NUM_QUERY_THREADS=64
 # VAR_PAGE_SIZE=$((CONF_VAR_AVG_NUM_VEC_PER_CLUSTER * CONF_VAR_VECTOR_BYTES * 2)) # should be power of 2 -> will only be used for ivfflat.
 # VAR_POOL_SIZE=$((1024 * 1024 * 1024)) #1GB
 
-VAR_WARMUP_TIME_SEC=5 #only search
+VAR_WARMUP_TIME_SEC=60 #only search
 VAR_RUN_TIME_SEC=60 #real test used for stat collection
 
 VAR_RUNTIME_THROUGHPUT_REPORT_SEC=5 #use 0 to disable
@@ -32,7 +32,7 @@ echo > $CN_CONF_FILE
 
 # echo "log-path:$VAR_LOG_OUTPUT_PATH" >> $CN_CONF_FILE
 
-echo "ground-truth-path:$VAR_GT_PATH" >> $CN_CONF_FILE
+# echo "ground-truth-path:$VAR_GT_PATH" >> $CN_CONF_FILE
 echo "latency-sample-base:$VAR_LATENCY_BASE" >> $CN_CONF_FILE
 echo "latency-sample-rate:$VAR_LATENCY_SAMPLE" >> $CN_CONF_FILE
 echo "default-k:$VAR_DEF_K" >> $CN_CONF_FILE

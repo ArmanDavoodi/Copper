@@ -117,12 +117,12 @@ void ParseConfigs(divftree::NodeID self_id) {
         throw std::runtime_error("Stat file path not provided!");
     }
 
-    vit = var_configs.find("ground-truth-path");
-    if (vit != var_configs.end()) {
-        exact_neighbours_path = vit->second;
-    } else {
-        throw std::runtime_error("Ground truth file path not provided!");
-    }
+    // vit = var_configs.find("ground-truth-path");
+    // if (vit != var_configs.end()) {
+    //     exact_neighbours_path = vit->second;
+    // } else {
+    //     throw std::runtime_error("Ground truth file path not provided!");
+    // }
 
     vit = var_configs.find("latency-sample-rate");
     if (vit != var_configs.end()) {

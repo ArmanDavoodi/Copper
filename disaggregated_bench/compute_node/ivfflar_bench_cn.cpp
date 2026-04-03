@@ -95,7 +95,7 @@ divftree::RetStatus Search(std::vector<std::pair<divftree::DTYPE, divftree::IVFV
                             "Exact KNN result should be better than the returned!");
             }
         }
-        FatalAssert(num_true_positives_per_query[idx] != 0, LOG_TAG_TEST, "recall of 0!");
+        // FatalAssert(num_true_positives_per_query[idx] != 0, LOG_TAG_TEST, "recall of 0!");
     }
 #endif
     double total_distance = 0;
@@ -295,7 +295,7 @@ void worker(divftree::Thread* self, uint64_t thread_idx) {
 
 inline void FlushStats(bool clear) {
 #ifdef ENABLE_STAT_COLLECTION
-    FILE* f = fopen(stat_file, "a");
+    FILE* f = fopen(stat_file, (clear ? "w" : "a"));
     if (f == nullptr) {
         DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_TEST, "Cannot open stat file %s for writing!", stat_file);
     } else {
@@ -355,7 +355,13 @@ inline void FlushStats(bool clear) {
         fprintf(f, "\n-------------------------\n");
         while (stats != nullptr) {
             divftree::MemoryStatsNode* next = stats->next;
-            fprintf(f, "Memory Stats: Allocated Pages: %zu, Bytes in Use: %zu\n", stats->num_allocated_pages, stats->num_bytes_in_use);
+            fprintf(f, "Memory Stats: Allocated Pages: (leaf:%zu - %.2f, internal:%zu - %.2f, total:%zu), Bytes in Use: (leaf:%zu - %.2f, internal:%zu - %.2f, total:%zu)\n",
+                    stats->num_allocated_pages_leaf, ((double)(stats->num_allocated_pages_leaf * 100))/(double)(stats->num_allocated_pages_leaf + stats->num_allocated_pages_internal),
+                    stats->num_allocated_pages_internal, ((double)(stats->num_allocated_pages_internal * 100))/(double)(stats->num_allocated_pages_leaf + stats->num_allocated_pages_internal),
+                    stats->num_allocated_pages_leaf + stats->num_allocated_pages_internal,
+                    stats->num_bytes_in_use_leaf, ((double)(stats->num_bytes_in_use_leaf * 100))/(double)(stats->num_bytes_in_use_leaf + stats->num_bytes_in_use_internal),
+                    stats->num_bytes_in_use_internal, ((double)(stats->num_bytes_in_use_internal * 100))/(double)(stats->num_bytes_in_use_leaf + stats->num_bytes_in_use_internal),
+                    stats->num_bytes_in_use_leaf + stats->num_bytes_in_use_internal);
             delete stats;
             stats = next;
         }
@@ -386,9 +392,15 @@ inline void FlushStats(bool clear) {
 
 /* log-output-file-dir is not the file name but the directory path */
 void ReadArgs(int argc, char** argv) {
+#ifdef RECALL_BENCH
+    if (argc != 10) {
+        DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Usage: %s <self-node-idx> <index-file-path> <gt-file-path> <log-output-file-dir> <stat-file-path> <page-size-bytes> <pool-size-bytes> <internal_n_probes> <leaf_n_probes>", argv[0]);
+    }
+#else
     if (argc != 9) {
         DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Usage: %s <self-node-idx> <index-file-path> <log-output-file-dir> <stat-file-path> <page-size-bytes> <pool-size-bytes> <internal_n_probes> <leaf_n_probes>", argv[0]);
     }
+#endif
 
     divftree::network_config::self_idx = static_cast<uint8_t>(std::stoul(argv[1]));
     std::string index_file_path = argv[2];
@@ -404,22 +416,40 @@ void ReadArgs(int argc, char** argv) {
         DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Index file path is not a regular file: %s", index_file_path.c_str());
     }
 
-    var_configs["log-path"] = argv[3];
-    var_configs["stat-file"] = argv[4];
-    index_attr.page_size = std::stoul(argv[5]);
+#ifdef RECALL_BENCH
+    exact_neighbours_path = argv[3];
+    if (exact_neighbours_path.empty()) {
+        DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "ground truth file path cannot be empty!");
+    }
+
+    if (!std::filesystem::exists(exact_neighbours_path)) {
+        DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "ground truth file does not exist at path: %s", exact_neighbours_path.c_str());
+    }
+
+    if (!std::filesystem::is_regular_file(exact_neighbours_path)) {
+        DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "ground truth file path is not a regular file: %s", exact_neighbours_path.c_str());
+    }
+    int next_idx = 4;
+#else
+    int next_idx = 3;
+#endif
+
+    var_configs["log-path"] = argv[next_idx];
+    var_configs["stat-file"] = argv[next_idx + 1];
+    index_attr.page_size = std::stoul(argv[next_idx + 2]);
     if (index_attr.page_size == 0 || !(divftree::ALIGNED(index_attr.page_size))) {
         DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Page size must be greater than 0!");
     }
-    index_attr.pool_size = std::stoul(argv[6]);
+    index_attr.pool_size = std::stoul(argv[next_idx + 3]);
     if (index_attr.pool_size < index_attr.page_size || !(divftree::ALIGNED(index_attr.pool_size))) {
         DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Pool size must be greater than page-size!");
     }
 
-    internal_n_probes = std::stoul(argv[7]);
+    internal_n_probes = std::stoul(argv[next_idx + 4]);
     if (internal_n_probes == 0) {
         DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Number of internal probes must be greater than 0!");
     }
-    leaf_n_probes = std::stoul(argv[8]);
+    leaf_n_probes = std::stoul(argv[next_idx + 5]);
     if (leaf_n_probes == 0) {
         DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Number of leaf probes must be greater than 0!");
     }

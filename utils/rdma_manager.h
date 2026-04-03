@@ -66,7 +66,7 @@ static constexpr ibv_mtu DEFAULT_MTU[NUM_NODE_TYPES] = {
 };
 
 static constexpr uint8_t GET_NODE_TYPE_IDX(bool is_memory_node) {
-    return is_memory_node ? MEMROY_NODE_IDX : COMPUTE_NODE_IDX;
+    return is_memory_node ? MEMORY_NODE_IDX : COMPUTE_NODE_IDX;
 }
 
 inline constexpr uint64_t MAX_TASK_SEQ_NUM = 0x0000FFFFFFFFFFFF;
@@ -906,7 +906,7 @@ protected:
         int target_device_index;
         uint8_t num_valid_nodes;
         RetStatus rs = RetStatus::Success();
-        const uint8_t type = is_memory_node ? MEMROY_NODE_IDX : COMPUTE_NODE_IDX;
+        const uint8_t type = is_memory_node ? MEMORY_NODE_IDX : COMPUTE_NODE_IDX;
 
         int num_ibv_devices = 0;
         struct ibv_device **dev_list = ibv_get_device_list(&num_ibv_devices);
@@ -1253,7 +1253,7 @@ ERROR_EXIT:
     }
 
     static RetStatus ModifyQPStateToRTR(struct ibv_qp* qp, uint32_t dest_qp_num,
-                                        const union ibv_gid& dest_gid,
+                                        const union ibv_gid& dest_gid, int gid_index,
                                         uint8_t port_num, uint32_t remote_psn, uint8_t type) {
         CHECK_NOT_NULLPTR(qp, LOG_TAG_RDMA);
         struct ibv_qp_attr qp_attr;
@@ -1278,7 +1278,7 @@ ERROR_EXIT:
         qp_attr.path_mtu = DEFAULT_MTU[type];
         qp_attr.dest_qp_num = dest_qp_num;
         qp_attr.rq_psn = remote_psn;
-        qp_attr.max_dest_rd_atomic = MAX_RD_ATOMIC[(type == MEMROY_NODE_IDX ? COMPUTE_NODE_IDX : MEMROY_NODE_IDX)];
+        qp_attr.max_dest_rd_atomic = MAX_RD_ATOMIC[(type == MEMORY_NODE_IDX ? COMPUTE_NODE_IDX : MEMORY_NODE_IDX)];
         qp_attr.min_rnr_timer = 1;
         qp_attr.ah_attr.is_global = 1;
         qp_attr.ah_attr.dlid = 0;
@@ -1287,8 +1287,8 @@ ERROR_EXIT:
         qp_attr.ah_attr.port_num = port_num;
         memcpy(&qp_attr.ah_attr.grh.dgid, &dest_gid, sizeof(dest_gid));
         qp_attr.ah_attr.grh.flow_label = 0;
-        qp_attr.ah_attr.grh.hop_limit = 1;
-        qp_attr.ah_attr.grh.sgid_index = 0;
+        qp_attr.ah_attr.grh.hop_limit = 64;
+        qp_attr.ah_attr.grh.sgid_index = gid_index;
         qp_attr.ah_attr.grh.traffic_class = 0;
 
         int flags = IBV_QP_STATE |
@@ -1579,14 +1579,14 @@ ERROR_EXIT:
         FatalAssert(!memory_nodes.empty(), LOG_TAG_RDMA, "There should be at least one memory node to connect to.");
         FatalAssert(memory_nodes.size() == 1, LOG_TAG_NOT_IMPLEMENTED,
                     "Currently, only one memory node is supported.");
-        const NodeID MEMORY_NODE_ID = memory_nodes.begin()->first;
+        const NodeID memory_node_id = memory_nodes.begin()->first;
         NodeID remote_node_id = selfInfo.node_id;
         ConnectionContext& ctx = memory_nodes.begin()->second;
         FatalAssert(ctx.socket == -1, LOG_TAG_RDMA,
                     "TCP connection is already established with memory node.");
-        FatalAssert(ctx.remote_node_info.node_id == MEMORY_NODE_ID, LOG_TAG_RDMA,
+        FatalAssert(ctx.remote_node_info.node_id == memory_node_id, LOG_TAG_RDMA,
                     "Remote node id mismatch. expected=%s, actual=%s",
-                    MEMORY_NODE_ID.ToString().ToCStr(),
+                    memory_node_id.ToString().ToCStr(),
                     ctx.remote_node_info.node_id.ToString().ToCStr());
 
         struct sockaddr_in server_addr;
@@ -1621,14 +1621,14 @@ ERROR_EXIT:
         FatalAssert(remote_node_id.IsMemoryNode(), LOG_TAG_RDMA,
                     "Received invalid remote node id from memory node. node_id=%s",
                     remote_node_id.ToString().ToCStr());
-        FatalAssert(remote_node_id == MEMORY_NODE_ID, LOG_TAG_RDMA,
+        FatalAssert(remote_node_id == memory_node_id, LOG_TAG_RDMA,
                     "Remote node id mismatch. expected=%s, received=%s",
-                    MEMORY_NODE_ID.ToString().ToCStr(),
+                    memory_node_id.ToString().ToCStr(),
                     remote_node_id.ToString().ToCStr());
 
         DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_RDMA,
                 "Established TCP connection to memory node (node_id=%s, ip=%u, port=%hu)",
-                MEMORY_NODE_ID.ToString().ToCStr(), ctx.remote_node_info.ip_address, ctx.remote_node_info.port);
+                memory_node_id.ToString().ToCStr(), ctx.remote_node_info.ip_address, ctx.remote_node_info.port);
 
 EXIT:
         FatalAssert(rs.IsOK(), LOG_TAG_RDMA,
@@ -1696,12 +1696,12 @@ EXIT:
         FatalAssert(!memory_nodes.empty(), LOG_TAG_RDMA, "There should be at least one memory node to connect to.");
         FatalAssert(memory_nodes.size() == 1, LOG_TAG_NOT_IMPLEMENTED,
                     "Currently, only one memory node is supported.");
-        const NodeID MEMORY_NODE_ID = memory_nodes.begin()->first;
+        const NodeID memory_node_id = memory_nodes.begin()->first;
         ConnectionContext& ctx = memory_nodes.begin()->second;
         ssize_t bytes = 0;
-        FatalAssert(ctx.remote_node_info.node_id == MEMORY_NODE_ID, LOG_TAG_RDMA,
+        FatalAssert(ctx.remote_node_info.node_id == memory_node_id, LOG_TAG_RDMA,
                     "Remote node id mismatch. expected=%s, actual=%s",
-                    MEMORY_NODE_ID.ToString().ToCStr(),
+                    memory_node_id.ToString().ToCStr(),
                     ctx.remote_node_info.node_id.ToString().ToCStr());
         HandshakeInfo handshake_info;
         memset(&handshake_info, 0, sizeof(handshake_info));
@@ -1710,20 +1710,20 @@ EXIT:
         if (bytes != sizeof(handshake_info)) {
             rs = RetStatus::Fail(String("Failed to receive handshake info from compute node %s. "
                                         "Received %zd bytes instead of %zu. errno=(%d)%s",
-                                        MEMORY_NODE_ID.ToString().ToCStr(),
+                                        memory_node_id.ToString().ToCStr(),
                                         bytes, sizeof(handshake_info),
                                         errno, strerror(errno)).ToCStr());
             goto EXIT;
         }
 
-        ProcessHandshakeInfo(MEMORY_NODE_ID, handshake_info);
+        ProcessHandshakeInfo(memory_node_id, handshake_info);
 
-        FillHandshakeInfo(MEMORY_NODE_ID, handshake_info);
+        FillHandshakeInfo(memory_node_id, handshake_info);
         bytes = send(ctx.socket, &handshake_info, sizeof(handshake_info), 0);
         if (bytes != sizeof(handshake_info)) {
             rs = RetStatus::Fail(String("Failed to send handshake info to memory node %s. "
                                         "Sent %zd bytes instead of %zu. errno=(%d)%s",
-                                        MEMORY_NODE_ID.ToString().ToCStr(),
+                                        memory_node_id.ToString().ToCStr(),
                                         bytes, sizeof(handshake_info),
                                         errno, strerror(errno)).ToCStr());
             goto EXIT;
@@ -1740,7 +1740,7 @@ EXIT:
         uint8_t type;
         if (selfInfo.node_id.IsMemoryNode()) {
             target_map = &compute_nodes;
-            type = MEMROY_NODE_IDX;
+            type = MEMORY_NODE_IDX;
         } else {
             target_map = &memory_nodes;
             type = COMPUTE_NODE_IDX;
@@ -1753,7 +1753,7 @@ EXIT:
             for (uint8_t conn_id = 0; conn_id < MAX_CONN_PER_NODE; ++conn_id) {
                 rs = ModifyQPStateToRTR(ctx.connections[conn_id].qp,
                                         ctx.connections[conn_id].remote_qp_num,
-                                        ctx.remote_gid,
+                                        ctx.remote_gid, _gid_index,
                                         _rdma_port,
                                         ctx.connections[conn_id].remote_psn,
                                         type);
