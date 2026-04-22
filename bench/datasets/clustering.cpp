@@ -272,6 +272,7 @@ struct ClusterManager {
     inline ClusterData& operator[](uint32_t idx) {
         lock.Lock(divftree::LockMode::SX_SHARED);
         ClusterData* res = clusters[idx].first;
+        FatalAssert(res != nullptr, LOG_TAG_BASIC, "cluster is empty!");
         lock.Unlock();
         return *res;
     }
@@ -281,6 +282,10 @@ struct ClusterManager {
         uint32_t num_seen = 0;
         for (uint32_t i = 0; i < clusters.size(); i++) {
             std::pair<ClusterData*, ClusterMetaData*> cluster_info = clusters[i];
+            if (cluster_info.first == nullptr || cluster_info.second == nullptr) {
+                FatalAssert(cluster_info.first == nullptr && cluster_info.second == nullptr, LOG_TAG_BASIC, "both should be null!");
+                continue;
+            }
             ClusterData& cluster_data = *(cluster_info.first);
             ClusterMetaData& cluster_meta = *(cluster_info.second);
             FatalAssert(cluster_data.num_points > 0, LOG_TAG_BASIC, "Cluster has no points assigned!");
@@ -290,6 +295,60 @@ struct ClusterManager {
         }
         lock.Unlock();
         return num_seen;
+    }
+
+    inline uint32_t RemoveEmptyClusters() {
+        lock.Lock(divftree::LockMode::SX_EXCLUSIVE);
+        uint32_t removed = 0;
+        for (uint32_t i = 0; i < clusters.size(); i++) {
+            if (clusters[i].first == nullptr || clusters[i].second == nullptr) {
+                FatalAssert(clusters[i].first == nullptr && clusters[i].second == nullptr, LOG_TAG_BASIC, "both should be null!");
+                ++removed;
+                continue;
+            }
+            FatalAssert(i >= removed, LOG_TAG_BASIC, "i cannot be greater than remove");
+            if (removed > 0) {
+                clusters[i - removed] = clusters[i];
+            }
+        }
+        clusters.resize(clusters.size() - removed);
+        uint32_t new_size = clusters.size();
+        lock.Unlock();
+        return new_size;
+    }
+
+    inline void SetEmpty(uint32_t idx) {
+        FatalAssert(idx < clusters.size(), LOG_TAG_BASIC, "idx out of bounds!");
+        lock.Lock(divftree::LockMode::SX_SHARED);
+        FatalAssert(clusters[idx].first != nullptr, LOG_TAG_BASIC, "Already empty!");
+        FatalAssert(clusters[idx].second != nullptr, LOG_TAG_BASIC, "Already empty!");
+        FatalAssert(clusters[idx].first->num_points == 0, LOG_TAG_BASIC, "cluster should be empty!");
+        delete clusters[idx].first;
+        clusters[idx].first = nullptr;
+        delete clusters[idx].second;
+        clusters[idx].second = nullptr;
+        lock.Unlock();
+    }
+
+    inline bool GetIfNotEmpty(uint32_t idx, bool lock_cluster, std::pair<ClusterData*, ClusterMetaData*>& out) {
+        if (!lock_cluster) {
+            if (clusters[idx].first == nullptr || clusters[idx].second == nullptr) {
+                FatalAssert(clusters[idx].first == nullptr && clusters[idx].second == nullptr, LOG_TAG_BASIC, "both should be null!");
+                return false;
+            }
+            out = clusters[idx];
+            return true;
+        }
+
+        lock.Lock(divftree::LockMode::SX_SHARED);
+        if (clusters[idx].first == nullptr || clusters[idx].second == nullptr) {
+            FatalAssert(clusters[idx].first == nullptr && clusters[idx].second == nullptr, LOG_TAG_BASIC, "both should be null!");
+            lock.Unlock();
+            return false;
+        }
+        out = clusters[idx];
+        lock.Unlock();
+        return true;
     }
 };
 
@@ -434,11 +493,12 @@ void kmeans(DataSet<DataSetInternal>& data, uint32_t* const valid_indices, uint3
             uint32_t max_iterations, size_t num_threads, ClusterManager& cluster_manager,
             uint32_t* const valid_cluster_indices, bool weighted_kmeans = false) {
     std::atomic<bool> converged = false;
+    std::atomic<uint32_t> first_non_empty_cluster = 0;
 
     std::cout << "Initializing centroids using " << num_threads << " threads...\n" << std::flush;
     #pragma omp parallel num_threads(num_threads) \
         shared(data, valid_indices, assignments, num_points, num_clusters, max_iterations,\
-               cluster_manager, valid_cluster_indices, converged)
+               cluster_manager, valid_cluster_indices, converged, first_non_empty_cluster)
     {
         divftree::Thread* st = divftree::threadSelf;
         bool created = false;
@@ -478,21 +538,40 @@ void kmeans(DataSet<DataSetInternal>& data, uint32_t* const valid_indices, uint3
             {
                 if (iter > 0) {
                     converged.store(true, std::memory_order_release);
+                    uint32_t c_idx = first_non_empty_cluster.load(std::memory_order_relaxed);
+                    for (; c_idx < num_clusters; ++c_idx) {
+                        uint32_t c = (valid_cluster_indices == nullptr ? c_idx : valid_cluster_indices[c_idx]);
+                        std::pair<ClusterData*, ClusterMetaData*> cluster_info;
+                        if (cluster_manager.GetIfNotEmpty(c, false, cluster_info)) {
+                            break;
+                        }
+                    }
+                    FatalAssert(c_idx != num_clusters, LOG_TAG_BASIC, "All clusters are empty!");
+                    FatalAssert(c_idx == 0 || num_clusters > 2, LOG_TAG_BASIC, "2means should not return empty clsuters if initial centroids are chosen from base vectors");
+                    first_non_empty_cluster.store(c_idx, std::memory_order_release);
                 }
             }
-
             /* assignment */
             #pragma omp for schedule(static)
             for (uint32_t idx = 0; idx < num_points; idx++) {
+                uint32_t fc = first_non_empty_cluster.load(std::memory_order_acquire);
                 uint32_t i = (valid_indices == nullptr ? idx : valid_indices[idx]);
-                uint32_t c = (valid_cluster_indices == nullptr ? 0 : valid_cluster_indices[0]);
-                uint32_t best_cluster = 0;
-                divftree::DTYPE best_dist = L2Squared(data[i].data, cluster_manager.At(c, false).first->data);
+                uint32_t c = (valid_cluster_indices == nullptr ? fc : valid_cluster_indices[fc]);
+                uint32_t best_cluster = fc;
+                std::pair<ClusterData*, ClusterMetaData*> cluster_info;
+                if (!cluster_manager.GetIfNotEmpty(c, false, cluster_info)) {
+                    FatalAssert(false, LOG_TAG_BASIC, "The first non empty index cannot be empty!");
+                    continue;
+                }
+                divftree::DTYPE best_dist = L2Squared(data[i].data, cluster_info.first->data);
                 // DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
                 //     "Distance of vector index %u to cluster %u is " DTYPE_FMT, i, c, best_dist);
-                for (uint32_t c_idx = 1; c_idx < num_clusters; c_idx++) {
+                for (uint32_t c_idx = fc + 1; c_idx < num_clusters; c_idx++) {
                     c = (valid_cluster_indices == nullptr ? c_idx : valid_cluster_indices[c_idx]);
-                    divftree::DTYPE dist = L2Squared(data[i].data, cluster_manager.At(c, false).first->data);
+                    if (!cluster_manager.GetIfNotEmpty(c, false, cluster_info)) {
+                        continue;
+                    }
+                    divftree::DTYPE dist = L2Squared(data[i].data, cluster_info.first->data);
                     if (MoreSimilar(dist, best_dist)) {
                         best_dist = dist;
                         best_cluster = c_idx;
@@ -550,7 +629,11 @@ void kmeans(DataSet<DataSetInternal>& data, uint32_t* const valid_indices, uint3
             #pragma omp for schedule(static)
             for (uint32_t i = 0; i < num_clusters; i++) {
                 uint32_t c = (valid_cluster_indices == nullptr ? i : valid_cluster_indices[i]);
-                std::pair<ClusterData*, ClusterMetaData*> cluster_info = cluster_manager.At(c, false);
+                std::pair<ClusterData*, ClusterMetaData*> cluster_info;
+                if (!cluster_manager.GetIfNotEmpty(c, false, cluster_info)) {
+                    FatalAssert(num_clusters > 2, LOG_TAG_BASIC, "2means should not return empty clusters when initial centroids are chosen from the actual vectors");
+                    continue;
+                }
                 ClusterData& cluster_data = *(cluster_info.first);
                 ClusterMetaData& cluster_meta = *(cluster_info.second);
                 cluster_data.num_points = 0;
@@ -564,7 +647,11 @@ void kmeans(DataSet<DataSetInternal>& data, uint32_t* const valid_indices, uint3
             for (uint32_t i = 0; i < num_clusters; i++) {
                 uint32_t c_idx = (tn + i) % num_clusters;
                 uint32_t c = (valid_cluster_indices == nullptr ? c_idx : valid_cluster_indices[c_idx]);
-                std::pair<ClusterData*, ClusterMetaData*> cluster_info = cluster_manager.At(c, false);
+                std::pair<ClusterData*, ClusterMetaData*> cluster_info;
+                if (!cluster_manager.GetIfNotEmpty(c, false, cluster_info)) {
+                    FatalAssert(num_clusters > 2, LOG_TAG_BASIC, "2means should not return empty clusters when initial centroids are chosen from the actual vectors");
+                    continue;
+                }
                 ClusterData& cluster_data = *(cluster_info.first);
                 ClusterMetaData& cluster_meta = *(cluster_info.second);
                 cluster_meta.lock.Lock(divftree::LockMode::SX_EXCLUSIVE);
@@ -584,9 +671,20 @@ void kmeans(DataSet<DataSetInternal>& data, uint32_t* const valid_indices, uint3
             #pragma omp for schedule(static)
             for (uint32_t i = 0; i < num_clusters; i++) {
                 uint32_t c = (valid_cluster_indices == nullptr ? i : valid_cluster_indices[i]);
-                std::pair<ClusterData*, ClusterMetaData*> cluster_info = cluster_manager.At(c, false);
+                std::pair<ClusterData*, ClusterMetaData*> cluster_info;
+                if (!cluster_manager.GetIfNotEmpty(c, false, cluster_info)) {
+                    FatalAssert(num_clusters > 2, LOG_TAG_BASIC, "2means should not return empty clusters when initial centroids are chosen from the actual vectors");
+                    continue;
+                }
+                if (cluster_info.first->num_points == 0) {
+                    FatalAssert(num_clusters > 2, LOG_TAG_BASIC, "2means should not return empty clusters when initial centroids are chosen from the actual vectors");
+                    FatalAssert(cluster_info.second->subtree_size == 0, LOG_TAG_BASIC, "subtree size should also be 0");
+                    cluster_manager.SetEmpty(c);
+                    continue;
+                }
                 ClusterData& cluster_data = *(cluster_info.first);
                 ClusterMetaData& cluster_meta = *(cluster_info.second);
+
                 FatalAssert(cluster_data.num_points > 0, LOG_TAG_BASIC, "Cluster has no points assigned!");
                 // divftree::String cluster_str = divftree::String("Updating centroid for cluster %u: num_points=%u, data=[", c, cluster_data.num_points);
                 FatalAssert(weighted_kmeans || (cluster_data.num_points == cluster_meta.subtree_size), LOG_TAG_BASIC,
@@ -644,23 +742,40 @@ void kmeans(DataSet<DataSetInternal>& data, uint32_t* const valid_indices, uint3
     memset(cluster_sums, 0, sizeof(divftree::MVTYPE) * num_clusters * DIMENSION);
     memset(cluster_weights, 0, sizeof(uint32_t) * num_clusters);
     memset(cluster_counts, 0, sizeof(uint32_t) * num_clusters);
+    uint32_t fc = 0;
 
     for (uint32_t iter = 0; iter < max_iterations || max_iterations == 0; ++iter) {
         if (iter > 0) {
             converged = true;
+            for (; fc < num_clusters; ++fc) {
+                uint32_t c = (valid_cluster_indices == nullptr ? fc : valid_cluster_indices[fc]);
+                std::pair<ClusterData*, ClusterMetaData*> cluster_info;
+                if (cluster_manager.GetIfNotEmpty(c, true, cluster_info)) {
+                    break;
+                }
+            }
+            FatalAssert(fc < num_clusters, LOG_TAG_BASIC, "All clusters are empty!");
+            FatalAssert(fc == 0 || num_clusters > 2, LOG_TAG_BASIC, "2means should not return empty clsuters if initial centroids are chosen from base vectors");
         }
 
         /* assignment */
         for (uint32_t idx = 0; idx < num_points; idx++) {
+            FatalAssert(fc < num_clusters, LOG_TAG_BASIC, "All clusters are empty!");
+            FatalAssert(fc == 0 || num_clusters > 2, LOG_TAG_BASIC, "cannot have empty clusters for 2means when initial centroids are chosen from the base vectors");
             uint32_t i = (valid_indices == nullptr ? idx : valid_indices[idx]);
-            uint32_t c = (valid_cluster_indices == nullptr ? 0 : valid_cluster_indices[0]);
-            uint32_t best_cluster = 0;
+            uint32_t c = (valid_cluster_indices == nullptr ? fc : valid_cluster_indices[fc]);
+            uint32_t best_cluster = fc;
             divftree::DTYPE best_dist = L2Squared(data[i].data, cluster_manager.At(c, true).first->data);
             // DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
             //         "Distance of vector index %u to cluster %u is " DTYPE_FMT, i, c, best_dist);
-            for (uint32_t c_idx = 1; c_idx < num_clusters; c_idx++) {
+            for (uint32_t c_idx = fc + 1; c_idx < num_clusters; c_idx++) {
                 c = (valid_cluster_indices == nullptr ? c_idx : valid_cluster_indices[c_idx]);
-                divftree::DTYPE dist = L2Squared(data[i].data, cluster_manager.At(c, true).first->data);
+                std::pair<ClusterData*, ClusterMetaData*> cluster_info;
+                if (!cluster_manager.GetIfNotEmpty(c, true, cluster_info)) {
+                    FatalAssert(num_clusters > 2, LOG_TAG_BASIC, "cannot have empty clsuters for 2 means in our alg");
+                    continue;
+                }
+                divftree::DTYPE dist = L2Squared(data[i].data, cluster_info.first->data);
                 // DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
                 //         "Distance of vector index %u to cluster %u is " DTYPE_FMT, i, c, dist);
                 if (MoreSimilar(dist, best_dist)) {
@@ -703,7 +818,18 @@ void kmeans(DataSet<DataSetInternal>& data, uint32_t* const valid_indices, uint3
         /* centroid computation */
         for (uint32_t i = 0; i < num_clusters; i++) {
             uint32_t c = (valid_cluster_indices == nullptr ? i : valid_cluster_indices[i]);
-            std::pair<ClusterData*, ClusterMetaData*> cluster_info = cluster_manager.At(c, true);
+            std::pair<ClusterData*, ClusterMetaData*> cluster_info;
+            if (!cluster_manager.GetIfNotEmpty(c, true, cluster_info)) {
+                FatalAssert(num_clusters > 2, LOG_TAG_BASIC, "cannot have empty clsuters for 2 means in our alg");
+                continue;
+            }
+            cluster_info.first->num_points = 0;
+            if (cluster_counts[i] == 0) {
+                FatalAssert(num_clusters > 2, LOG_TAG_BASIC, "cannot have empty clsuters for 2 means in our alg");
+                cluster_manager.SetEmpty(c);
+                continue;
+            }
+
             ClusterData& cluster_data = *(cluster_info.first);
             ClusterMetaData& cluster_meta = *(cluster_info.second);
             cluster_data.num_points = cluster_counts[i];
@@ -744,7 +870,6 @@ void kmeans_simple(DataSet<VectorData>& data, uint32_t num_points, uint32_t num_
 
     kmeans(data, nullptr, assignments, num_points, num_clusters, max_iterations, num_threads,
            cluster_manager, nullptr);
-
     uint32_t num_seen = cluster_manager.SetOffsets();
     FatalAssert(num_seen == num_points, LOG_TAG_BASIC,
                 "Total number of assigned points should be equal to num_points!");
@@ -768,6 +893,7 @@ void kmeans_simple(DataSet<VectorData>& data, uint32_t num_points, uint32_t num_
             uint32_t c = assignments[i];
 
             std::pair<ClusterData*, ClusterMetaData*> cluster_info = cluster_manager.At(c, false);
+            FatalAssert(cluster_info.first->num_points > 0, LOG_TAG_BASIC, "Cluster should have points assigned!");
             ClusterData& cluster_data = *(cluster_info.first);
             ClusterMetaData& cluster_meta_data = *(cluster_info.second);
 
@@ -781,6 +907,12 @@ void kmeans_simple(DataSet<VectorData>& data, uint32_t num_points, uint32_t num_
         }
     }
     delete[] assignments;
+
+    uint32_t new_num_clusters = cluster_manager.RemoveEmptyClusters();
+    if (num_clusters != new_num_clusters) {
+        FatalAssert(new_num_clusters < num_clusters, LOG_TAG_BASIC, "new num clusters cannot be greater than old num clusters");
+        DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_BASIC, "kmeans-simple: %u clusters where empty -> new num clusters = %u", new_num_clusters - num_clusters, new_num_clusters);
+    }
 
     data.ReplaceWithImg();
 }
@@ -817,6 +949,17 @@ void kmeans_sampled(DataSet<VectorData>& data, uint32_t num_points, uint32_t sam
 
     std::cout << "Assigning remaining points to nearest centroids and reordering vectors using " << num_threads << " threads...\n" << std::flush;
     std::atomic<uint32_t> num_assigned = 0;
+
+    uint32_t fc = 0;
+    if (num_clusters > 2) {
+        for (; fc < num_clusters; ++fc) {
+            std::pair<ClusterData*, ClusterMetaData*> cluster_info;
+            if (cluster_manager.GetIfNotEmpty(fc, false, cluster_info)) {
+                break;
+            }
+        }
+    }
+
     #pragma omp parallel num_threads(num_threads) shared(cluster_manager, assignments, num_points, data, num_assigned)
     {
         divftree::Thread* st = divftree::threadSelf;
@@ -838,10 +981,14 @@ void kmeans_sampled(DataSet<VectorData>& data, uint32_t num_points, uint32_t sam
             if (assignments[idx] != (uint32_t)-1) {
                 continue; // already assigned in the initial k-means
             }
-            uint32_t best_cluster = 0;
-            divftree::DTYPE best_dist = L2Squared(data[idx].data, cluster_manager.At(0, false).first->data);
-            for (uint32_t c_idx = 1; c_idx < num_clusters; c_idx++) {
-                divftree::DTYPE dist = L2Squared(data[idx].data, cluster_manager.At(c_idx, false).first->data);
+            std::pair<ClusterData*, ClusterMetaData*> cluster_info;
+            uint32_t best_cluster = fc;
+            divftree::DTYPE best_dist = L2Squared(data[idx].data, cluster_manager.At(fc, false).first->data);
+            for (uint32_t c_idx = fc + 1; c_idx < num_clusters; c_idx++) {
+                if (!cluster_manager.GetIfNotEmpty(c_idx, false, cluster_info)) {
+                    continue;
+                }
+                divftree::DTYPE dist = L2Squared(data[idx].data, cluster_info.first->data);
                 if (MoreSimilar(dist, best_dist)) {
                     best_dist = dist;
                     best_cluster = c_idx;
@@ -871,6 +1018,7 @@ void kmeans_sampled(DataSet<VectorData>& data, uint32_t num_points, uint32_t sam
             uint32_t c = assignments[i];
 
             std::pair<ClusterData*, ClusterMetaData*> cluster_info = cluster_manager.At(c, false);
+            FatalAssert(cluster_info.first->num_points > 0, LOG_TAG_BASIC, "Cluster should have points assigned!");
             ClusterData& cluster_data = *(cluster_info.first);
             ClusterMetaData& cluster_meta_data = *(cluster_info.second);
 
@@ -884,6 +1032,12 @@ void kmeans_sampled(DataSet<VectorData>& data, uint32_t num_points, uint32_t sam
         }
     }
     delete[] assignments;
+
+    uint32_t new_num_clusters = cluster_manager.RemoveEmptyClusters();
+    if (num_clusters != new_num_clusters) {
+        FatalAssert(new_num_clusters < num_clusters, LOG_TAG_BASIC, "new num clusters cannot be greater than old num clusters");
+        DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_BASIC, "kmeans-sampled: %u clusters where empty -> new num clusters = %u", new_num_clusters - num_clusters, new_num_clusters);
+    }
 
     data.ReplaceWithImg();
 }
@@ -958,7 +1112,11 @@ void kmeans_capped(DataSet<DataSetInternal>& data, uint32_t num_points, uint32_t
     uint32_t num_seen = 0;
     uint32_t num_new_clusters_needed = 0;
     for (uint32_t i = 0; i < num_clusters; i++) {
-        std::pair<ClusterData*, ClusterMetaData*> cluster_info = cluster_manager.At(i, false);
+        std::pair<ClusterData*, ClusterMetaData*> cluster_info;
+        if (!cluster_manager.GetIfNotEmpty(i, false, cluster_info)) {
+            FatalAssert(num_clusters > 2, LOG_TAG_BASIC, "2means should not return empty clusters when initial centroids are chosen from the actual vectors");
+            continue;
+        }
         ClusterData& cluster_data = *(cluster_info.first);
         ClusterMetaData& cluster_meta_data = *(cluster_info.second);
         FatalAssert(cluster_data.num_points > 0, LOG_TAG_BASIC, "Cluster has no points assigned!");
@@ -1007,6 +1165,7 @@ void kmeans_capped(DataSet<DataSetInternal>& data, uint32_t num_points, uint32_t
             for (uint32_t i = 0; i < num_points; i++) {
                 uint32_t c = assignments[i];
                 std::pair<ClusterData*, ClusterMetaData*> cluster_info = cluster_manager.At(c, false);
+                FatalAssert(cluster_info.first->num_points > 0, LOG_TAG_BASIC, "Cluster should have points assigned!");
                 ClusterData& cluster_data = *(cluster_info.first);
                 ClusterMetaData& cluster_meta_data = *(cluster_info.second);
                 if (cluster_data.num_points <= cluster_cap) {
@@ -1053,7 +1212,12 @@ void kmeans_capped(DataSet<DataSetInternal>& data, uint32_t num_points, uint32_t
                 new_split_tasks.reserve(task.num_clusters);
                 for (uint32_t i = 0; i < task.num_clusters; i++) {
                     uint32_t c = new_valid_cluster_indices[i];
-                    std::pair<ClusterData*, ClusterMetaData*> cluster_info = cluster_manager.At(c, true);
+                    std::pair<ClusterData*, ClusterMetaData*> cluster_info;
+                    if (!cluster_manager.GetIfNotEmpty(c, true, cluster_info)) {
+                        FatalAssert(task.num_clusters > 2, LOG_TAG_BASIC, "2means should not return empty clusters when initial centroids are chosen from the actual vectors");
+                        continue;
+                    }
+
                     ClusterData& cluster_data = *(cluster_info.first);
                     ClusterMetaData& cluster_meta_data = *(cluster_info.second);
                     FatalAssert(cluster_data.num_points > 0, LOG_TAG_BASIC, "Cluster has no points assigned!");
@@ -1096,6 +1260,7 @@ void kmeans_capped(DataSet<DataSetInternal>& data, uint32_t num_points, uint32_t
                         std::pair<ClusterData*, ClusterMetaData*> cluster_info = cluster_manager.At(c, true);
                         ClusterData& cluster_data = *(cluster_info.first);
                         ClusterMetaData& cluster_meta_data = *(cluster_info.second);
+                        FatalAssert(cluster_data.num_points > 0, LOG_TAG_BASIC, "Cluster should have points assigned!");
 
                         if ((target_cluster_data.num_points > cluster_cap) && (c != task.target_cluster)) {
                             target_cluster_meta_data.assigned_vector_indices[p] = target_cluster_meta_data.assigned_vector_indices.back();
@@ -1147,6 +1312,7 @@ void kmeans_capped(DataSet<DataSetInternal>& data, uint32_t num_points, uint32_t
             std::pair<ClusterData*, ClusterMetaData*> cluster_info = cluster_manager.At(c, false);
             ClusterData& cluster_data = *(cluster_info.first);
             ClusterMetaData& cluster_meta_data = *(cluster_info.second);
+            FatalAssert(cluster_data.num_points > 0, LOG_TAG_BASIC, "Cluster should have points assigned!");
             if constexpr (std::is_same<DataSetInternal, VectorData>::value) {
                 cluster_data.num_total_points.fetch_add(data[i].num_duplicates + 1);
             }
@@ -1159,6 +1325,7 @@ void kmeans_capped(DataSet<DataSetInternal>& data, uint32_t num_points, uint32_t
             st->DestroyDIVFThread();
         }
     }
+    num_clusters = cluster_manager.RemoveEmptyClusters();
 
     delete[] assignments;
 

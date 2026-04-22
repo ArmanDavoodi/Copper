@@ -780,7 +780,7 @@ public:
         memory_stats_head = nullptr;
 #endif
 #ifdef ENABLE_STAT_COLLECTION
-        String stats = "";
+        String stats(1024*1024); // 1MB buffer
         std::vector<size_t> total_moved_to_cool(256, 0);
         std::vector<size_t> total_removed_from_cool(256, 0);
         std::vector<size_t> total_evicted(256, 0);
@@ -800,7 +800,7 @@ public:
             total_read_remote_in_progress[level] += entry.num_read_remote_in_progress;
             total_read_remote[level] += entry.num_read_remote;
             total_read[level] += entry.num_read;
-            
+
             total_moved_to_cool[0] += entry.num_moved_to_cool;
             total_removed_from_cool[0] += entry.num_removed_from_cool;
             total_evicted[0] += entry.num_evicted;
@@ -808,6 +808,40 @@ public:
             total_read_remote_in_progress[0] += entry.num_read_remote_in_progress;
             total_read_remote[0] += entry.num_read_remote;
             total_read[0] += entry.num_read;
+        }
+
+        stats += String(
+                "BufferMgr Stats:\n"
+                "Total reads: %zu (local: %.2f%%(%zu), remote in progress: %.2f%%(%zu), remote: %.2f%%(%zu)), "
+                "total_moved_to_cool: %zu, total_removed_from_cool: %zu, total_evicted: %zu\n",
+                total_read[0],
+                (((double)(total_read_local[0]) / total_read[0]) * 100), total_read_local[0],
+                (((double)(total_read_remote_in_progress[0]) / total_read[0]) * 100), total_read_remote_in_progress[0],
+                (((double)(total_read_remote[0]) / total_read[0]) * 100), total_read_remote[0],
+                total_moved_to_cool[0], total_removed_from_cool[0], total_evicted[0]
+            );
+
+        for (uint8_t level = max_level; level > 0; --level) {
+            stats += String(
+                "Level %hhu Stats:\n"
+                "Total reads: %zu (local: %.2f%%(%zu), remote in progress: %.2f%%(%zu), remote: %.2f%%(%zu)), "
+                "total_moved_to_cool: %zu, total_removed_from_cool: %zu, total_evicted: %zu\n",
+                level,
+                total_read[level],
+                (((double)(total_read_local[level]) / total_read[level]) * 100), total_read_local[level],
+                (((double)(total_read_remote_in_progress[level]) / total_read[level]) * 100), total_read_remote_in_progress[level],
+                (((double)(total_read_remote[level]) / total_read[level]) * 100), total_read_remote[level],
+                total_moved_to_cool[level], total_removed_from_cool[level], total_evicted[level]
+            );
+        }
+
+        stats += String("\n");
+
+        for (auto& pair : _buffer_map) {
+            uint8_t level = pair.first._level;
+            max_level = std::max(max_level, level);
+            BufferEntry& entry = pair.second;
+
             stats += String(VECTORID_LOG_FMT ": reads: %zu (local: %.2f%%(%zu), remote in progress: %.2f%%(%zu), remote: %.2f%%(%zu)), moved to cool: %zu, removed from cool: %zu, evicted: %zu\n",
                            VECTORID_LOG(pair.first), entry.num_read,
                            (((double)(entry.num_read_local) / entry.num_read) * 100), entry.num_read_local,
@@ -826,30 +860,9 @@ public:
             }
         }
 
-        for (uint8_t level = max_level; level > 0; --level) {
-            stats = String(
-                "Level %hhu Stats:\n"
-                "Total reads: %zu (local: %.2f%%(%zu), remote in progress: %.2f%%(%zu), remote: %.2f%%(%zu)), "
-                "total_moved_to_cool: %zu, total_removed_from_cool: %zu, total_evicted: %zu\n",
-                level,
-                total_read[level],
-                (((double)(total_read_local[level]) / total_read[level]) * 100), total_read_local[level],
-                (((double)(total_read_remote_in_progress[level]) / total_read[level]) * 100), total_read_remote_in_progress[level],
-                (((double)(total_read_remote[level]) / total_read[level]) * 100), total_read_remote[level],
-                total_moved_to_cool[level], total_removed_from_cool[level], total_evicted[level]
-            ) + stats + String("\n");
-        }
-        return
-            String(
-                "BufferMgr Stats:\n"
-                "Total reads: %zu (local: %.2f%%(%zu), remote in progress: %.2f%%(%zu), remote: %.2f%%(%zu)), "
-                "total_moved_to_cool: %zu, total_removed_from_cool: %zu, total_evicted: %zu\n",
-                total_read,
-                (((double)(total_read_local[0]) / total_read[0]) * 100), total_read_local[0],
-                (((double)(total_read_remote_in_progress[0]) / total_read[0]) * 100), total_read_remote_in_progress[0],
-                (((double)(total_read_remote[0]) / total_read[0]) * 100), total_read_remote[0],
-                total_moved_to_cool[0], total_removed_from_cool[0], total_evicted[0]
-            ) + stats + String("\n");
+        stats += String("\n");
+
+        return stats;
 #else
         return "BufferMgr Stats: (enable stat collection to see details)";
 #endif

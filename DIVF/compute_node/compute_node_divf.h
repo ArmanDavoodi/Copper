@@ -202,8 +202,10 @@ public:
         CHECK_NOT_NULLPTR(bufferMgr, LOG_TAG_BASIC);
         RDMA_Manager* rdmaMgr = RDMA_Manager::GetInstance();
         CHECK_NOT_NULLPTR(rdmaMgr, LOG_TAG_BASIC);
-        return rdmaMgr->GetStats(reset_after_fetch) + String("\n----------------\n") +
-               bufferMgr->GetStats(m_stat_list, reset_after_fetch);
+        String stats = rdmaMgr->GetStats(reset_after_fetch);
+        stats += String("\n----------------\n");
+        stats += bufferMgr->GetStats(m_stat_list, reset_after_fetch);
+        return stats;
     }
 
 protected:
