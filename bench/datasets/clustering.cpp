@@ -1780,7 +1780,7 @@ inline void ParseArgs(int argc, char* argv[], Args& args) {
             FatalAssert(false, LOG_TAG_BASIC, "leaf_cap must be greater than 1 and less than num_points_to_use!");
             exit(EXIT_FAILURE);
         }
-        if (args.divftree_kmeans_capped_args.internal_cap < 2 || args.divftree_kmeans_capped_args.internal_cap > args.divftree_kmeans_capped_args.leaf_cap) {
+        if (args.divftree_kmeans_capped_args.internal_cap < 2 /* || args.divftree_kmeans_capped_args.internal_cap > args.divftree_kmeans_capped_args.leaf_cap */) {
             std::cerr << "Error: internal_cap must be greater than 1 and less than or equal to leaf_cap (" << args.divftree_kmeans_capped_args.leaf_cap << ").\n";
             fclose(args.input_fp);
             fclose(args.output_fp);

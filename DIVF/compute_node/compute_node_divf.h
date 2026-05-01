@@ -66,9 +66,9 @@ public:
         uint32_t max_nprobe = std::max(k, std::max(leaf_nprobe, internal_nprobe)) + 1;
         uint32_t nprobe = is_leaf ? leaf_nprobe : internal_nprobe;
         if (nprobe > index_attr.index_meta.top_centroids.size()) {
-            DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_BASIC,
-                    "nprobe (%zu) is greater than the number of clusters (%zu). Reducing nprobe to %zu.",
-                    nprobe, index_attr.index_meta.top_centroids.size(), index_attr.index_meta.top_centroids.size());
+            // DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_BASIC,
+            //         "nprobe (%zu) is greater than the number of clusters (%zu). Reducing nprobe to %zu.",
+            //         nprobe, index_attr.index_meta.top_centroids.size(), index_attr.index_meta.top_centroids.size());
             nprobe = index_attr.index_meta.top_centroids.size();
         }
 

@@ -293,9 +293,9 @@ public:
         // FatalAssert(num_pages <= ((_num_buckets * _bucket_cap) / 2), LOG_TAG_BUFFER,
         //             "num_pages exceeds total capacity in CacheMetaContainerDetail::TryMoveToCooling()");
         CHECK_NOT_NULLPTR(freed_pages, LOG_TAG_BUFFER);
-        FatalAssert(max_pages_needed > 0, LOG_TAG_BUFFER,
-                    "max_pages_needed must be greater than 0 in CacheMetaContainerDetail::TryMoveToCooling()");
-        
+        // FatalAssert(max_pages_needed > 0, LOG_TAG_BUFFER,
+        //             "max_pages_needed must be greater than 0 in CacheMetaContainerDetail::TryMoveToCooling()");
+
         /* to avoid trying to cool too many entries at once and failing to acquire locks */
         num_pages = std::min(num_pages, (_num_buckets * _bucket_cap) / 4);
         FatalAssert(num_pages > 0, LOG_TAG_BUFFER,
@@ -320,6 +320,16 @@ public:
             size_t bucket_idx = threadSelf->UniformRange64(0, _num_buckets - 1);
             if (!_locks[bucket_idx].TryLock(SX_EXCLUSIVE)) {
                 continue;
+            }
+
+            if (max_pages_needed == 0) {
+                /* we are only trying to populate the cooling list */
+                size_t idx = _cooling_bucket_next_idx[bucket_idx] + _bucket_cap * bucket_idx;
+                if (_cooling_entries[idx] != nullptr) {
+                    /* this bucket is full so we do not need to populate */
+                    _locks[bucket_idx].Unlock();
+                    break;
+                }
             }
 
             if (_hot_entries[bucket_idx].empty()) {
@@ -446,14 +456,14 @@ public:
             std::max((size_t)((pool_bytes / page_bytes) * COOLING_SIZE_RATIO), 1lu),
             num_buckets, pool)), _internal_meta_container(nullptr) {}
 
-    CacheMetaContainer(size_t pool_bytes, size_t leaf_bytes, size_t internal_bytes,
+    CacheMetaContainer(size_t pool_bytes, size_t leaf_bytes, size_t internal_bytes, uint32_t leaf_cap,
                        size_t num_buckets, LocalMemoryPool& pool) :
         _leaf_page_size(leaf_bytes), _internal_page_size(internal_bytes),
         _leaf_meta_container(new CacheMetaContainerDetail(
             std::max((size_t)((pool_bytes / leaf_bytes) * COOLING_SIZE_RATIO), 1lu),
             num_buckets, pool)),
         _internal_meta_container(new CacheMetaContainerDetail(
-            std::max((size_t)((pool_bytes / internal_bytes) * COOLING_SIZE_RATIO), 1lu),
+            std::max((size_t)((pool_bytes / (internal_bytes * leaf_cap)) * COOLING_SIZE_RATIO), num_buckets),
             num_buckets, pool)) {}
 
     ~CacheMetaContainer() {
@@ -930,7 +940,7 @@ protected:
                     "Initializing BufferMgr with IVF_TREE index. leaf_page_size: %zu, internal_page_size: %zu, pool_size: %zu",
                     leaf_page_size, internal_page_size, pool_size);
             _cache = new LocalMemoryPool(internal_page_size, leaf_page_size, pool_size);
-            _cache_meta_container = new CacheMetaContainer(pool_size, leaf_page_size, internal_page_size,
+            _cache_meta_container = new CacheMetaContainer(pool_size, leaf_page_size, internal_page_size, index_meta.leaf_size_cap,
                                                            2 * num_user_threads, *_cache);
             DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
                     "BufferMgr initialized with IVF_TREE index. leaf_page_size: %zu, internal_page_size: %zu, pool_size: %zu",
@@ -1053,7 +1063,7 @@ protected:
                     _buffer_map.emplace(
                         cluster_meta.centroid_id,
                         BufferEntry(cluster_meta.centroid_id, cluster_meta.remote_addr, cluster_meta.remote_size,
-                                    cluster_meta.num_elements, _cache->GetPageSize(true))
+                                    cluster_meta.num_elements, _cache->GetPageSize(cluster_meta.centroid_id.IsLeaf()))
                     );
                     if (level_idx == index_meta.num_levels - 1) {
                         index_meta.top_centroids[c].id = cluster_meta.centroid_id;
@@ -1110,7 +1120,7 @@ protected:
             size_t num_to_alloc = num_pages_to_load - num_allocated;
             size_t current_allocated =
                 _cache_meta_container->TryMoveToCooling(num_to_alloc, local_buffers + num_allocated,
-                                                        num_to_alloc, bytes_freed_from_cool, num_pages_freed, is_leaf);
+                                                        (num_tries == 1 ? 0 : num_to_alloc), bytes_freed_from_cool, num_pages_freed, is_leaf);
             num_allocated += current_allocated;
             num_from_cool += current_allocated;
             if (num_allocated < num_pages_to_load) {
@@ -1122,7 +1132,7 @@ protected:
                 num_allocated += current_allocated;
             }
 
-            if (num_allocated < num_pages_to_load) {
+            if ((num_tries > 1) && (num_allocated < num_pages_to_load)) {
                 usleep(1);
             }
         }

@@ -10,6 +10,7 @@
 ENABLE_GDB       ?= 1# Enables -g3
 ENABLE_ASAN      ?= 1# Enables AddressSanitizer
 ENABLE_DEBUGINFO ?= 1# Enables -rdynamic, -fno-omit-frame-pointer and debug-friendly flags
+ENABLE_GPROF     ?= 0# Enables -pg # does not work will with many threads
 ENABLE_OPT       ?= 0# Enables optimization (-O3 vs -O0)
 
 # ================================
@@ -54,6 +55,11 @@ endif
 
 ifeq ($(ENABLE_GDB),1)
     CXXFLAGS += -g3
+endif
+
+ifeq ($(ENABLE_GPROF),1)
+    CXXFLAGS += -pg
+    LDFLAGS  += -pg
 endif
 
 # AddressSanitizer
