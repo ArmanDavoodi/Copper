@@ -7,11 +7,11 @@
 # Configurable build options
 # ================================
 
-ENABLE_GDB       ?= 1# Enables -g3
-ENABLE_ASAN      ?= 1# Enables AddressSanitizer
-ENABLE_DEBUGINFO ?= 1# Enables -rdynamic, -fno-omit-frame-pointer and debug-friendly flags
+ENABLE_GDB       ?= 0# Enables -g3
+ENABLE_ASAN      ?= 0# Enables AddressSanitizer
+ENABLE_DEBUGINFO ?= 0# Enables -rdynamic, -fno-omit-frame-pointer and debug-friendly flags
 ENABLE_GPROF     ?= 0# Enables -pg # does not work will with many threads
-ENABLE_OPT       ?= 0# Enables optimization (-O3 vs -O0)
+ENABLE_OPT       ?= 1# Enables optimization (-O3 vs -O0)
 
 # ================================
 # Common
@@ -34,7 +34,7 @@ $(info Memory Node source dir: $(MN_SRC_DIR))
 
 CXX := g++
 WARNING_FLAGS := -Wall -Wextra -pedantic -Wno-pedantic -Wno-write-strings -Wno-pointer-arith
-CXXFLAGS := $(WARNING_FLAGS) -std=c++20 $(INCLUDE_PATHS) -march=native -mcx16 -MMD -MP -libverbs -pthread
+CXXFLAGS := $(WARNING_FLAGS) -std=c++20 $(INCLUDE_PATHS) -march=native -mcx16 -MMD -MP -pthread
 LDFLAGS := -latomic -ldl -libverbs -pthread
 
 # ================================
@@ -91,7 +91,7 @@ CN_EXES := $(patsubst $(CN_SRC_DIR)/%.cpp, $(CN_BIN_DIR)/%, $(CN_TESTS))
 all: $(MN_EXES) $(CN_EXES)
 
 $(MN_BIN_DIR)/%: $(MN_OBJ_DIR)/%.o | $(MN_BIN_DIR)
-	$(CXX) $(LDFLAGS) -o $@ $<
+	$(CXX) -o $@ $< $(LDFLAGS)
 
 $(MN_OBJ_DIR)/%.o: $(MN_SRC_DIR)/%.cpp | $(MN_OBJ_DIR)
 	$(CXX) $(MN_CXXFLAGS) -c $< -o $@
@@ -103,7 +103,7 @@ $(MN_OBJ_DIR): $(BUILD_DIR)
 	mkdir -p $(MN_OBJ_DIR)
 
 $(CN_BIN_DIR)/%: $(CN_OBJ_DIR)/%.o | $(CN_BIN_DIR)
-	$(CXX) $(LDFLAGS) -o $@ $<
+	$(CXX) -o $@ $< $(LDFLAGS)
 
 $(CN_OBJ_DIR)/%.o: $(CN_SRC_DIR)/%.cpp | $(CN_OBJ_DIR)
 	$(CXX) $(CN_CXXFLAGS) -c $< -o $@

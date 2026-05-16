@@ -41,13 +41,13 @@ inline std::vector<std::vector<size_t>> query_latency_lists;
 divftree::RetStatus Search(std::vector<std::pair<divftree::DTYPE, divftree::IVFVectorID>>& neighbours, size_t idx) {
     divftree::RetStatus rs;
     neighbours.clear();
-    if (divftree::threadSelf->UniformRange32(0, 1000) == 0) {
-        divftree::String query_str = divftree::String("search query vector: idx=%zu, data=[", idx);
-        for (size_t i = 0; i < DIMENSION; ++i) {
-            query_str += divftree::String(VTYPE_FMT "%s", search_query_vectors[idx * DIMENSION + i], (i == DIMENSION - 1) ? "]" : ", ");
-        }
-        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%s", query_str.ToCStr());
-    }
+    // if (divftree::threadSelf->UniformRange32(0, 1000) == 0) {
+    //     divftree::String query_str = divftree::String("search query vector: idx=%zu, data=[", idx);
+    //     for (size_t i = 0; i < DIMENSION; ++i) {
+    //         query_str += divftree::String(VTYPE_FMT "%s", search_query_vectors[idx * DIMENSION + i], (i == DIMENSION - 1) ? "]" : ", ");
+    //     }
+    //     DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%s", query_str.ToCStr());
+    // }
 
     if (sample_rate_for_latency != 0 &&
         divftree::threadSelf->UniformRange64(0, sample_base_for_latency - 1) < sample_rate_for_latency) {
@@ -577,8 +577,8 @@ int main(int argc, char** argv) {
             }
             last_rps = cur_rps;
             last_reps = cur_reps;
-            if ((total_wait_time + time_to_wait > run_time)) {
-                time_to_wait = run_time - total_wait_time;
+            if ((total_wait_time + time_to_wait > warmup_time)) {
+                time_to_wait = warmup_time - total_wait_time;
             }
         }
     } else {

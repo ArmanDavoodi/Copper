@@ -81,8 +81,12 @@ struct RetStatus {
     static inline RetStatus Fail(const char* msg) {
         RetStatus status;
         status.stat = FAIL;
-        status.message = new char[strlen(msg) + 1];
-        strcpy(const_cast<char*>(status.message), msg);
+        if (msg != nullptr) {
+            status.message = new char[strlen(msg) + 1];
+            strcpy(const_cast<char*>(status.message), msg);
+        } else {
+            status.message = nullptr;
+        }
         return status;
     }
 

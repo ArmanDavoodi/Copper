@@ -28,6 +28,8 @@
 #define LOG_FUNCTION_NAME
 #elif BUILD==RELEASE
 #define ENABLE_ASSERTS
+#define ENABLE_TEST_LOGGING
+#define LOG_FUNCTION_NAME
 #endif
 
 // Todo: handle during compile

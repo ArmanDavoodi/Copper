@@ -166,12 +166,452 @@ struct BufferEntry {
     }
 };
 
+struct CacheEntry {
+    BufferEntry* entry;
+    size_t next;
+    size_t prev;
+};
+
+class CacheBucket {
+public:
+    CacheBucket(size_t _cooling_cap) :
+        cooling_cap(_cooling_cap), cooling_list_head(_cooling_cap),
+        cooling_list_tail(_cooling_cap), cooling_free_list_head(0),
+        hot_list_head(_cooling_cap), hot_list_tail(_cooling_cap), hot_free_list_head(0),
+        cooling_list_size(0), hot_list_size(0) {
+        hot_list.resize(_cooling_cap);
+        cooling_list = new CacheEntry[_cooling_cap];
+        for (size_t i = 0; i < _cooling_cap; ++i) {
+            cooling_list[i].entry = nullptr;
+            cooling_list[i].next = i + 1;
+            cooling_list[i].prev = _cooling_cap;
+            hot_list[i].entry = nullptr;
+            hot_list[i].next = i + 1;
+            hot_list[i].prev = _cooling_cap;
+        }
+    }
+
+    ~CacheBucket() {
+        delete[] cooling_list;
+    }
+
+    CacheBucket(const CacheBucket&) : cooling_cap(0) {
+        /* it is needed to use it as a vector */
+        FatalAssert(false, LOG_TAG_BUFFER, "CacheBucket copy constructor should not be called");
+    }
+
+    CacheBucket& operator=(const CacheBucket&) {
+        /* it is needed to use it as a vector */
+        FatalAssert(false, LOG_TAG_BUFFER, "CacheBucket copy assignment operator should not be called");
+        return *this;
+    }
+
+    bool TryLockBucket() {
+        return lock.TryLock(SX_EXCLUSIVE);
+    }
+
+    void LockBucket() {
+        lock.Lock(SX_EXCLUSIVE);
+    }
+
+    void UnlockBucket() {
+        lock.Unlock();
+    }
+
+    void ResizeHotList() {
+        threadSelf->SanityCheckLockHeldInModeByMe(&lock, SX_EXCLUSIVE);
+        FatalAssert(hot_free_list_head == hot_list.size(), LOG_TAG_BUFFER,
+                    "Hot free list head must point to the end of the hot list when resizing in CacheBucket::ResizeHotList()");
+        FatalAssert(hot_list_size == hot_list.size(), LOG_TAG_BUFFER,
+                    "Hot list size must be equal to hot list capacity when resizing in CacheBucket::ResizeHotList()");
+        FatalAssert(hot_list_size > 0, LOG_TAG_BUFFER,
+                    "Hot list size must be greater than 0 when resizing in CacheBucket::ResizeHotList()");
+        size_t new_cap = hot_list.size() * 2;
+        hot_list.resize(new_cap);
+        hot_free_list_head = hot_list_size;
+        for (size_t i = hot_list_size; i < new_cap; ++i) {
+            hot_list[i].entry = nullptr;
+            hot_list[i].next = i + 1;
+            hot_list[i].prev = new_cap;
+        }
+        FatalAssert(hot_list[hot_list_tail].next == hot_list_size, LOG_TAG_BUFFER,
+                    "Current tail entry's next index must point to the end of the hot list after resizing in CacheBucket::ResizeHotList()");
+        FatalAssert(hot_list[hot_list_head].prev == hot_list_size, LOG_TAG_BUFFER,
+                    "Current head entry's prev index must point to the end of the hot list after resizing in CacheBucket::ResizeHotList()");
+        hot_list[hot_list_tail].next = new_cap;
+        hot_list[hot_list_head].prev = new_cap;
+    }
+
+    void AddToHotList(BufferEntry* entry) {
+        CHECK_NOT_NULLPTR(entry, LOG_TAG_BUFFER);
+        threadSelf->SanityCheckLockHeldInModeByMe(&lock, SX_EXCLUSIVE);
+        threadSelf->SanityCheckLockHeldByMe(&entry->lock);
+        FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED, LOG_TAG_BUFFER,
+                    "Only entries in CACHED state can be added to hot list in CacheBucket::AddToHotList()");
+        FatalAssert(entry->pin == 0, LOG_TAG_BUFFER,
+                    "Only unpinned entries can be added to hot list in CacheBucket::AddToHotList()");
+
+        if (hot_free_list_head == hot_list.size()) {
+            ResizeHotList();
+        }
+
+        size_t idx = hot_free_list_head;
+        hot_free_list_head = hot_list[idx].next;
+
+        hot_list[idx].entry = entry;
+        hot_list[idx].next = hot_list.size();
+        hot_list[idx].prev = hot_list_tail;
+        if (hot_list_tail != hot_list.size()) {
+            FatalAssert(hot_list[hot_list_tail].entry != nullptr, LOG_TAG_BUFFER,
+                        "Current tail entry cannot be null in CacheBucket::AddToHotList()");
+            FatalAssert(hot_list[hot_list_tail].next == hot_list.size(), LOG_TAG_BUFFER,
+                        "Current tail entry's next index must point to the end of the hot list in CacheBucket::AddToHotList()");
+            hot_list[hot_list_tail].next = idx;
+        } else {
+            FatalAssert(hot_list_head == hot_list.size(), LOG_TAG_BUFFER,
+                        "Hot list head must point to the end of the hot list when adding the first entry in CacheBucket::AddToHotList()");
+            hot_list_head = idx;
+        }
+        hot_list_tail = idx;
+        entry->cache_list_idx = idx;
+        hot_list_size++;
+    }
+
+    void RemoveFromHotList(BufferEntry* entry) {
+        CHECK_NOT_NULLPTR(entry, LOG_TAG_BUFFER);
+        threadSelf->SanityCheckLockHeldInModeByMe(&lock, SX_EXCLUSIVE);
+        threadSelf->SanityCheckLockHeldByMe(&entry->lock);
+        FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED, LOG_TAG_BUFFER,
+                    "Only entries in CACHED state can be removed from hot list in CacheBucket::RemoveFromHotList()");
+        FatalAssert(entry->pin > 0, LOG_TAG_BUFFER,
+                    "Only pinned entries can be removed from hot list in CacheBucket::RemoveFromHotList()");
+        FatalAssert(entry->cache_list_idx < hot_list.size(), LOG_TAG_BUFFER,
+                    "Entry's cache list index is out of bounds in CacheBucket::RemoveFromHotList()");
+        FatalAssert(entry == hot_list[entry->cache_list_idx].entry, LOG_TAG_BUFFER,
+                    "Entry's cache list index does not point to the entry itself in CacheBucket::RemoveFromHotList()");
+        size_t prev_idx = hot_list[entry->cache_list_idx].prev;
+        size_t next_idx = hot_list[entry->cache_list_idx].next;
+        if (prev_idx != hot_list.size()) {
+            FatalAssert(hot_list[prev_idx].entry != nullptr, LOG_TAG_BUFFER,
+                        "Previous hot entry cannot be null in CacheBucket::RemoveFromHotList()");
+            FatalAssert(hot_list[prev_idx].next == entry->cache_list_idx, LOG_TAG_BUFFER,
+                        "Previous hot entry's next index must point to the current entry in CacheBucket::RemoveFromHotList()");
+            hot_list[prev_idx].next = next_idx;
+        } else {
+            FatalAssert(hot_list_head == entry->cache_list_idx, LOG_TAG_BUFFER,
+                        "Hot list head must point to the removed entry when there is only one entry in the hot list in CacheBucket::RemoveFromHotList()");
+            hot_list_head = next_idx;
+        }
+        if (next_idx != hot_list.size()) {
+            FatalAssert(hot_list[next_idx].entry != nullptr, LOG_TAG_BUFFER,
+                        "Next hot entry cannot be null in CacheBucket::RemoveFromHotList()");
+            FatalAssert(hot_list[next_idx].prev == entry->cache_list_idx, LOG_TAG_BUFFER,
+                        "Next hot entry's prev index must point to the current entry in CacheBucket::RemoveFromHotList()");
+            hot_list[next_idx].prev = prev_idx;
+        } else {
+            FatalAssert(hot_list_tail == entry->cache_list_idx, LOG_TAG_BUFFER,
+                        "Hot list tail must point to the removed entry when there is only one entry in the hot list in CacheBucket::RemoveFromHotList()");
+            hot_list_tail = prev_idx;
+        }
+
+        hot_list[entry->cache_list_idx].entry = nullptr;
+        hot_list[entry->cache_list_idx].next = hot_free_list_head;
+        hot_list[entry->cache_list_idx].prev = hot_list.size();
+        hot_free_list_head = entry->cache_list_idx;
+        hot_list_size--;
+    }
+
+    BufferEntry* PopFromHotList() {
+        threadSelf->SanityCheckLockHeldInModeByMe(&lock, SX_EXCLUSIVE);
+        if (hot_list_head == hot_list.size()) {
+            FatalAssert(hot_list_tail == hot_list.size(), LOG_TAG_BUFFER,
+                        "Hot list tail must point to the end of the hot list when hot list is empty in CacheBucket::PopFromHotList()");
+            FatalAssert(hot_list_size == 0, LOG_TAG_BUFFER,
+                        "Hot list size must be 0 when hot list is empty in CacheBucket::PopFromHotList()");
+            return nullptr;
+        }
+
+        size_t idx = hot_list_head;
+        FatalAssert(hot_list[idx].entry != nullptr, LOG_TAG_BUFFER,
+                    "Popped hot entry's entry pointer cannot be null in CacheBucket::PopFromHotList()");
+        FatalAssert(hot_list[idx].prev == hot_list.size(), LOG_TAG_BUFFER,
+                    "Popped hot entry's prev index must point to the end of the hot list in CacheBucket::PopFromHotList()");
+        hot_list_head = hot_list[idx].next;
+        if (hot_list_head != hot_list.size()) {
+            FatalAssert(hot_list[hot_list_head].entry != nullptr, LOG_TAG_BUFFER,
+                        "Next hot entry's entry pointer cannot be null in CacheBucket::PopFromHotList()");
+            FatalAssert(hot_list[hot_list_head].prev == idx, LOG_TAG_BUFFER,
+                        "Next hot entry's prev index must point to the current entry in CacheBucket::PopFromHotList()");
+            hot_list[hot_list_head].prev = hot_list.size();
+        } else {
+            FatalAssert(hot_list_tail == idx, LOG_TAG_BUFFER,
+                        "Hot list tail must point to the popped entry when there is only one entry in the hot list in CacheBucket::PopFromHotList()");
+            hot_list_tail = hot_list.size();
+        }
+
+        BufferEntry* entry = hot_list[idx].entry;
+        hot_list[idx].entry = nullptr;
+        hot_list[idx].next = hot_free_list_head;
+        hot_list[idx].prev = hot_list.size();
+        hot_free_list_head = idx;
+        hot_list_size--;
+        return entry;
+    }
+
+    size_t GetHotListSize() {
+        threadSelf->SanityCheckLockHeldInModeByMe(&lock, SX_EXCLUSIVE);
+        return hot_list_size;
+    }
+
+    bool CoolingListIsEmpty() {
+        threadSelf->SanityCheckLockHeldInModeByMe(&lock, SX_EXCLUSIVE);
+        SANITY_CHECK(
+            FatalAssert(cooling_list_head <= cooling_cap, LOG_TAG_BUFFER,
+                        "Cooling list head index out of bounds in CacheBucket::CoolingListIsEmpty()");
+            FatalAssert(cooling_list_tail <= cooling_cap, LOG_TAG_BUFFER,
+                        "Cooling list tail index out of bounds in CacheBucket::CoolingListIsEmpty()");
+            FatalAssert(cooling_list_size <= cooling_cap, LOG_TAG_BUFFER,
+                        "Cooling list size cannot be greater than cooling capacity in CacheBucket::CoolingListIsEmpty()");
+            FatalAssert((cooling_free_list_head == cooling_cap) == (cooling_list_size == cooling_cap), LOG_TAG_BUFFER,
+                        "Inconsistent cooling list state in CacheBucket::CoolingListIsFull()");
+            FatalAssert(((cooling_list_head == cooling_cap) == (cooling_list_tail == cooling_cap)), LOG_TAG_BUFFER,
+                        "Inconsistent cooling list state in CacheBucket::CoolingListIsEmpty()");
+            FatalAssert(((cooling_list_head == cooling_cap) == (cooling_list_size == 0)), LOG_TAG_BUFFER,
+                        "Inconsistent cooling list state in CacheBucket::CoolingListIsEmpty()");
+            FatalAssert((cooling_list_head < cooling_cap) || (cooling_free_list_head < cooling_cap), LOG_TAG_BUFFER,
+                        "Cooling list head and free list head cannot both point to the end of the cooling list in CacheBucket::CoolingListIsEmpty()");
+        );
+        return cooling_list_tail == cooling_cap;
+    }
+
+    bool CoolingListIsFull() {
+        threadSelf->SanityCheckLockHeldInModeByMe(&lock, SX_EXCLUSIVE);
+        SANITY_CHECK(
+            FatalAssert(cooling_list_head <= cooling_cap, LOG_TAG_BUFFER,
+                        "Cooling list head index out of bounds in CacheBucket::CoolingListIsEmpty()");
+            FatalAssert(cooling_list_tail <= cooling_cap, LOG_TAG_BUFFER,
+                        "Cooling list tail index out of bounds in CacheBucket::CoolingListIsEmpty()");
+            FatalAssert(cooling_list_size <= cooling_cap, LOG_TAG_BUFFER,
+                        "Cooling list size cannot be greater than cooling capacity in CacheBucket::CoolingListIsEmpty()");
+            FatalAssert((cooling_free_list_head == cooling_cap) == (cooling_list_size == cooling_cap), LOG_TAG_BUFFER,
+                        "Inconsistent cooling list state in CacheBucket::CoolingListIsFull()");
+            FatalAssert(((cooling_list_head == cooling_cap) == (cooling_list_tail == cooling_cap)), LOG_TAG_BUFFER,
+                        "Inconsistent cooling list state in CacheBucket::CoolingListIsEmpty()");
+            FatalAssert(((cooling_list_head == cooling_cap) == (cooling_list_size == 0)), LOG_TAG_BUFFER,
+                        "Inconsistent cooling list state in CacheBucket::CoolingListIsEmpty()");
+            FatalAssert((cooling_list_head < cooling_cap) || (cooling_free_list_head < cooling_cap), LOG_TAG_BUFFER,
+                        "Cooling list head and free list head cannot both point to the end of the cooling list in CacheBucket::CoolingListIsFull()");
+        );
+        return cooling_free_list_head == cooling_cap;
+    }
+
+    void AddToFreeList(size_t idx) {
+        threadSelf->SanityCheckLockHeldInModeByMe(&lock, SX_EXCLUSIVE);
+        FatalAssert(idx < cooling_cap, LOG_TAG_BUFFER,
+                    "Cooling list node index out of bounds in CacheBucket::AddToFreeList()");
+        cooling_list[idx].entry = nullptr;
+        cooling_list[idx].next = cooling_free_list_head;
+        cooling_list[idx].prev = cooling_cap;
+        cooling_free_list_head = idx;
+    }
+
+    size_t PopCoolingList() {
+        threadSelf->SanityCheckLockHeldInModeByMe(&lock, SX_EXCLUSIVE);
+        if (CoolingListIsEmpty()) {
+            return cooling_cap;
+        }
+
+        size_t idx = cooling_list_head;
+        FatalAssert(cooling_list[idx].entry != nullptr, LOG_TAG_BUFFER,
+                    "Popped cooling entry's entry pointer cannot be null in CacheBucket::PopCoolingList()");
+        FatalAssert(cooling_list[idx].prev == cooling_cap, LOG_TAG_BUFFER,
+                    "Popped cooling entry's prev index must point to the end of the cooling list in CacheBucket::PopCoolingList()");
+        cooling_list_head = cooling_list[idx].next;
+        if (cooling_list_head != cooling_cap) {
+            FatalAssert(cooling_list[cooling_list_head].prev == idx, LOG_TAG_BUFFER,
+                        "Next cooling entry's prev index must point to the current entry in CacheBucket::PopCoolingList()");
+            FatalAssert(cooling_list[cooling_list_head].entry != nullptr, LOG_TAG_BUFFER,
+                        "Next cooling entry's entry pointer cannot be null in CacheBucket::PopCoolingList()");
+            cooling_list[cooling_list_head].prev = cooling_cap;
+        } else {
+            FatalAssert(cooling_list_tail == idx, LOG_TAG_BUFFER,
+                        "Cooling list tail must point to the popped entry when there is only one entry in the cooling list in CacheBucket::PopCoolingList()");
+            cooling_list_tail = cooling_cap;
+        }
+        cooling_list[idx].next = cooling_cap;
+        cooling_list_size--;
+        return idx;
+    }
+
+    size_t GetCoolingListNode() {
+        threadSelf->SanityCheckLockHeldInModeByMe(&lock, SX_EXCLUSIVE);
+        if (!CoolingListIsFull()) {
+            size_t idx = cooling_free_list_head;
+            cooling_free_list_head = cooling_list[idx].next;
+            cooling_list[idx].next = cooling_cap;
+            FatalAssert(cooling_list[idx].entry == nullptr, LOG_TAG_BUFFER,
+                        "New cooling list node must have null entry pointer in CacheBucket::GetCoolingListNode()");
+            FatalAssert(cooling_list[idx].prev == cooling_cap, LOG_TAG_BUFFER,
+                        "New cooling list node must have prev index pointing to the end of the cooling list in CacheBucket::GetCoolingListNode()");
+            return idx;
+        }
+
+        return PopCoolingList();
+    }
+
+    BufferEntry* AddToCoolingList(BufferEntry* entry) {
+        CHECK_NOT_NULLPTR(entry, LOG_TAG_BUFFER);
+        threadSelf->SanityCheckLockHeldInModeByMe(&lock, SX_EXCLUSIVE);
+        threadSelf->SanityCheckLockHeldByMe(&entry->lock);
+        FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_COOLING, LOG_TAG_BUFFER,
+                    "Only entries in COOLING state can be added to cooling list in CacheBucket::AddToCoolingList()");
+        FatalAssert(entry->pin == 0, LOG_TAG_BUFFER,
+                    "Only unpinned entries can be added to cooling list in CacheBucket::AddToCoolingList()");
+        size_t idx = GetCoolingListNode();
+        BufferEntry* evicted_entry = cooling_list[idx].entry;
+        cooling_list[idx].entry = entry;
+        cooling_list[idx].prev = cooling_list_tail;
+        entry->cache_list_idx = idx;
+        if (cooling_list_tail != cooling_cap) {
+            FatalAssert(cooling_list[cooling_list_tail].entry != nullptr, LOG_TAG_BUFFER,
+                        "Current tail entry cannot be null in CacheBucket::AddToCoolingList()");
+            cooling_list[cooling_list_tail].next = idx;
+        } else {
+            FatalAssert(cooling_list_head == cooling_cap, LOG_TAG_BUFFER,
+                        "Cooling list head must point to the end of the cooling list when adding the first entry in CacheBucket::AddToCoolingList()");
+            cooling_list_head = idx;
+        }
+        cooling_list_tail = idx;
+        cooling_list_size++;
+
+        FatalAssert((evicted_entry == nullptr) || ((evicted_entry->state == BufferEntryState::BUFFER_ENTRY_COOLING) &&
+                                                   (evicted_entry->pin == 0)), LOG_TAG_BUFFER,
+                    "Evicted entry must be in EVICTED state in CacheBucket::AddToCoolingList()");
+        return evicted_entry;
+    }
+
+    BufferEntry* EvictFromCoolingList() {
+        threadSelf->SanityCheckLockHeldInModeByMe(&lock, SX_EXCLUSIVE);
+        if (CoolingListIsEmpty()) {
+            return nullptr;
+        }
+
+        size_t idx = PopCoolingList();
+        BufferEntry* evicted_entry = cooling_list[idx].entry;
+        AddToFreeList(idx);
+
+        FatalAssert(evicted_entry != nullptr, LOG_TAG_BUFFER,
+                    "Evicted entry cannot be null in CacheBucket::EvictFromCoolingList()");
+        FatalAssert(evicted_entry->state == BufferEntryState::BUFFER_ENTRY_COOLING, LOG_TAG_BUFFER,
+                    "Evicted entry must be in COOLING state in CacheBucket::EvictFromCoolingList()");
+        FatalAssert(evicted_entry->pin == 0, LOG_TAG_BUFFER,
+                    "Evicted entry must be unpinned in CacheBucket::EvictFromCoolingList()");
+        return evicted_entry;
+    }
+
+    void RemoveFromCoolingList(BufferEntry* entry) {
+        CHECK_NOT_NULLPTR(entry, LOG_TAG_BUFFER);
+        threadSelf->SanityCheckLockHeldInModeByMe(&lock, SX_EXCLUSIVE);
+        threadSelf->SanityCheckLockHeldByMe(&entry->lock);
+        FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_COOLING, LOG_TAG_BUFFER,
+                    "Only entries in COOLING state can be removed from cooling list in CacheBucket::RemoveFromCoolingList()");
+        FatalAssert(entry->pin > 0, LOG_TAG_BUFFER,
+                    "Only pinned entries can be removed from cooling list in CacheBucket::RemoveFromCoolingList()");
+        size_t idx = entry->cache_list_idx;
+        FatalAssert(idx < cooling_cap, LOG_TAG_BUFFER,
+                    "Cooling list index out of bounds in CacheBucket::RemoveFromCoolingList()");
+        FatalAssert(cooling_list[idx].entry == entry, LOG_TAG_BUFFER,
+                    "Entry's cache list index does not point to the entry itself in CacheBucket::RemoveFromCoolingList()");
+        size_t prev_idx = cooling_list[idx].prev;
+        size_t next_idx = cooling_list[idx].next;
+        if (prev_idx != cooling_cap) {
+            FatalAssert(cooling_list[prev_idx].entry != nullptr, LOG_TAG_BUFFER,
+                        "Previous cooling entry cannot be null in CacheBucket::RemoveFromCoolingList()");
+            cooling_list[prev_idx].next = next_idx;
+        } else {
+            FatalAssert(cooling_list_head == idx, LOG_TAG_BUFFER,
+                        "Cooling list head must point to the removed entry when there is only one entry in the cooling list in CacheBucket::RemoveFromCoolingList()");
+            cooling_list_head = next_idx;
+        }
+        if (next_idx != cooling_cap) {
+            FatalAssert(cooling_list[next_idx].entry != nullptr, LOG_TAG_BUFFER,
+                        "Next cooling entry cannot be null in CacheBucket::RemoveFromCoolingList()");
+            cooling_list[next_idx].prev = prev_idx;
+        } else {
+            FatalAssert(cooling_list_tail == idx, LOG_TAG_BUFFER,
+                        "Cooling list tail must point to the removed entry when there is only one entry in the cooling list in CacheBucket::RemoveFromCoolingList()");
+            cooling_list_tail = prev_idx;
+        }
+        AddToFreeList(idx);
+        cooling_list_size--;
+    }
+
+    void FreeAllEntries(LocalMemoryPool& page_pool) {
+        threadSelf->SanityCheckLockHeldInModeByMe(&lock, SX_EXCLUSIVE);
+        for (size_t i = 0; i < hot_list.size(); ++i) {
+            if (hot_list[i].entry != nullptr) {
+                BufferEntry* entry = hot_list[i].entry;
+                FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED, LOG_TAG_BUFFER,
+                            "Hot entry must be in CACHED state in CacheBucket::FreeAllEntries()");
+                FatalAssert(entry->pin == 0, LOG_TAG_BUFFER,
+                            "Hot entry must be unpinned in CacheBucket::FreeAllEntries()");
+                for (size_t p = 0; p < entry->num_pages; ++p) {
+                    page_pool.Free(entry->pages[p]);
+                    entry->pages[p] = nullptr;
+                }
+                entry->num_pages = 0;
+                entry->state = BufferEntryState::BUFFER_ENTRY_EVICTED;
+            }
+            hot_list[i].entry = nullptr;
+        }
+        for (size_t i = 0; i < cooling_cap; ++i) {
+            if (cooling_list[i].entry != nullptr) {
+                BufferEntry* entry = cooling_list[i].entry;
+                FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_COOLING, LOG_TAG_BUFFER,
+                            "Cooling entry must be in COOLING state in CacheBucket::FreeAllEntries()");
+                FatalAssert(entry->pin == 0, LOG_TAG_BUFFER,
+                            "Cooling entry must be unpinned in CacheBucket::FreeAllEntries()");
+                for (size_t p = 0; p < entry->num_pages; ++p) {
+                    page_pool.Free(entry->pages[p]);
+                    entry->pages[p] = nullptr;
+                }
+                entry->num_pages = 0;
+                entry->state = BufferEntryState::BUFFER_ENTRY_EVICTED;
+            }
+            cooling_list[i].entry = nullptr;
+        }
+        cooling_list_head = cooling_cap;
+        cooling_list_tail = cooling_cap;
+        cooling_free_list_head = 0;
+        hot_list_head = 0;
+        hot_list_tail = 0;
+        hot_free_list_head = 0;
+        cooling_list_size = 0;
+        hot_list_size = 0;
+    }
+
+protected:
+    const size_t cooling_cap;
+    std::vector<CacheEntry> hot_list;
+    CacheEntry* cooling_list;
+    size_t cooling_list_head;
+    size_t cooling_list_tail;
+    size_t cooling_free_list_head;
+    size_t hot_list_head;
+    size_t hot_list_tail;
+    size_t hot_free_list_head;
+
+    size_t cooling_list_size;
+    size_t hot_list_size;
+    SXSpinLock lock;
+};
+
 class CacheMetaContainerDetail {
 public:
     CacheMetaContainerDetail(size_t capacity, size_t num_buckets, LocalMemoryPool& pool) :
-        _num_buckets(num_buckets), _bucket_cap(std::max((size_t)1, capacity / num_buckets)),
+        _num_buckets(num_buckets), _bucket_cap(std::max((size_t)2, capacity / num_buckets)),
         _page_pool(pool), _hash(PtrHash<BufferEntry>()),
-        _num_hot_entries(0) {
+        _num_hot_entries(0), _num_cooling_entries(0) {
         FatalAssert(capacity > 0, LOG_TAG_BUFFER,
                     "CacheMetaContainerDetail capacity must be greater than 0");
         FatalAssert(num_buckets > 0, LOG_TAG_BUFFER,
@@ -180,29 +620,22 @@ public:
                     LOG_TAG_BUFFER,
                     "CacheMetaContainerDetail capacity must be at least num_buckets");
 
-        _hot_entries = new std::vector<BufferEntry*>[num_buckets];
-        _cooling_entries = new BufferEntry*[capacity];
-        memset(_cooling_entries, 0, sizeof(BufferEntry*) * capacity);
-        _cooling_bucket_next_idx = new size_t[num_buckets];
-        memset(_cooling_bucket_next_idx, 0, sizeof(size_t) * num_buckets);
-        _locks = new SXSpinLock[num_buckets];
+        buckets.reserve(num_buckets);
+        for (size_t i = 0; i < num_buckets; ++i) {
+            buckets.emplace_back(_bucket_cap);
+        }
     }
 
-    ~CacheMetaContainerDetail() {
-        delete[] _hot_entries;
-        delete[] _cooling_entries;
-        delete[] _cooling_bucket_next_idx;
-        delete[] _locks;
-    }
+    ~CacheMetaContainerDetail() = default;
 
     bool TryLockAndPinEntry(BufferEntry* entry) {
         FatalAssert(entry != nullptr, LOG_TAG_BUFFER,
                     "Cannot pin a null entry in CacheMetaContainerDetail");
         size_t hash_value = _hash(entry);
         size_t bucket_idx = hash_value % _num_buckets;
-        _locks[bucket_idx].Lock(SX_EXCLUSIVE);
+        buckets[bucket_idx].LockBucket();
         if (!entry->lock.TryLock(SX_EXCLUSIVE)) {
-            _locks[bucket_idx].Unlock();
+            buckets[bucket_idx].UnlockBucket();
             return false;
         }
 
@@ -214,45 +647,17 @@ public:
                         entry->state == BufferEntryState::BUFFER_ENTRY_LOADING,
                         LOG_TAG_BUFFER,
                         "Pinned entry must be in CACHED state in CacheMetaContainerDetail::TryLockAndPinEntry()");
-            _locks[bucket_idx].Unlock();
+            buckets[bucket_idx].UnlockBucket();
             return true;
         }
 
         if (entry->state == BufferEntryState::BUFFER_ENTRY_CACHED) {
-            FatalAssert(_hot_entries[bucket_idx].size() > entry->cache_list_idx,
-                        LOG_TAG_BUFFER,
-                        "Pinned entry's cache list index is out of bounds in CacheMetaContainerDetail::TryLockAndPinEntry()");
-            FatalAssert(entry == _hot_entries[bucket_idx][entry->cache_list_idx],
-                        LOG_TAG_BUFFER,
-                        "Pinned entry must be in hot entries list in CacheMetaContainerDetail::TryLockAndPinEntry()");
-            if (entry->cache_list_idx != _hot_entries[bucket_idx].size() - 1) {
-                BufferEntry* last_entry = _hot_entries[bucket_idx].back();
-                _hot_entries[bucket_idx][entry->cache_list_idx] = last_entry;
-                last_entry->cache_list_idx = entry->cache_list_idx;
-            }
-            _hot_entries[bucket_idx].pop_back();
+            buckets[bucket_idx].RemoveFromHotList(entry);
             _num_hot_entries.fetch_sub(1);
         } else if (entry->state == BufferEntryState::BUFFER_ENTRY_COOLING) {
-            size_t idx = entry->cache_list_idx;
-            FatalAssert(_cooling_entries[idx] == entry,
-                        LOG_TAG_BUFFER,
-                        "Pinned entry must be in cooling entries list in CacheMetaContainerDetail::TryLockAndPinEntry()");
-            FatalAssert(idx >= bucket_idx * _bucket_cap &&
-                        idx < (bucket_idx + 1) * _bucket_cap,
-                        LOG_TAG_BUFFER,
-                        "Pinned entry's cache list index is out of bounds in CacheMetaContainerDetail::TryLockAndPinEntry()");
-            size_t last_b_idx = (_cooling_bucket_next_idx[bucket_idx] == 0 ? _bucket_cap - 1 :
-                                                                             _cooling_bucket_next_idx[bucket_idx] - 1);
-            size_t last_idx = bucket_idx * _bucket_cap + last_b_idx;
-            if (idx != last_idx) {
-                BufferEntry* last_entry = _cooling_entries[last_idx];
-                CHECK_NOT_NULLPTR(last_entry, LOG_TAG_BUFFER);
-                _cooling_entries[idx] = last_entry;
-                last_entry->cache_list_idx = idx;
-            }
-            _cooling_entries[last_idx] = nullptr;
+            buckets[bucket_idx].RemoveFromCoolingList(entry);
+            _num_cooling_entries.fetch_sub(1);
             entry->state = BufferEntryState::BUFFER_ENTRY_CACHED;
-            _cooling_bucket_next_idx[bucket_idx] = last_b_idx;
 #ifdef ENABLE_STAT_COLLECTION
             (entry->num_removed_from_cool)++;
 #endif
@@ -261,51 +666,40 @@ public:
                         LOG_TAG_BUFFER,
                         "Pinned entry must be in EVICTED state in CacheMetaContainerDetail::TryLockAndPinEntry()");
         }
-        _locks[bucket_idx].Unlock();
+        buckets[bucket_idx].UnlockBucket();
         return true;
     }
 
     void UnpinEntry(BufferEntry* entry) {
         CHECK_NOT_NULLPTR(entry, LOG_TAG_BUFFER);
+        size_t hash_value = _hash(entry);
+        size_t bucket_idx = hash_value % _num_buckets;
+        buckets[bucket_idx].LockBucket();
+        entry->lock.Lock(SX_EXCLUSIVE);
         FatalAssert(entry->pin > 0, LOG_TAG_BUFFER,
                     "Cannot unpin an entry with pin count 0 in CacheMetaContainerDetail::UnpinEntry()");
         FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED,
                     LOG_TAG_BUFFER,
                     "Unpinned entry must be in CACHED state in CacheMetaContainerDetail::UnpinEntry()");
-        size_t hash_value = _hash(entry);
-        size_t bucket_idx = hash_value % _num_buckets;
-        _locks[bucket_idx].Lock(SX_EXCLUSIVE);
-        entry->lock.Lock(SX_EXCLUSIVE);
         --(entry->pin);
         if (entry->pin == 0) {
-            _hot_entries[bucket_idx].push_back(entry);
-            entry->cache_list_idx = _hot_entries[bucket_idx].size() - 1;
+            buckets[bucket_idx].AddToHotList(entry);
             _num_hot_entries.fetch_add(1);
         }
         entry->lock.Unlock();
-        _locks[bucket_idx].Unlock();
+        buckets[bucket_idx].UnlockBucket();
     }
 
-    size_t TryMoveToCooling(uint64_t num_pages, void** freed_pages, size_t max_pages_needed, size_t& bytes_freed,
-                            size_t& pages_freed, size_t page_size) {
+    void PopulateCoolingList(size_t num_pages) {
         FatalAssert(num_pages > 0, LOG_TAG_BUFFER,
-                    "num_pages must be greater than 0 in CacheMetaContainerDetail::TryMoveToCooling()");
-        // FatalAssert(num_pages <= ((_num_buckets * _bucket_cap) / 2), LOG_TAG_BUFFER,
-        //             "num_pages exceeds total capacity in CacheMetaContainerDetail::TryMoveToCooling()");
-        CHECK_NOT_NULLPTR(freed_pages, LOG_TAG_BUFFER);
-        // FatalAssert(max_pages_needed > 0, LOG_TAG_BUFFER,
-        //             "max_pages_needed must be greater than 0 in CacheMetaContainerDetail::TryMoveToCooling()");
-
-        /* to avoid trying to cool too many entries at once and failing to acquire locks */
+                    "num_pages must be greater than 0 in CacheMetaContainerDetail::PopulateCoolingList()");
         num_pages = std::min(num_pages, (_num_buckets * _bucket_cap) / 4);
         FatalAssert(num_pages > 0, LOG_TAG_BUFFER,
-                    "num_pages must be greater than 0 after adjustment in CacheMetaContainerDetail::TryMoveToCooling()");
+                    "num_pages must be greater than 0 in CacheMetaContainerDetail::PopulateCoolingList()");
 
-        /* todo: check stats */
-        size_t num_cooling = 0;
-        size_t num_freed = 0;
+        size_t num_cooled = 0;
         size_t real_num_pages = num_pages;
-        while (num_cooling < real_num_pages) {
+        while (num_cooled < real_num_pages) {
             size_t num_hot = _num_hot_entries.load(std::memory_order_acquire);
             if (num_hot == 0) { /* if less than some amount */
                 break;
@@ -318,84 +712,146 @@ public:
             }
 
             size_t bucket_idx = threadSelf->UniformRange64(0, _num_buckets - 1);
-            if (!_locks[bucket_idx].TryLock(SX_EXCLUSIVE)) {
+            if (!buckets[bucket_idx].TryLockBucket()) {
+                DIVFTREE_YIELD();
                 continue;
             }
 
-            if (max_pages_needed == 0) {
-                /* we are only trying to populate the cooling list */
-                size_t idx = _cooling_bucket_next_idx[bucket_idx] + _bucket_cap * bucket_idx;
-                if (_cooling_entries[idx] != nullptr) {
-                    /* this bucket is full so we do not need to populate */
-                    _locks[bucket_idx].Unlock();
+            if (buckets[bucket_idx].CoolingListIsFull()) {
+                buckets[bucket_idx].UnlockBucket();
+                size_t num_cooling = _num_cooling_entries.load(std::memory_order_acquire);
+                if (num_cooling * 10 > (_bucket_cap * _num_buckets) * 9) {
+                    break;
+                } else {
+                    DIVFTREE_YIELD();
+                    continue;
+                }
+            }
+
+            if (buckets[bucket_idx].GetHotListSize() == 0) {
+                buckets[bucket_idx].UnlockBucket();
+                num_hot = _num_hot_entries.load(std::memory_order_acquire);
+                if (num_hot < _num_buckets) {
                     break;
                 }
-            }
-
-            if (_hot_entries[bucket_idx].empty()) {
-                _locks[bucket_idx].Unlock();
+                DIVFTREE_YIELD();
                 continue;
             }
 
-            size_t hot_idx = threadSelf->UniformRange64(0, _hot_entries[bucket_idx].size() - 1);
-            BufferEntry* entry = _hot_entries[bucket_idx][hot_idx];
-            if (hot_idx != _hot_entries[bucket_idx].size() - 1) {
-                BufferEntry* last_entry = _hot_entries[bucket_idx].back();
-                _hot_entries[bucket_idx][hot_idx] = last_entry;
-                last_entry->cache_list_idx = hot_idx;
-            }
-            _hot_entries[bucket_idx].pop_back();
-            _num_hot_entries.fetch_sub(1);
+            BufferEntry* entry = buckets[bucket_idx].PopFromHotList();
             FatalAssert(entry != nullptr, LOG_TAG_BUFFER,
-                        "Hot entry is null in CacheMetaContainerDetail::TryMoveToCooling()");
+                        "Popped hot entry cannot be null in CacheMetaContainerDetail::PopulateCoolingList()");
+            entry->lock.Lock(SX_EXCLUSIVE);
             FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED,
                         LOG_TAG_BUFFER,
-                        "Hot entry is not in CACHED state in CacheMetaContainerDetail::TryMoveToCooling()");
+                        "Popped hot entry must be in CACHED state in CacheMetaContainerDetail::PopulateCoolingList()");
             FatalAssert(entry->pin == 0,
                         LOG_TAG_BUFFER,
-                        "Hot entry is pinned in CacheMetaContainerDetail::TryMoveToCooling()");
-            entry->lock.Lock(SX_EXCLUSIVE);
+                        "Popped hot entry must be unpinned in CacheMetaContainerDetail::PopulateCoolingList()");
 
-            // move to cooling list
             entry->state = BufferEntryState::BUFFER_ENTRY_COOLING;
-            size_t idx = _cooling_bucket_next_idx[bucket_idx] + _bucket_cap * bucket_idx;
-            if (_cooling_entries[idx] != nullptr) {
-                FatalAssert(_cooling_entries[idx]->state == BufferEntryState::BUFFER_ENTRY_COOLING,
+            BufferEntry* evicted = buckets[bucket_idx].AddToCoolingList(entry);
+            entry->lock.Unlock();
+            _num_hot_entries.fetch_sub(1);
+            _num_cooling_entries.fetch_add(1);
+            UNUSED_VARIABLE(evicted);
+            FatalAssert(evicted == nullptr, LOG_TAG_BUFFER,
+                        "No entry should be evicted when populating cooling list in CacheMetaContainerDetail::PopulateCoolingList()");
+#ifdef ENABLE_STAT_COLLECTION
+            (entry->num_moved_to_cool)++;
+#endif
+            num_cooled++;
+            buckets[bucket_idx].UnlockBucket();
+            num_hot = _num_hot_entries.load(std::memory_order_acquire);
+        }
+    }
+
+    size_t TriggerEviction(uint64_t num_pages_needed, void** freed_pages, size_t& bytes_freed,
+                           size_t& pages_freed, size_t page_size) {
+        FatalAssert(num_pages_needed > 0, LOG_TAG_BUFFER,
+                    "num_pages_needed must be greater than 0 in CacheMetaContainerDetail::TriggerEviction()");
+        CHECK_NOT_NULLPTR(freed_pages, LOG_TAG_BUFFER);
+
+
+        size_t num_freed = 0;
+        while (num_freed < num_pages_needed) {
+            size_t bucket_idx = threadSelf->UniformRange64(0, _num_buckets - 1);
+            if (!buckets[bucket_idx].TryLockBucket()) {
+                DIVFTREE_YIELD();
+                continue;
+            }
+
+            size_t num_hot = _num_hot_entries.load(std::memory_order_acquire);
+            BufferEntry* evicted_entry = nullptr;
+            if ((num_hot < _num_buckets) && (buckets[bucket_idx].GetHotListSize() == 0)) {
+                if (_num_cooling_entries.load(std::memory_order_acquire) == 0) {
+                    DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_BUFFER,
+                            "No hot entries and no cooling entries available during eviction in CacheMetaContainerDetail::TriggerEviction()");
+                    buckets[bucket_idx].UnlockBucket();
+                    break;
+                }
+
+                if (buckets[bucket_idx].CoolingListIsEmpty()) {
+                    buckets[bucket_idx].UnlockBucket();
+                    DIVFTREE_YIELD();
+                    continue;
+                }
+
+                evicted_entry = buckets[bucket_idx].EvictFromCoolingList();
+                FatalAssert(evicted_entry != nullptr, LOG_TAG_BUFFER,
+                            "Evicted entry cannot be null in CacheMetaContainerDetail::TriggerEviction()");
+                _num_cooling_entries.fetch_sub(1);
+            } else {
+                if (buckets[bucket_idx].GetHotListSize() == 0) {
+                    buckets[bucket_idx].UnlockBucket();
+                    DIVFTREE_YIELD();
+                    continue;
+                }
+
+                BufferEntry* entry = buckets[bucket_idx].PopFromHotList();
+                FatalAssert(entry != nullptr, LOG_TAG_BUFFER,
+                            "Popped hot entry cannot be null in CacheMetaContainerDetail::TriggerEviction()");
+                entry->lock.Lock(SX_EXCLUSIVE);
+                FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED,
                             LOG_TAG_BUFFER,
-                            "Cooling entry slot is occupied by a non-cooling entry in CacheMetaContainerDetail::TryMoveToCooling()");
-                FatalAssert(_cooling_entries[idx]->pin == 0,
+                            "Popped hot entry must be in CACHED state in CacheMetaContainerDetail::TriggerEviction()");
+                FatalAssert(entry->pin == 0,
                             LOG_TAG_BUFFER,
-                            "Cooling entry slot is occupied by a pinned entry in CacheMetaContainerDetail::TryMoveToCooling()");
-                _cooling_entries[idx]->state = BufferEntryState::BUFFER_ENTRY_EVICTED;
+                            "Popped hot entry must be unpinned in CacheMetaContainerDetail::TriggerEviction()");
+
+                entry->state = BufferEntryState::BUFFER_ENTRY_COOLING;
 #ifdef ENABLE_STAT_COLLECTION
                 (entry->num_moved_to_cool)++;
-                (_cooling_entries[idx]->num_evicted)++;
 #endif
-                if (num_freed < max_pages_needed) {
-                    size_t num_needed = std::min(_cooling_entries[idx]->num_pages, max_pages_needed - num_freed);
-                    for (size_t p = 0; p < num_needed; ++p) {
-                        freed_pages[num_freed++] = _cooling_entries[idx]->pages[p];
-                    }
-                    if (num_needed < _cooling_entries[idx]->num_pages) {
-                        size_t pf = _cooling_entries[idx]->num_pages - num_needed;
-                        _page_pool.BatchFree(_cooling_entries[idx]->pages + num_needed, pf);
-                        pages_freed += pf;
-                        bytes_freed += _cooling_entries[idx]->total_size_bytes - (num_needed * page_size);
-                    }
-                } else {
-                    _page_pool.BatchFree(_cooling_entries[idx]->pages, _cooling_entries[idx]->num_pages);
-                    pages_freed += _cooling_entries[idx]->num_pages;
-                    bytes_freed += _cooling_entries[idx]->total_size_bytes;
+                evicted_entry = buckets[bucket_idx].AddToCoolingList(entry);
+                entry->lock.Unlock();
+                _num_hot_entries.fetch_sub(1);
+                if (evicted_entry == nullptr) {
+                    _num_cooling_entries.fetch_add(1);
                 }
             }
 
-            _cooling_entries[idx] = entry;
-            entry->cache_list_idx = idx;
-            _cooling_bucket_next_idx[bucket_idx] = (_cooling_bucket_next_idx[bucket_idx] + 1) % _bucket_cap;
-
-            num_cooling += entry->num_pages;
-            entry->lock.Unlock();
-            _locks[bucket_idx].Unlock();
+            if (evicted_entry != nullptr) {
+                evicted_entry->lock.Lock(SX_EXCLUSIVE);
+                buckets[bucket_idx].UnlockBucket();
+                size_t num_needed = std::min(evicted_entry->num_pages, num_pages_needed - num_freed);
+                for (size_t p = 0; p < num_needed; ++p) {
+                    freed_pages[num_freed++] = evicted_entry->pages[p];
+                }
+                if (num_needed < evicted_entry->num_pages) {
+                    size_t pf = evicted_entry->num_pages - num_needed;
+                    _page_pool.BatchFree(evicted_entry->pages + num_needed, pf);
+                    pages_freed += pf;
+                    bytes_freed += evicted_entry->total_size_bytes - (num_needed * page_size);
+                }
+                evicted_entry->state = BufferEntryState::BUFFER_ENTRY_EVICTED;
+#ifdef ENABLE_STAT_COLLECTION
+                (evicted_entry->num_evicted)++;
+#endif
+                evicted_entry->lock.Unlock();
+            } else {
+                buckets[bucket_idx].UnlockBucket();
+            }
         }
 
         return num_freed;
@@ -403,32 +859,9 @@ public:
 
     inline void FreeAll() {
         for (size_t i = 0; i < _num_buckets; ++i) {
-            _locks[i].Lock(SX_EXCLUSIVE);
-            for (BufferEntry* entry : _hot_entries[i]) {
-                FatalAssert(entry->state == BufferEntryState::BUFFER_ENTRY_CACHED,
-                            LOG_TAG_BUFFER,
-                            "Hot entry must be in CACHED state in CacheMetaContainerDetail::FreeAll()");
-                FatalAssert(entry->pin == 0,
-                            LOG_TAG_BUFFER,
-                            "Hot entry must be unpinned in CacheMetaContainerDetail::FreeAll()");
-                entry->state = BufferEntryState::BUFFER_ENTRY_EVICTED;
-                _page_pool.BatchFree(entry->pages, entry->num_pages);
-            }
-            _hot_entries[i].clear();
-            _locks[i].Unlock();
-        }
-        for (size_t i = 0; i < _num_buckets * _bucket_cap; ++i) {
-            if (_cooling_entries[i] != nullptr) {
-                FatalAssert(_cooling_entries[i]->state == BufferEntryState::BUFFER_ENTRY_COOLING,
-                            LOG_TAG_BUFFER,
-                            "Cooling entry must be in COOLING state in CacheMetaContainerDetail::FreeAll()");
-                FatalAssert(_cooling_entries[i]->pin == 0,
-                            LOG_TAG_BUFFER,
-                            "Cooling entry must be unpinned in CacheMetaContainerDetail::FreeAll()");
-                _cooling_entries[i]->state = BufferEntryState::BUFFER_ENTRY_EVICTED;
-                _page_pool.BatchFree(_cooling_entries[i]->pages, _cooling_entries[i]->num_pages);
-                _cooling_entries[i] = nullptr;
-            }
+            buckets[i].LockBucket();
+            buckets[i].FreeAllEntries(_page_pool);
+            buckets[i].UnlockBucket();
         }
     }
 
@@ -439,10 +872,8 @@ protected:
     PtrHash<BufferEntry> _hash;
 
     std::atomic<size_t> _num_hot_entries;
-    std::vector<BufferEntry*>* _hot_entries;
-    BufferEntry** _cooling_entries;
-    size_t* _cooling_bucket_next_idx;
-    SXSpinLock* _locks;
+    std::atomic<size_t> _num_cooling_entries;
+    std::vector<CacheBucket> buckets;
 };
 
 class CacheMetaContainer {
@@ -494,16 +925,26 @@ public:
         return _internal_meta_container->UnpinEntry(entry);
     }
 
-    size_t TryMoveToCooling(uint64_t num_pages, void** freed_pages, size_t max_pages_needed, size_t& bytes_freed,
-                            size_t& pages_freed, bool is_leaf) {
+    void PopulateCoolingList(size_t num_pages, bool is_leaf) {
         CHECK_NOT_NULLPTR(_leaf_meta_container, LOG_TAG_BUFFER);
         if (is_leaf) {
-            return _leaf_meta_container->TryMoveToCooling(num_pages, freed_pages, max_pages_needed,
-                                                          bytes_freed, pages_freed, _leaf_page_size);
+            _leaf_meta_container->PopulateCoolingList(num_pages);
+            return;
         }
         CHECK_NOT_NULLPTR(_internal_meta_container, LOG_TAG_BUFFER);
-        return _internal_meta_container->TryMoveToCooling(num_pages, freed_pages, max_pages_needed,
-                                                          bytes_freed, pages_freed, _internal_page_size);
+        _internal_meta_container->PopulateCoolingList(num_pages);
+    }
+
+    size_t TriggerEviction(uint64_t num_pages_needed, void** freed_pages, size_t& bytes_freed,
+                           size_t& pages_freed, bool is_leaf) {
+        CHECK_NOT_NULLPTR(_leaf_meta_container, LOG_TAG_BUFFER);
+        if (is_leaf) {
+            return _leaf_meta_container->TriggerEviction(num_pages_needed, freed_pages, bytes_freed,
+                                                         pages_freed, _leaf_page_size);
+        }
+        CHECK_NOT_NULLPTR(_internal_meta_container, LOG_TAG_BUFFER);
+        return _internal_meta_container->TriggerEviction(num_pages_needed, freed_pages, bytes_freed,
+                                                         pages_freed, _internal_page_size);
     }
 
     inline void FreeAll() {
@@ -902,7 +1343,7 @@ protected:
                     "Initializing BufferMgr with IVF_FLAT index. page_size: %zu, pool_size: %zu",
                     page_size, pool_size);
             _cache = new LocalMemoryPool(page_size, page_size, pool_size);
-            _cache_meta_container = new CacheMetaContainer(pool_size, page_size, 2 * num_user_threads, *_cache);
+            _cache_meta_container = new CacheMetaContainer(pool_size, page_size, 4 * num_user_threads, *_cache);
             DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
                     "BufferMgr initialized with IVF_FLAT index. page_size: %zu, pool_size: %zu",
                     page_size, pool_size);
@@ -1114,27 +1555,29 @@ protected:
         }
         _memory_stats_lock.Lock(SX_EXCLUSIVE);
 #endif
+        if (num_pages_to_load > 0) {
+            _cache_meta_container->PopulateCoolingList(num_pages_to_load, is_leaf);
+        }
 
         while (num_allocated < num_pages_to_load) {
-            ++num_tries;
             size_t num_to_alloc = num_pages_to_load - num_allocated;
             size_t current_allocated =
-                _cache_meta_container->TryMoveToCooling(num_to_alloc, local_buffers + num_allocated,
-                                                        (num_tries == 1 ? 0 : num_to_alloc), bytes_freed_from_cool, num_pages_freed, is_leaf);
+                    _cache->BatchAllocate(slotType, local_buffers + num_allocated, num_to_alloc,
+                                          AllocationFlags{.clear = 0, .non_blocking = 1, .atomic = 0, .unused = 0});
+            num_from_pool += current_allocated;
             num_allocated += current_allocated;
-            num_from_cool += current_allocated;
             if (num_allocated < num_pages_to_load) {
                 num_to_alloc = num_pages_to_load - num_allocated;
                 current_allocated =
-                    _cache->BatchAllocate(slotType, local_buffers + num_allocated, num_to_alloc,
-                                          AllocationFlags{.clear = 0, .non_blocking = 1, .atomic = 0, .unused = 0});
-                num_from_pool += current_allocated;
+                    _cache_meta_container->TriggerEviction(num_to_alloc, local_buffers + num_allocated, bytes_freed_from_cool, num_pages_freed, is_leaf);
                 num_allocated += current_allocated;
+                num_from_cool += current_allocated;
             }
 
-            if ((num_tries > 1) && (num_allocated < num_pages_to_load)) {
+            if ((num_tries > 0) && (num_allocated < num_pages_to_load)) {
                 usleep(1);
             }
+            ++num_tries;
         }
         threadSelf->UpdateMemoryStats(num_from_cool, num_from_pool, num_tries);
 

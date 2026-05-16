@@ -98,6 +98,13 @@ void ParseConfigs(divftree::NodeID self_id) {
     auto vit = var_configs.find("log-path");
     if (vit != var_configs.end()) {
         strncpy(::divftree::debug::output_log_path, vit->second.c_str(), 255);
+        if (std::filesystem::exists(::divftree::debug::output_log_path)) {
+            if (!std::filesystem::is_directory(::divftree::debug::output_log_path)) {
+                throw std::runtime_error("Log path exists but is not a directory!");
+            }
+        } else {
+            std::filesystem::create_directories(::divftree::debug::output_log_path);
+        }
         char file_name[512] = "";
         strcat(file_name, ::divftree::debug::output_log_path);
         strcat(file_name, (self_id.ToString() + ::divftree::String(".log")).ToCStr());
