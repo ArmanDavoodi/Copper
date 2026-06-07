@@ -7,11 +7,11 @@
 # Configurable build options
 # ================================
 
-ENABLE_GDB       ?= 0# Enables -g3
-ENABLE_ASAN      ?= 0# Enables AddressSanitizer
-ENABLE_DEBUGINFO ?= 0# Enables -rdynamic, -fno-omit-frame-pointer and debug-friendly flags
+ENABLE_GDB       ?= 1# Enables -g3
+ENABLE_ASAN      ?= 1# Enables AddressSanitizer
+ENABLE_DEBUGINFO ?= 1# Enables -rdynamic, -fno-omit-frame-pointer and debug-friendly flags
 ENABLE_GPROF     ?= 0# Enables -pg # does not work will with many threads
-ENABLE_OPT       ?= 1# Enables optimization (-O3 vs -O0)
+ENABLE_OPT       ?= 0# Enables optimization (-O3 vs -O0)
 
 # ================================
 # Common

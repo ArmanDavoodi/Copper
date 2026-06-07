@@ -7,23 +7,23 @@ cd $ROOT
 VAR_INPUT_FILE=$ROOT/bench/datasets/bigann/unique_identified/BIGANN1B.u8bin
 VAR_OUTPUT_FILE_DIR=$ROOT/bench/datasets/bigann/index/ctypeu8/capped
 VAR_OUTPUT_FILE_NAME_LIST=(
-    bigann1B_1024C_MAX256_MI24
-    bigann1B_2048C_MAX256_MI24
-    bigann1B_4096C_MAX256_MI24
-    bigann1B_8192C_MAX256_MI24
-    bigann1B_16384C_MAX256_MI24
-    bigann1B_32768C_MAX256_MI24
-    bigann1B_65536C_MAX256_MI24
+    # bigann1B_1024C_MAX512_MI24
+    # bigann1B_2048C_MAX512_MI24
+    bigann1B_4096C_MAX512_MI24
+    bigann1B_8192C_MAX512_MI24
+    bigann1B_16384C_MAX512_MI24
+    # bigann1B_32768C_MAX512_MI24
+    # bigann1B_65536C_MAX512_MI24
 )
 
 VAR_CLUSTER_CAP_LISTS=(
-    1024
-    2048
+    # 1024
+    # 2048
     4096
     8192
     16384
-    32768
-    65536
+    # 32768
+    # 65536
 )
 
 VAR_NUM_COMMANDS=${#VAR_OUTPUT_FILE_NAME_LIST[@]}
@@ -35,7 +35,7 @@ for ((i=0; i<$VAR_NUM_COMMANDS; i++)); do
     echo ============================================================================================================================================================================================================================================================================================================ >> $ROOT/a2_clustering_capped.log
     echo "building ivf-capped with cluster_cap=$VAR_CLUSTER_CAP, output_file=$VAR_OUTPUT_FILE_NAME"
     echo "building ivf-capped with cluster_cap=$VAR_CLUSTER_CAP, output_file=$VAR_OUTPUT_FILE_NAME" >> $ROOT/a2_clustering_capped.log
-    ./bench/datasets/bin/clustering $VAR_INPUT_FILE $VAR_OUTPUT_FILE_DIR/$VAR_OUTPUT_FILE_NAME 120 0 24 kmeans_capped $VAR_CLUSTER_CAP max 256 >> $ROOT/a2_clustering_capped.log 2>&1
+    ./bench/datasets/bin/clustering $VAR_INPUT_FILE $VAR_OUTPUT_FILE_DIR/$VAR_OUTPUT_FILE_NAME 100 0 24 kmeans_capped $VAR_CLUSTER_CAP max 512 >> $ROOT/a2_clustering_capped.log 2>&1
     echo "done building ivf-capped with cluster_cap=$VAR_CLUSTER_CAP, output_file=$VAR_OUTPUT_FILE_NAME"
     echo "done building ivf-capped with cluster_cap=$VAR_CLUSTER_CAP, output_file=$VAR_OUTPUT_FILE_NAME" >> $ROOT/a2_clustering_capped.log
     echo ============================================================================================================================================================================================================================================================================================================ >> $ROOT/a2_clustering_capped.log

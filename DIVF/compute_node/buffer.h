@@ -4,7 +4,7 @@
 #include "common.h"
 #include "debug.h"
 
-#include "utils/memory_pool.h"
+#include "utils/static_memory_pool.h"
 #include "utils/rdma_manager.h"
 #include "utils/concurrent_datastructures.h"
 
@@ -18,6 +18,11 @@ struct IndexMeta {
 
     uint32_t leaf_size_cap;
     uint32_t internal_size_cap;
+    uint32_t leaf_nprobe;
+    uint32_t internal_nprobe;
+
+    uint32_t num_internal_clusters;
+    uint32_t num_leaf_clusters;
 };
 
 enum class BufferEntryState : uint8_t {
@@ -555,10 +560,7 @@ public:
                             "Hot entry must be in CACHED state in CacheBucket::FreeAllEntries()");
                 FatalAssert(entry->pin == 0, LOG_TAG_BUFFER,
                             "Hot entry must be unpinned in CacheBucket::FreeAllEntries()");
-                for (size_t p = 0; p < entry->num_pages; ++p) {
-                    page_pool.Free(entry->pages[p]);
-                    entry->pages[p] = nullptr;
-                }
+                page_pool.BatchFree(entry->pages, entry->num_pages);
                 entry->num_pages = 0;
                 entry->state = BufferEntryState::BUFFER_ENTRY_EVICTED;
             }
@@ -571,10 +573,7 @@ public:
                             "Cooling entry must be in COOLING state in CacheBucket::FreeAllEntries()");
                 FatalAssert(entry->pin == 0, LOG_TAG_BUFFER,
                             "Cooling entry must be unpinned in CacheBucket::FreeAllEntries()");
-                for (size_t p = 0; p < entry->num_pages; ++p) {
-                    page_pool.Free(entry->pages[p]);
-                    entry->pages[p] = nullptr;
-                }
+                page_pool.BatchFree(entry->pages, entry->num_pages);
                 entry->num_pages = 0;
                 entry->state = BufferEntryState::BUFFER_ENTRY_EVICTED;
             }
@@ -607,19 +606,38 @@ protected:
 };
 
 class CacheMetaContainerDetail {
+    static constexpr double COOLING_SIZE_RATIO = 0.2;
+    static constexpr double COOLING_SIZE_RATIO_MAX = 0.5; /* half of pages can be cooling */
+    /* 
+    
+        cap * ratio / num_buckets >= 2 -> good
+        else:
+        cap * MAX_RATIO / num_buckets >= 2 -> find the lowest ratio that satisfies the condition
+        else:
+        num_buckets = cap*max / 2
+    
+    */
+
 public:
-    CacheMetaContainerDetail(size_t capacity, size_t num_buckets, LocalMemoryPool& pool) :
-        _num_buckets(num_buckets), _bucket_cap(std::max((size_t)2, capacity / num_buckets)),
+    CacheMetaContainerDetail(size_t capacity, size_t num_buckets, LocalMemoryPool& pool, bool is_leaf) :
+        _num_buckets(
+            ((COOLING_SIZE_RATIO_MAX * (double)capacity) / num_buckets >= 2.0) ?
+             num_buckets :
+             std::max((size_t)1, (size_t)((COOLING_SIZE_RATIO_MAX * (double)capacity) / 2))),
+        _bucket_cap(std::max((size_t)2, (size_t)((double)capacity * COOLING_SIZE_RATIO / num_buckets))),
         _page_pool(pool), _hash(PtrHash<BufferEntry>()),
         _num_hot_entries(0), _num_cooling_entries(0) {
         FatalAssert(capacity > 0, LOG_TAG_BUFFER,
                     "CacheMetaContainerDetail capacity must be greater than 0");
         FatalAssert(num_buckets > 0, LOG_TAG_BUFFER,
                     "CacheMetaContainerDetail num_buckets must be greater than 0");
-        FatalAssert(capacity >= num_buckets,
-                    LOG_TAG_BUFFER,
-                    "CacheMetaContainerDetail capacity must be at least num_buckets");
-
+        
+        DIVFLOG_IF_TRUE(num_buckets < _num_buckets, LOG_LEVEL_WARNING, LOG_TAG_BUFFER,
+                        "Having too few buckets may cause contention in CacheMetaContainerDetail: input cap = %lu, input num_buckets = %lu, actual num_buckets = %lu, bucket_cap = %lu, is_leaf = %s",
+                        capacity, num_buckets, _num_buckets, _bucket_cap, is_leaf ? "true" : "false");
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
+               "CacheMetaContainerDetail initialized with expected capacity = %lu, num_buckets = %lu, bucket_cap = %lu, is_leaf = %s",
+               capacity, _num_buckets, _bucket_cap, is_leaf ? "true" : "false");
         buckets.reserve(num_buckets);
         for (size_t i = 0; i < num_buckets; ++i) {
             buckets.emplace_back(_bucket_cap);
@@ -693,22 +711,20 @@ public:
     void PopulateCoolingList(size_t num_pages) {
         FatalAssert(num_pages > 0, LOG_TAG_BUFFER,
                     "num_pages must be greater than 0 in CacheMetaContainerDetail::PopulateCoolingList()");
-        num_pages = std::min(num_pages, (_num_buckets * _bucket_cap) / 4);
+        num_pages = std::min(num_pages, _num_buckets / 4);
         FatalAssert(num_pages > 0, LOG_TAG_BUFFER,
                     "num_pages must be greater than 0 in CacheMetaContainerDetail::PopulateCoolingList()");
 
         size_t num_cooled = 0;
-        size_t real_num_pages = num_pages;
-        while (num_cooled < real_num_pages) {
-            size_t num_hot = _num_hot_entries.load(std::memory_order_acquire);
-            if (num_hot == 0) { /* if less than some amount */
-                break;
+        while (num_cooled < num_pages) {
+            size_t num_cooling = _num_cooling_entries.load(std::memory_order_acquire);
+            if (num_cooling * 10 > (_bucket_cap * _num_buckets) * 9) {
+                return;
             }
 
-            if (num_hot < real_num_pages) {
-                real_num_pages = num_hot;
-            } else if (num_hot > real_num_pages && real_num_pages < num_pages) {
-                real_num_pages = std::min(num_hot, num_pages);
+            size_t num_hot = _num_hot_entries.load(std::memory_order_acquire);
+            if (num_hot < _num_buckets) { /* if less than some amount */
+                break;
             }
 
             size_t bucket_idx = threadSelf->UniformRange64(0, _num_buckets - 1);
@@ -719,21 +735,13 @@ public:
 
             if (buckets[bucket_idx].CoolingListIsFull()) {
                 buckets[bucket_idx].UnlockBucket();
-                size_t num_cooling = _num_cooling_entries.load(std::memory_order_acquire);
-                if (num_cooling * 10 > (_bucket_cap * _num_buckets) * 9) {
-                    break;
-                } else {
-                    DIVFTREE_YIELD();
-                    continue;
-                }
+                DIVFTREE_YIELD();
+                ++num_cooled; /* increment to make sure we don't get stuck */
+                continue;
             }
 
             if (buckets[bucket_idx].GetHotListSize() == 0) {
                 buckets[bucket_idx].UnlockBucket();
-                num_hot = _num_hot_entries.load(std::memory_order_acquire);
-                if (num_hot < _num_buckets) {
-                    break;
-                }
                 DIVFTREE_YIELD();
                 continue;
             }
@@ -878,24 +886,22 @@ protected:
 
 class CacheMetaContainer {
 public:
-    static constexpr double COOLING_SIZE_RATIO = 0.2;
-
     CacheMetaContainer(size_t pool_bytes, size_t page_bytes, size_t num_buckets, LocalMemoryPool& pool) :
         _leaf_page_size(page_bytes),
         _internal_page_size(0),
         _leaf_meta_container(new CacheMetaContainerDetail(
-            std::max((size_t)((pool_bytes / page_bytes) * COOLING_SIZE_RATIO), 1lu),
-            num_buckets, pool)), _internal_meta_container(nullptr) {}
+            std::max((size_t)((pool_bytes / page_bytes)), 1lu),
+            num_buckets, pool, true)), _internal_meta_container(nullptr) {}
 
-    CacheMetaContainer(size_t pool_bytes, size_t leaf_bytes, size_t internal_bytes, uint32_t leaf_cap,
+    CacheMetaContainer(size_t leaf_bytes, size_t internal_bytes, size_t leaf_pool, size_t internal_pool,
                        size_t num_buckets, LocalMemoryPool& pool) :
         _leaf_page_size(leaf_bytes), _internal_page_size(internal_bytes),
         _leaf_meta_container(new CacheMetaContainerDetail(
-            std::max((size_t)((pool_bytes / leaf_bytes) * COOLING_SIZE_RATIO), 1lu),
-            num_buckets, pool)),
+            std::max((size_t)((leaf_pool / leaf_bytes)), 1lu),
+            num_buckets, pool, true)),
         _internal_meta_container(new CacheMetaContainerDetail(
-            std::max((size_t)((pool_bytes / (internal_bytes * leaf_cap)) * COOLING_SIZE_RATIO), num_buckets),
-            num_buckets, pool)) {}
+            std::max((size_t)((internal_pool / internal_bytes)), 1lu),
+            num_buckets, pool, false)) {}
 
     ~CacheMetaContainer() {
         CHECK_NOT_NULLPTR(_leaf_meta_container, LOG_TAG_BUFFER);
@@ -1342,7 +1348,7 @@ protected:
             DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
                     "Initializing BufferMgr with IVF_FLAT index. page_size: %zu, pool_size: %zu",
                     page_size, pool_size);
-            _cache = new LocalMemoryPool(page_size, page_size, pool_size);
+            _cache = new LocalMemoryPool(0, page_size, pool_size, 0);
             _cache_meta_container = new CacheMetaContainer(pool_size, page_size, 4 * num_user_threads, *_cache);
             DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
                     "BufferMgr initialized with IVF_FLAT index. page_size: %zu, pool_size: %zu",
@@ -1357,9 +1363,9 @@ protected:
             DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
                     "Initializing BufferMgr with IVF_CAPPED index. leaf_page_size: %zu, pool_size: %zu",
                     leaf_page_size, pool_size);
-            _cache = new LocalMemoryPool(leaf_page_size, leaf_page_size, pool_size);
+            _cache = new LocalMemoryPool(0, leaf_page_size, pool_size, 0);
             _cache_meta_container = new CacheMetaContainer(pool_size, leaf_page_size,
-                                                           2 * num_user_threads, *_cache);
+                                                           4 * num_user_threads, *_cache);
             DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
                     "BufferMgr initialized with IVF_CAPPED index. page_size: %zu, pool_size: %zu",
                     leaf_page_size, pool_size);
@@ -1377,12 +1383,56 @@ protected:
                         "pool_size must be greater than the sum of leaf_page_size and internal_page_size for IVF_TREE index in BufferMgr constructor");
             pool_size = ALIGNED_SIZE(pool_size, std::lcm(leaf_page_size + CACHE_LINE_SIZE,
                                                          internal_page_size + CACHE_LINE_SIZE));
+
+            const size_t num_internal_levels = index_meta.num_levels - 1;
+            const size_t internal_demand = num_internal_levels * index_meta.internal_nprobe * internal_page_size;
+            const size_t leaf_demand = index_meta.leaf_nprobe * leaf_page_size;
+            constexpr double internal_cache_miss = 0.3;
+            constexpr double leaf_cache_miss = 0.9;
+            const double num_active_threads = std::max((double)1.0, (double)num_user_threads * 0.5); // assume at least 50% of threads are active at any time
+            const size_t leaf_effective_demand = std::max((size_t)leaf_demand, (size_t)(leaf_demand * leaf_cache_miss * num_active_threads));
+            const size_t internal_effective_demand = std::max((size_t)internal_demand, (size_t)(internal_demand * internal_cache_miss * num_active_threads));
+            FatalAssert(leaf_effective_demand + internal_effective_demand < (double)pool_size, LOG_TAG_BUFFER,
+                        "Not enough cache to support ANNS demand for these many threads");
+            const size_t internal_reuse_bias = std::max(1u, index_meta.internal_size_cap / (index_meta.leaf_nprobe * 2));
+            const size_t internal_weight = std::min(internal_demand * internal_reuse_bias,
+                                              index_meta.num_internal_clusters * internal_page_size);
+            const size_t leaf_weight = std::min(leaf_demand,
+                                                index_meta.num_leaf_clusters * leaf_page_size);
+
+            size_t leaf_pool_size = std::max(leaf_effective_demand, (pool_size * leaf_weight) / (leaf_weight + internal_weight));
+            size_t internal_pool_size = pool_size - leaf_pool_size;
+            if (internal_pool_size > (index_meta.num_internal_clusters * internal_page_size)) {
+                internal_pool_size = index_meta.num_internal_clusters * internal_page_size;
+                leaf_pool_size = pool_size - internal_pool_size;
+            } else if (internal_pool_size < internal_effective_demand) {
+                if (internal_effective_demand > (index_meta.num_internal_clusters * internal_page_size)) {
+                    internal_pool_size = index_meta.num_internal_clusters * internal_page_size;
+                    leaf_pool_size = pool_size - internal_pool_size;
+                } else {
+                    internal_pool_size = internal_effective_demand;
+                    leaf_pool_size = pool_size - internal_pool_size;
+                }
+            }
+            FatalAssert(leaf_pool_size >= leaf_effective_demand, LOG_TAG_BUFFER,
+                        "Leaf pool size is too small to support ANNS demand for these many threads");
+            FatalAssert((internal_pool_size >= internal_effective_demand) || (internal_pool_size == index_meta.num_internal_clusters * internal_page_size), LOG_TAG_BUFFER,
+                        "Internal pool size is too small to support ANNS demand for these many threads");
+            leaf_pool_size = ALIGNED_SIZE(leaf_pool_size, leaf_page_size + CACHE_LINE_SIZE);
+            internal_pool_size = ALIGNED_SIZE(internal_pool_size, internal_page_size + CACHE_LINE_SIZE);
+            pool_size = leaf_pool_size + internal_pool_size;
+            
             DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
-                    "Initializing BufferMgr with IVF_TREE index. leaf_page_size: %zu, internal_page_size: %zu, pool_size: %zu",
-                    leaf_page_size, internal_page_size, pool_size);
-            _cache = new LocalMemoryPool(internal_page_size, leaf_page_size, pool_size);
-            _cache_meta_container = new CacheMetaContainer(pool_size, leaf_page_size, internal_page_size, index_meta.leaf_size_cap,
-                                                           2 * num_user_threads, *_cache);
+                    "Initializing BufferMgr with IVF_TREE index. leaf_page_size: %zu, internal_page_size: %zu, leaf_pool_size: %zu, internal_pool_size: %zu, pool_size: %zu, "
+                    "leaf_weight: %zu, internal_weight: %zu, internal_reuse_bias: %zu, internal_demand: %zu, leaf_demand: %zu, internal_effective_demand: %zu, leaf_effective_demand: %zu, total_leaf_size: %zu, total_internal_size: %zu, leaf_to_total: %.2f %%, internal_to_total: %.2f %%, internal_total_cached: %.2f %%",
+                    leaf_page_size, internal_page_size, leaf_pool_size, internal_pool_size, pool_size, leaf_weight, internal_weight, internal_reuse_bias,
+                    internal_demand, leaf_demand, internal_effective_demand, leaf_effective_demand, index_meta.num_leaf_clusters * leaf_page_size, index_meta.num_internal_clusters * internal_page_size,
+                    (double)(leaf_pool_size * 100) / pool_size, (double)(internal_pool_size * 100) / pool_size, (double)(internal_pool_size * 100) / (index_meta.num_internal_clusters * internal_page_size));
+            _cache = new LocalMemoryPool(internal_page_size, leaf_page_size, leaf_pool_size, internal_pool_size);
+            _cache_meta_container = new CacheMetaContainer(leaf_page_size, internal_page_size, leaf_pool_size, internal_pool_size,
+                                            4 * num_user_threads, *_cache);
+            // _cache_meta_container = new CacheMetaContainer(pool_size, leaf_page_size, internal_page_size, index_meta.leaf_size_cap,
+            //                                                4 * num_user_threads, *_cache);
             DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
                     "BufferMgr initialized with IVF_TREE index. leaf_page_size: %zu, internal_page_size: %zu, pool_size: %zu",
                     leaf_page_size, internal_page_size, pool_size);

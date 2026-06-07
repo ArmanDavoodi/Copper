@@ -279,6 +279,7 @@ void worker(divftree::Thread* self, uint64_t thread_idx) {
     do { \
         printf(msg __VA_OPT__(,) __VA_ARGS__); \
         printf("\n"); \
+        fflush(stdout); \
         DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_TEST, msg __VA_OPT__(,) __VA_ARGS__); \
     } while(0)
 
@@ -286,11 +287,13 @@ void worker(divftree::Thread* self, uint64_t thread_idx) {
     do { \
         printf(msg __VA_OPT__(,) __VA_ARGS__); \
         printf("\n"); \
+        fflush(stdout); \
     } while(0)
 
 #define ExclusiveBenchNewLine() \
     do { \
         printf("\n"); \
+        fflush(stdout); \
     } while(0)
 
 inline void FlushStats(bool clear) {
@@ -366,6 +369,7 @@ inline void FlushStats(bool clear) {
             stats = next;
         }
         fprintf(f, "\n-------------------------\n");
+        fflush(f);
         fclose(f);
 
         if (clear) {
@@ -454,6 +458,9 @@ void ReadArgs(int argc, char** argv) {
         DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Number of leaf probes must be greater than 0!");
     }
 
+    index_attr.index_meta.internal_nprobe = internal_n_probes;
+    index_attr.index_meta.leaf_nprobe = leaf_n_probes;
+
     FILE* file = fopen(index_file_path.c_str(), "rb");
     if (file == nullptr) {
         DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Failed to open index file at path: %s", index_file_path.c_str());
@@ -489,7 +496,48 @@ void ReadArgs(int argc, char** argv) {
         if (index_attr.index_meta.internal_size_cap == 0) {
             DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Internal cluster capacity for hierarchical k-means index must be greater than 0!");
         }
+
+        fseek(file, sizeof(uint32_t) * 2 + sizeof(uint16_t), SEEK_CUR);
+        ret = fread(&index_attr.index_meta.num_levels, sizeof(uint8_t), 1, file);
+        if (ret != 1) {
+            DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Failed to read number of levels for hierarchical k-means index from index file!");
+        }
+        if (index_attr.index_meta.num_levels == 0) {
+            DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Number of levels for hierarchical k-means index must be greater than 0!");
+        } else if (index_attr.index_meta.num_levels == 1) {
+            DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_BASIC, "Flat Hierarchical k-means index");
+        }
+
+        index_attr.index_meta.num_leaf_clusters = 0;
+        index_attr.index_meta.num_internal_clusters = 0;
+        for (uint8_t level = index_attr.index_meta.num_levels; level > 0; --level) {
+            uint32_t tmp;
+            ret = fread(&tmp, sizeof(uint32_t), 1, file);
+            if (ret != 1) {
+                DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Failed to read number of clusters for level %u for hierarchical k-means index from index file!", level);
+            }
+
+            if (tmp == 0) {
+                DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Number of clusters at level %u for hierarchical k-means index must be greater than 0!", level);
+            }
+
+            if (level == divftree::VectorID::LEAF_LEVEL) {
+                index_attr.index_meta.num_leaf_clusters = tmp;
+                break; /* leaf clusters are at the last level, so we can break after reading it */
+            } else {
+                index_attr.index_meta.num_internal_clusters += tmp;
+            }
+
+            fseek(file, tmp * (sizeof(divftree::VectorID) + sizeof(uint32_t) + sizeof(uint32_t) + DIMENSION * sizeof(divftree::CTYPE)), SEEK_CUR);
+        }
+
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Hierarchical k-means index with %u levels, %u internal clusters, and %u leaf clusters",
+                index_attr.index_meta.num_levels, index_attr.index_meta.num_internal_clusters, index_attr.index_meta.num_leaf_clusters);
         break;
+    case divftree::IndexType::IVF_FLAT:
+        break;
+    default:
+        DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Unsupported index type index file!");
     }
 
     fclose(file);
@@ -768,7 +816,7 @@ int main(int argc, char** argv) {
     avg_recall /= (double)total_num_queries;
 
     BenchLog("Recall Info: (99%% of queries have a recall higher/better than p01) "
-             "p01:%.2f, p05:%.2f, p50:%.2f, p95:%.f, p99:%2.f, avg:%.2f",
+             "p01:%.2f, p05:%.2f, p50:%.2f, p95:%.2f, p99:%.2f, avg:%.2f",
              p01_recall, p05_recall, p50_recall, p95_recall, p99_recall, avg_recall);
 
     for (size_t i = 0; i < total_num_queries; ++i) {

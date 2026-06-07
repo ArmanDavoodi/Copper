@@ -63,8 +63,8 @@ using VTYPE = uint8_t;
 #else
 using CTYPE = uint8_t;
 #define CTYPE_FMT "%hhu"
-using MVTYPE = double;
-#define MVTYPE_FMT "%lu"
+using MVTYPE = float;
+#define MVTYPE_FMT "%2.f"
 #error CENTROID_TYPE not found!
 #endif
 
@@ -112,13 +112,76 @@ using DTYPE = uint8_t;
 #include "utils/concurrent_datastructures.h"
 
 template<typename T1, typename T2>
-inline divftree::DTYPE L2Squared(const T1* a, const T2* b) {
+inline divftree::DTYPE L2Squared(const T1* __restrict__ a, const T2* __restrict__ b) {
     divftree:: DTYPE dist = 0;
-    for (uint16_t i = 0; i < DIMENSION; i++) {
+    #pragma GCC ivdep
+    for (int i = 0; i < DIMENSION; i++) {
         divftree::DTYPE diff = static_cast<divftree::DTYPE>(a[i]) - static_cast<divftree::DTYPE>(b[i]);
         dist += diff * diff;
     }
     return dist;
+}
+
+template<typename T1, typename T2>
+inline void VCpy(T1* __restrict__ dest, const T2* __restrict__ src) {
+    if constexpr (std::is_same_v<T1, T2>) {
+        memcpy(dest, src, sizeof(T1) * DIMENSION);
+    } else {
+        #pragma GCC ivdep
+        for (int i = 0; i < DIMENSION; i++) {
+            dest[i] = static_cast<T1>(src[i]);
+        }
+    }
+}
+
+template<typename T1, typename T2>
+inline void VSet(T1* __restrict__ dest, T2 val) {
+     if constexpr (std::is_same_v<T1, T2>) {
+        memset(dest, val, sizeof(T1) * DIMENSION);
+    } else {
+        #pragma GCC ivdep
+        for (int i = 0; i < DIMENSION; i++) {
+            dest[i] = static_cast<T1>(val);
+        }
+    }
+}
+
+template<typename T1, typename T2>
+inline void VAdd(T1* __restrict__ dest, const T2* __restrict__ v) {
+    #pragma GCC ivdep
+    for (int i = 0; i < DIMENSION; i++) {
+        dest[i] += static_cast<T1>(v[i]);
+    }
+}
+
+template<typename DestT, typename T1, typename T2>
+inline void VAdd(DestT* __restrict__ dest, const T1* __restrict__ v1, const T2* __restrict__ v2) {
+    #pragma GCC ivdep
+    for (int i = 0; i < DIMENSION; i++) {
+        dest[i] += static_cast<DestT>(v1[i]) + static_cast<DestT>(v2[i]);
+    }
+}
+
+template<typename T1, typename T2>
+inline void VDivInPlace(T1* __restrict__ vec, T2 value) {
+    using CalcT = std::common_type_t<T1, T2>;
+    CalcT inv = CalcT(1) / static_cast<CalcT>(value);
+
+    #pragma GCC ivdep
+    for (int i = 0; i < DIMENSION; i++) {
+        vec[i] = static_cast<T1>(static_cast<CalcT>(vec[i]) * inv);
+    }
+}
+
+template<typename T1, typename T2, typename ScalarT>
+inline void VCpyNormalize(T1* __restrict__ v1, const T2* __restrict__ v2, ScalarT value) {
+    using CalcT = std::common_type_t<T1, T2, ScalarT>;
+    CalcT inv = CalcT(1) / static_cast<CalcT>(value);
+
+    #pragma GCC ivdep
+    for (int i = 0; i < DIMENSION; i++) {
+        v1[i] = static_cast<T1>(static_cast<CalcT>(v2[i]) * inv);
+    }
 }
 
 inline bool MoreSimilar(const divftree::DTYPE& dist1, const divftree::DTYPE& dist2) {
@@ -516,10 +579,11 @@ void kmeans(DataSet<DataSetInternal>& data, uint32_t* const valid_indices, uint3
             std::pair<ClusterData*, ClusterMetaData*> cluster_info = cluster_manager.At(c, false);
             ClusterData& cluster_data = *(cluster_info.first);
             // divftree::String centroid_str = divftree::String("Initializing centroid %u with vector index %u: data=[", c, idx);
-            for (uint16_t d = 0; d < DIMENSION; d++) {
-                cluster_data.data[d] = static_cast<divftree::MVTYPE>(data[idx].data[d]);
-                // centroid_str += divftree::String(VTYPE_FMT "%s", data[idx].data[d], (d == DIMENSION - 1) ? "]" : ", ");
-            }
+            VCpy(cluster_data.data, data[idx].data);
+            // for (uint16_t d = 0; d < DIMENSION; d++) {
+            //     cluster_data.data[d] = static_cast<divftree::MVTYPE>(data[idx].data[d]);
+            //     // centroid_str += divftree::String(VTYPE_FMT "%s", data[idx].data[d], (d == DIMENSION - 1) ? "]" : ", ");
+            // }
             // DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%s", centroid_str.ToCStr());
         }
 
@@ -595,10 +659,14 @@ void kmeans(DataSet<DataSetInternal>& data, uint32_t* const valid_indices, uint3
 
                 ++(cluster_counts[best_cluster]);
                 cluster_weights[best_cluster] += data.DataWeight(i, !weighted_kmeans);
-                for (uint16_t d = 0; d < DIMENSION; d++) {
-                    cluster_sums[best_cluster * DIMENSION + d] +=
-                        static_cast<divftree::MVTYPE>(data[i].data[d]) *
-                        static_cast<divftree::MVTYPE>(data.DataWeight(i, !weighted_kmeans));
+                if (weighted_kmeans) {
+                    for (uint16_t d = 0; d < DIMENSION; d++) {
+                        cluster_sums[best_cluster * DIMENSION + d] +=
+                            static_cast<divftree::MVTYPE>(data[i].data[d]) *
+                            static_cast<divftree::MVTYPE>(data.DataWeight(i, false));
+                    }
+                } else {
+                    VAdd(cluster_sums + best_cluster * DIMENSION, data[i].data);
                 }
             }
 
@@ -659,10 +727,8 @@ void kmeans(DataSet<DataSetInternal>& data, uint32_t* const valid_indices, uint3
                 cluster_data.num_points += cluster_counts[c_idx];
                 cluster_counts[c_idx] = 0;
                 cluster_weights[c_idx] = 0;
-                for (uint16_t d = 0; d < DIMENSION; d++) {
-                    cluster_data.data[d] += cluster_sums[c_idx * DIMENSION + d];
-                    cluster_sums[c_idx * DIMENSION + d] = 0;
-                }
+                VAdd(cluster_data.data, cluster_sums + c_idx * DIMENSION);
+                memset(cluster_sums + c_idx * DIMENSION, 0, sizeof(divftree::MVTYPE) * DIMENSION);
                 cluster_meta.lock.Unlock();
             }
 
@@ -689,10 +755,7 @@ void kmeans(DataSet<DataSetInternal>& data, uint32_t* const valid_indices, uint3
                 // divftree::String cluster_str = divftree::String("Updating centroid for cluster %u: num_points=%u, data=[", c, cluster_data.num_points);
                 FatalAssert(weighted_kmeans || (cluster_data.num_points == cluster_meta.subtree_size), LOG_TAG_BASIC,
                             "if we are taking uniform avg, num_points should be the same as subtree-size here");
-                for (uint16_t d = 0; d < DIMENSION; d++) {
-                    cluster_data.data[d] /= static_cast<divftree::MVTYPE>(cluster_meta.subtree_size);
-                    // cluster_str += divftree::String(MVTYPE_FMT "%s", cluster_data.data[d], (d == DIMENSION - 1) ? "]" : ", ");
-                }
+                VDivInPlace(cluster_data.data, static_cast<divftree::MVTYPE>(cluster_meta.subtree_size));
                 // DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%s", cluster_str.ToCStr());
             }
 
@@ -729,10 +792,7 @@ void kmeans(DataSet<DataSetInternal>& data, uint32_t* const valid_indices, uint3
         ClusterData& cluster_data = *(cluster_info.first);
         cluster_data.num_points = 0;
         // divftree::String centroid_str = divftree::String("Initializing centroid %u with vector index %u: data=[", c, idx);
-        for (uint16_t d = 0; d < DIMENSION; d++) {
-            cluster_data.data[d] = static_cast<divftree::MVTYPE>(data[idx].data[d]);
-            // centroid_str += divftree::String(VTYPE_FMT "%s", data[idx].data[d], (d == DIMENSION - 1) ? "]" : ", ");
-        }
+        VCpy(cluster_data.data, data[idx].data);
         // DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%s", centroid_str.ToCStr());
     }
 
@@ -799,10 +859,14 @@ void kmeans(DataSet<DataSetInternal>& data, uint32_t* const valid_indices, uint3
 
             ++(cluster_counts[best_cluster]);
             cluster_weights[best_cluster] += data.DataWeight(i, !weighted_kmeans);
-            for (uint16_t d = 0; d < DIMENSION; d++) {
-                cluster_sums[best_cluster * DIMENSION + d] +=
-                    static_cast<divftree::MVTYPE>(data[i].data[d]) *
-                    static_cast<divftree::MVTYPE>(data.DataWeight(i, !weighted_kmeans));
+            if (weighted_kmeans) {
+                for (uint16_t d = 0; d < DIMENSION; d++) {
+                    cluster_sums[best_cluster * DIMENSION + d] +=
+                        static_cast<divftree::MVTYPE>(data[i].data[d]) *
+                        static_cast<divftree::MVTYPE>(data.DataWeight(i, !weighted_kmeans));
+                }
+            } else {
+                VAdd(cluster_sums + best_cluster * DIMENSION, data[i].data);
             }
         }
 
@@ -839,11 +903,13 @@ void kmeans(DataSet<DataSetInternal>& data, uint32_t* const valid_indices, uint3
             FatalAssert(weighted_kmeans || (cluster_data.num_points == cluster_meta.subtree_size), LOG_TAG_BASIC,
                         "if we are taking uniform avg, num_points should be the same as subtree-size here");
             // divftree::String cluster_str = divftree::String("Updating centroid for cluster %u: num_points=%u, data=[", c, cluster_data.num_points);
-            for (uint16_t d = 0; d < DIMENSION; d++) {
-                cluster_data.data[d] = cluster_sums[i * DIMENSION + d] / static_cast<divftree::MVTYPE>(cluster_meta.subtree_size);
-                cluster_sums[i * DIMENSION + d] = 0;
-                // cluster_str += divftree::String(MVTYPE_FMT "%s", cluster_data.data[d], (d == DIMENSION - 1) ? "]" : ", ");
-            }
+            // for (uint16_t d = 0; d < DIMENSION; d++) {
+            //     cluster_data.data[d] = cluster_sums[i * DIMENSION + d] / static_cast<divftree::MVTYPE>(cluster_meta.subtree_size);
+            //     cluster_sums[i * DIMENSION + d] = 0;
+            //     // cluster_str += divftree::String(MVTYPE_FMT "%s", cluster_data.data[d], (d == DIMENSION - 1) ? "]" : ", ");
+            // }
+            VCpyNormalize(cluster_data.data, cluster_sums + i * DIMENSION, cluster_meta.subtree_size);
+            memset(cluster_sums + i * DIMENSION, 0, sizeof(divftree::MVTYPE) * DIMENSION);
             // DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "%s", cluster_str.ToCStr());
         }
 
@@ -917,50 +983,129 @@ void kmeans_simple(DataSet<VectorData>& data, uint32_t num_points, uint32_t num_
     data.ReplaceWithImg();
 }
 
-void kmeans_sampled(DataSet<VectorData>& data, uint32_t num_points, uint32_t sample_size, uint32_t num_clusters,
-                    uint32_t max_iterations, size_t num_threads, ClusterManager& cluster_manager) {
-    cluster_manager.AddClusters(num_clusters, false);
+inline uint32_t GetSampleSize(uint32_t num_points, uint32_t min_sample_size, uint32_t vector_per_cluster, uint32_t num_clusters, size_t num_threads, uint32_t& block_size) {
+    min_sample_size = (uint32_t)(std::min((size_t)num_points, std::max((size_t)min_sample_size, (size_t)min_sample_size * (size_t)(num_threads * 0.75))));
+    uint32_t sample_size;
+    if ((uint64_t)(vector_per_cluster) * (uint64_t)num_clusters > (uint64_t)(num_points)) {
+        sample_size = std::min(num_points, min_sample_size);
+    } else {
+        sample_size = std::min(num_points, std::max(min_sample_size, vector_per_cluster * num_clusters));
+    }
+    block_size = num_points / sample_size;
+    sample_size = num_points / block_size;
+    return sample_size;
+}
 
-    uint32_t* assignments = new uint32_t[num_points];
-    memset(assignments, -1, sizeof(uint32_t) * num_points);
+template<typename DataSetInternal>
+void kmeans_sampled_general(DataSet<DataSetInternal>& data, uint32_t num_points,
+                            uint32_t min_sample_size, uint32_t vector_per_cluster, uint32_t num_clusters,
+                            uint32_t max_iterations, size_t num_threads, ClusterManager& cluster_manager,
+                            uint32_t* const valid_indices, uint32_t* assignments,
+                            uint32_t* const valid_cluster_indices, std::mt19937& gen, bool weighted_kmeans = false) {
+    uint32_t block_size = 0;
+    uint32_t sample_size = GetSampleSize(num_points, min_sample_size, vector_per_cluster, num_clusters, num_threads, block_size);
+    FatalAssert(sample_size > 0, LOG_TAG_BASIC, "Sample size should be greater than 0!");
+    FatalAssert(sample_size <= num_points, LOG_TAG_BASIC, "Sample size should be less than or equal to the number of points!");
+    FatalAssert(sample_size >= num_clusters, LOG_TAG_BASIC, "Sample size should be greater than or equal to the number of clusters!");
+    FatalAssert(block_size > 0, LOG_TAG_BASIC, "Block size should be greater than 0!");
+    FatalAssert(block_size <= num_points, LOG_TAG_BASIC, "Block size should be less than or equal to the number of points!");
+    FatalAssert(block_size <= sample_size, LOG_TAG_BASIC, "Block size should be less than or equal to the sample size!");
+    FatalAssert(num_points / block_size == sample_size, LOG_TAG_BASIC, "num_points should be divisible by block_size to get the correct sample size!");
+
+    if (sample_size == num_points) {
+        FatalAssert(block_size == 1, LOG_TAG_BASIC, "If sample size is equal to num points, block size should be 1!");
+        if (num_threads == 1) {
+            kmeans(data, valid_indices, assignments, num_points, num_clusters, max_iterations,
+                   cluster_manager, valid_cluster_indices, weighted_kmeans);
+        } else {
+            kmeans(data, valid_indices, assignments, num_points, num_clusters, max_iterations, num_threads,
+                cluster_manager, valid_cluster_indices, weighted_kmeans);
+        }
+        return;
+    }
+    FatalAssert(block_size > 1, LOG_TAG_BASIC, "Block size should be greater than 1 for sampled k-means!");
+
+    std::uniform_int_distribution<uint32_t> rand_num(0, block_size - 1);
     uint32_t* sample_indices = new uint32_t[sample_size];
 
-    std::mt19937 gen(std::random_device{}());
-    std::uniform_int_distribution<uint32_t> rand_num(0, sample_size - 1);
-    std::set<uint32_t>* indices = new std::set<uint32_t>;
-    uint32_t num_sampled = 0;
-    std::cout << "Choosing " << sample_size << " random samples for initial k-means...\n" << std::flush;
-    while (num_sampled < sample_size) {
-        uint32_t idx = rand_num(gen);
-        if (indices->find(idx) == indices->end()) {
-            indices->insert(idx);
-            sample_indices[num_sampled] = idx;
-            num_sampled++;
-            if (num_sampled % (sample_size / 100) == 0) {
-                std::cout << "Sampling progress: " << (num_sampled * 100) / sample_size << "%\n" << std::flush;
-            }
+    if (num_threads > 1) {
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
+                "Sampling %u points for k-means initialization with block size %u using %zu threads...",
+                sample_size, block_size, num_threads);
+    }
+
+    for (uint32_t i = 0; i < sample_size; i++) {
+        for (uint32_t j = 0; j < block_size; j++) {
+            uint32_t idx = (valid_indices == nullptr ? (i * block_size) + j : valid_indices[(i * block_size) + j]);
+            assignments[idx] = (uint32_t)-1; // mark as unassigned for the initial k-means
+        }
+        uint32_t idx = (i * block_size) + rand_num(gen);
+        FatalAssert(idx < num_points, LOG_TAG_BASIC, "Sample index out of bounds!");
+        sample_indices[i] = (valid_indices == nullptr ? idx : valid_indices[idx]);
+    }
+
+    if (sample_size * block_size != num_points) {
+        FatalAssert(sample_size * block_size < num_points, LOG_TAG_BASIC, "Sample size times block size should be less than or equal to num points!");
+        for (uint32_t i = sample_size * block_size; i < num_points; i++) {
+            uint32_t idx = (valid_indices == nullptr ? i : valid_indices[i]);
+            assignments[idx] = (uint32_t)-1; // mark as unassigned for the initial k-means
         }
     }
-    delete indices;
 
-    kmeans(data, sample_indices, assignments, sample_size, num_clusters, max_iterations, num_threads,
-           cluster_manager, nullptr);
+    if (num_threads == 1) {
+        kmeans(data, sample_indices, assignments, sample_size, num_clusters, max_iterations,
+               cluster_manager, valid_cluster_indices, weighted_kmeans);
+    } else {
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Sampling done");
+        kmeans(data, sample_indices, assignments, sample_size, num_clusters, max_iterations, num_threads,
+            cluster_manager, valid_cluster_indices, weighted_kmeans);
+    }
     delete[] sample_indices;
-
-    std::cout << "Assigning remaining points to nearest centroids and reordering vectors using " << num_threads << " threads...\n" << std::flush;
-    std::atomic<uint32_t> num_assigned = 0;
 
     uint32_t fc = 0;
     if (num_clusters > 2) {
         for (; fc < num_clusters; ++fc) {
             std::pair<ClusterData*, ClusterMetaData*> cluster_info;
-            if (cluster_manager.GetIfNotEmpty(fc, false, cluster_info)) {
+            uint32_t c = (valid_cluster_indices == nullptr ? fc : valid_cluster_indices[fc]);
+            if (cluster_manager.GetIfNotEmpty(c, num_threads == 1, cluster_info)) {
                 break;
             }
         }
     }
 
-    #pragma omp parallel num_threads(num_threads) shared(cluster_manager, assignments, num_points, data, num_assigned)
+    if (num_threads == 1) {
+        for (uint32_t i = 0; i < num_points; i++) {
+            uint32_t idx = (valid_indices == nullptr ? i : valid_indices[i]);
+            if (assignments[idx] != (uint32_t)-1) {
+                continue; // already assigned in the initial k-means
+            }
+            std::pair<ClusterData*, ClusterMetaData*> cluster_info;
+            uint32_t c = (valid_cluster_indices == nullptr ? fc : valid_cluster_indices[fc]);
+            uint32_t best_cluster = c;
+            divftree::DTYPE best_dist = L2Squared(data[idx].data, cluster_manager.At(c, true).first->data);
+            for (uint32_t c_idx = fc + 1; c_idx < num_clusters; c_idx++) {
+                uint32_t c = (valid_cluster_indices == nullptr ? c_idx : valid_cluster_indices[c_idx]);
+                if (!cluster_manager.GetIfNotEmpty(c, true, cluster_info)) {
+                    continue;
+                }
+                divftree::DTYPE dist = L2Squared(data[idx].data, cluster_info.first->data);
+                if (MoreSimilar(dist, best_dist)) {
+                    best_dist = dist;
+                    best_cluster = c;
+                }
+            }
+            assignments[idx] = best_cluster;
+            ClusterData& cluster_data = *(cluster_manager.At(best_cluster, true).first);
+            ClusterMetaData& cluster_meta_data = *(cluster_manager.At(best_cluster, true).second);
+            ++(cluster_data.num_points); // update num_points for the assigned cluster
+        }
+        return;
+    }
+
+
+    DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC,
+            "Assigning remaining points to clusters for sampled k-means using %zu threads...", num_threads);
+    #pragma omp parallel num_threads(num_threads)
     {
         divftree::Thread* st = divftree::threadSelf;
         bool created = false;
@@ -971,27 +1116,24 @@ void kmeans_sampled(DataSet<VectorData>& data, uint32_t num_points, uint32_t sam
         }
 
         #pragma omp for schedule(static)
-        for (uint32_t idx = 0; idx < num_points; idx++) {
-            uint64_t assigned = num_assigned.fetch_add(1) + 1;
-            if (assigned % (num_points / 100) == 0) {
-                DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Assignment progress: %u%%",
-                        (assigned * 100ul) / (uint64_t)num_points);
-            }
-
+        for (uint32_t i = 0; i < num_points; i++) {
+            uint32_t idx = (valid_indices == nullptr ? i : valid_indices[i]);
             if (assignments[idx] != (uint32_t)-1) {
                 continue; // already assigned in the initial k-means
             }
             std::pair<ClusterData*, ClusterMetaData*> cluster_info;
-            uint32_t best_cluster = fc;
-            divftree::DTYPE best_dist = L2Squared(data[idx].data, cluster_manager.At(fc, false).first->data);
+            uint32_t c = (valid_cluster_indices == nullptr ? fc : valid_cluster_indices[fc]);
+            uint32_t best_cluster = c;
+            divftree::DTYPE best_dist = L2Squared(data[idx].data, cluster_manager.At(c, false).first->data);
             for (uint32_t c_idx = fc + 1; c_idx < num_clusters; c_idx++) {
-                if (!cluster_manager.GetIfNotEmpty(c_idx, false, cluster_info)) {
+                uint32_t c = (valid_cluster_indices == nullptr ? c_idx : valid_cluster_indices[c_idx]);
+                if (!cluster_manager.GetIfNotEmpty(c, false, cluster_info)) {
                     continue;
                 }
                 divftree::DTYPE dist = L2Squared(data[idx].data, cluster_info.first->data);
                 if (MoreSimilar(dist, best_dist)) {
                     best_dist = dist;
-                    best_cluster = c_idx;
+                    best_cluster = c;
                 }
             }
             assignments[idx] = best_cluster;
@@ -1002,15 +1144,41 @@ void kmeans_sampled(DataSet<VectorData>& data, uint32_t num_points, uint32_t sam
             cluster_meta_data.lock.Unlock();
         }
 
-        #pragma omp single
-        {
-            std::cout << "Setting cluster offsets for reordering...\n" << std::flush;
-            uint32_t num_seen = cluster_manager.SetOffsets();
-            FatalAssert(num_seen == num_points, LOG_TAG_BASIC,
-                        "Total number of assigned points should be equal to num_points!");
+        if (created) {
+            st->DestroyDIVFThread();
+        }
+    }
+}
 
-            std::cout << "Allocating memory for reordered vector data...\n" << std::flush;
-            data.CreateEmptyImage();
+void kmeans_sampled(DataSet<VectorData>& data, uint32_t num_points,
+                    uint32_t min_sample_size, uint32_t vector_per_cluster, uint32_t num_clusters,
+                    uint32_t max_iterations, size_t num_threads, ClusterManager& cluster_manager) {
+    cluster_manager.AddClusters(num_clusters, false);
+
+    uint32_t* assignments = new uint32_t[num_points];
+    memset(assignments, -1, sizeof(uint32_t) * num_points);
+
+    std::mt19937 gen(std::random_device{}());
+
+    kmeans_sampled_general(data, num_points, min_sample_size, vector_per_cluster, num_clusters, max_iterations,
+                            num_threads, cluster_manager, nullptr, assignments, nullptr, gen);
+
+    std::cout << "Setting cluster offsets for reordering...\n" << std::flush;
+    uint32_t num_seen = cluster_manager.SetOffsets();
+    FatalAssert(num_seen == num_points, LOG_TAG_BASIC,
+                "Total number of assigned points should be equal to num_points!");
+
+    std::cout << "Allocating memory for reordered vector data...\n" << std::flush;
+    data.CreateEmptyImage();
+
+    #pragma omp parallel num_threads(num_threads) shared(cluster_manager, assignments, num_points, data)
+    {
+        divftree::Thread* st = divftree::threadSelf;
+        bool created = false;
+        if (st == nullptr) {
+            created = true;
+            st = new divftree::Thread(100);
+            st->InitDIVFThread(true);
         }
 
         #pragma omp for schedule(static)
@@ -1045,14 +1213,19 @@ void kmeans_sampled(DataSet<VectorData>& data, uint32_t num_points, uint32_t sam
 enum class NumClusterCompAlg : uint8_t {
     SIMPLE,
     SIMPLE_COEFFICIENT,
-    MAX
+    MAX,
+    MAX_SAMPLED
 };
 
 struct ClusteringConfig {
     NumClusterCompAlg num_cluster_comp_alg;
     union {
         uint32_t coefficient;
-        uint32_t max_num_clusters;
+        struct {
+            uint32_t max_num_clusters;
+            uint32_t min_sample_size;
+            uint32_t num_points_per_cluster;
+        };
     };
 
     std::string ToString() const {
@@ -1063,6 +1236,8 @@ struct ClusteringConfig {
                 return "SIMPLE_COEFFICIENT(coefficient=" + std::to_string(coefficient) + ")";
             case NumClusterCompAlg::MAX:
                 return "MAX(max_num_clusters=" + std::to_string(max_num_clusters) + ")";
+            case NumClusterCompAlg::MAX_SAMPLED:
+                return "MAX_SAMPLED(max_num_clusters=" + std::to_string(max_num_clusters) + ", min_sample_size=" + std::to_string(min_sample_size) + ", num_points_per_cluster=" + std::to_string(num_points_per_cluster) + ")";
             default:
                 return "UNKNOWN";
         }
@@ -1073,7 +1248,7 @@ inline uint32_t GetNumClusters(uint32_t num_points, uint32_t cluster_cap, Cluste
     FatalAssert(cluster_cap > 0, LOG_TAG_BASIC, "Cluster capacity must be greater than 0!");
     FatalAssert(num_points > cluster_cap, LOG_TAG_BASIC, "Number of points must be greater than 0!");
 
-    if (config.num_cluster_comp_alg == NumClusterCompAlg::MAX) {
+    if (config.num_cluster_comp_alg == NumClusterCompAlg::MAX || config.num_cluster_comp_alg == NumClusterCompAlg::MAX_SAMPLED) {
         return std::max(2u, std::min(config.max_num_clusters, num_points / cluster_cap));
     }
 
@@ -1104,8 +1279,14 @@ void kmeans_capped(DataSet<DataSetInternal>& data, uint32_t num_points, uint32_t
     memset(assignments, 0, sizeof(uint32_t) * num_points);
 
     std::cout << "Running initial k-means with " << num_clusters << " clusters...\n" << std::flush;
-    kmeans(data, nullptr, assignments, num_points, num_clusters, max_iterations, num_threads,
-           cluster_manager, nullptr, weighted_kmeans);
+    if (config.num_cluster_comp_alg == NumClusterCompAlg::MAX_SAMPLED) {
+        std::mt19937 gen(std::random_device{}());
+        kmeans_sampled_general(data, num_points, config.min_sample_size, config.num_points_per_cluster, num_clusters,
+                               max_iterations, num_threads, cluster_manager, nullptr, assignments, nullptr, gen, weighted_kmeans);
+    } else {
+        kmeans(data, nullptr, assignments, num_points, num_clusters, max_iterations, num_threads,
+               cluster_manager, nullptr, weighted_kmeans);
+    }
 
     divftree::BlockingQueue<SplitTask> split_tasks(num_clusters);
 
@@ -1161,6 +1342,8 @@ void kmeans_capped(DataSet<DataSetInternal>& data, uint32_t num_points, uint32_t
         }
 
         if (num_new_clusters_needed > 0) {
+            std::mt19937 gen(std::random_device{}());
+
             #pragma omp for schedule(guided)
             for (uint32_t i = 0; i < num_points; i++) {
                 uint32_t c = assignments[i];
@@ -1202,8 +1385,14 @@ void kmeans_capped(DataSet<DataSetInternal>& data, uint32_t num_points, uint32_t
                 DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Splitting cluster %u with %u points into %u clusters...",
                         task.target_cluster, target_cluster_data.num_points, task.num_clusters);
                 uint32_t old_size = target_cluster_data.num_points;
-                kmeans(data, target_cluster_meta_data.assigned_vector_indices.data(), assignments, target_cluster_data.num_points,
-                       task.num_clusters, max_iterations, cluster_manager, new_valid_cluster_indices, weighted_kmeans);
+                if (config.num_cluster_comp_alg == NumClusterCompAlg::MAX_SAMPLED) {
+                    kmeans_sampled_general(data, target_cluster_data.num_points, config.min_sample_size, config.num_points_per_cluster, task.num_clusters,
+                                           max_iterations, 1, cluster_manager, target_cluster_meta_data.assigned_vector_indices.data(),
+                                           assignments, new_valid_cluster_indices, gen, weighted_kmeans);
+                } else {
+                    kmeans(data, target_cluster_meta_data.assigned_vector_indices.data(), assignments, target_cluster_data.num_points,
+                        task.num_clusters, max_iterations, cluster_manager, new_valid_cluster_indices, weighted_kmeans);
+                }
 
                 uint32_t num_points_seen = 0;
                 uint32_t num_new_clusters_needed_for_task = 0;
@@ -1377,7 +1566,8 @@ struct Args {
         } kmeans_args;
 
         struct {
-            uint32_t sample_size;
+            uint32_t min_sample_size;
+            uint32_t num_point_per_cluster;
             uint32_t num_clusters;
         } kmeans_sampled_args;
 
@@ -1409,7 +1599,8 @@ struct Args {
             case AlgorithmType::KMEANS_SAMPLED:
                 std::cout << "KMEANS_SAMPLED\n" << std::flush;
                 std::cout << "Num clusters: " << kmeans_sampled_args.num_clusters << "\n" << std::flush;
-                std::cout << "Sample size: " << kmeans_sampled_args.sample_size << "\n" << std::flush;
+                std::cout << "Min sample size: " << kmeans_sampled_args.min_sample_size << "\n" << std::flush;
+                std::cout << "Points per cluster: " << kmeans_sampled_args.num_point_per_cluster << "\n" << std::flush;
                 break;
             case AlgorithmType::KMEANS_CAPPED:
                 std::cout << "KMEANS_CAPPED\n" << std::flush;
@@ -1432,7 +1623,7 @@ struct Args {
 
 inline void PrintUsage(int argc, char* argv[]) {
     std::cerr << "Usage: " << argv[0] << " <input_file> <output_file> <num_threads> <num_points> "
-                 "<max_iter> <algorithm> (<num_clusters> | <num_clusters> <sample_size> | (<cluster_cap> | <leaf_cap> <internal_cap> <weighted_kmeans>) <clustering_alg> [<max_num_clusters> | <coefficent>])\n";
+                 "<max_iter> <algorithm> (<num_clusters> | <num_clusters> <min_sample_size> <num_point_per_cluster> | (<cluster_cap> | <leaf_cap> <internal_cap> <weighted_kmeans>) <clustering_alg> [<max_num_clusters> | <coefficent> | <max_num_clusters> <min_sample_size> <num_point_per_cluster>])\n";
     std::cerr << "\t<input_file>: Path to the input binary file containing vector data.\n";
     std::cerr << "\t<output_file>: Path to the output binary file to write clustered vector data.\n";
     std::cerr << "\t<num_threads>: Number of threads to use for clustering. If set to 0 "
@@ -1444,7 +1635,9 @@ inline void PrintUsage(int argc, char* argv[]) {
                  "Must be one of the following: 'kmeans', 'kmeans_sampled', 'kmeans_capped', 'kmeans_hierarchical'.\n";
     std::cerr << "\t<num_clusters>: (Only for kmeans or kmeans_sampled) Number of clusters to form. "
                  "Must be a positive integer greater than one and less than or equal to num_points.\n";
-    std::cerr << "\t<sample_size>: (Only for kmeans_sampled) Number of points to sample from the input file. "
+    std::cerr << "\t<min_sample_size>: (Only for kmeans_sampled or other methods with 'max_sampled' type) Minimum number of points to sample from the input file. "
+                 "Must be a positive integer greater than 1 and less than or equal to num_points.\n";
+    std::cerr << "\t<num_point_per_cluster>: (Only for kmeans_sampled or other methods with 'max_sampled' type) Number of points to sample per cluster in the initial k-means. "
                  "Must be a positive integer greater than 1 and less than num_points.\n";
     std::cerr << "\t<cluster_cap>: (Only for kmeans_capped) Maximum number of points allowed in each cluster. "
                  "Must be a positive integer greater than one and less than num_points.\n";
@@ -1455,7 +1648,7 @@ inline void PrintUsage(int argc, char* argv[]) {
     std::cerr << "\t<weighted_kmeans>: (Only for kmeans_hierarchical) If set to 1, will use the number of raw vectors per subtree while computing the internal node centroids."
                  "Must be either 1 or 0.\n";
     std::cerr << "\t<clustering_alg>: (Only for kmeans_capped or kmeans_hierarchical) Clustering algorithm to use. "
-                 "Must be one of the following: 'simple', 'simple_coefficient', 'max'.\n";
+                 "Must be one of the following: 'simple', 'simple_coefficient', 'max', 'max_sampled'.\n";
     std::cerr << "\t<max_num_clusters>: (Only for kmeans_capped or kmeans_hierarchical with 'max' algorithm) Maximum number of clusters to form per each call to kmeans."
                  "Must be a positive integer greater than one and less than or equal to num_points.\n";
     std::cerr << "\t<coefficient>: (Only for kmeans_capped or kmeans_hierarchical with 'simple_coefficient' algorithm) Coefficient to use in computing number of clusters. "
@@ -1468,7 +1661,7 @@ inline void PrintUsage(int argc, char* argv[]) {
 }
 
 inline void ParseArgs(int argc, char* argv[], Args& args) {
-    if (argc < 8 || argc > 12) {
+    if (argc < 8 || argc > 14) {
         PrintUsage(argc, argv);
         FatalAssert(false, LOG_TAG_BASIC, "Invalid number of arguments!");
         exit(EXIT_FAILURE);
@@ -1482,7 +1675,7 @@ inline void ParseArgs(int argc, char* argv[], Args& args) {
         }
         args.algorithm = AlgorithmType::KMEANS;
     } else if (strcmp(argv[6], "kmeans_sampled") == 0) {
-        if (argc != 9) {
+        if (argc != 10) {
             PrintUsage(argc, argv);
             FatalAssert(false, LOG_TAG_BASIC, "Invalid number of arguments for kmeans_sampled!");
             exit(EXIT_FAILURE);
@@ -1494,13 +1687,21 @@ inline void ParseArgs(int argc, char* argv[], Args& args) {
             exit(EXIT_FAILURE);
         }
         args.kmeans_sampled_args.num_clusters = n_clusters;
-        uint32_t sample_size = std::stoul(argv[8]);
-        if (sample_size <= 1 || n_clusters >= sample_size) {
+        uint32_t min_sample_size = std::stoul(argv[8]);
+        if (min_sample_size <= 1 || n_clusters >= min_sample_size) {
             PrintUsage(argc, argv);
-            FatalAssert(false, LOG_TAG_BASIC, "Sample size must be greater than 1 and less than sample size for kmeans_sampled!");
+            FatalAssert(false, LOG_TAG_BASIC, "Min sample size must be greater than 1 and less than or equal to num_points for kmeans_sampled!");
             exit(EXIT_FAILURE);
         }
-        args.kmeans_sampled_args.sample_size = sample_size;
+
+        uint32_t num_point_per_cluster = std::stoul(argv[9]);
+        if (num_point_per_cluster <= 1) {
+            PrintUsage(argc, argv);
+            FatalAssert(false, LOG_TAG_BASIC, "Number of points per cluster must be greater than 1 and less than num_points for kmeans_sampled!");
+            exit(EXIT_FAILURE);
+        }
+        args.kmeans_sampled_args.min_sample_size = min_sample_size;
+        args.kmeans_sampled_args.num_point_per_cluster = num_point_per_cluster;
         args.algorithm = AlgorithmType::KMEANS_SAMPLED;
     } else if (strcmp(argv[6], "kmeans_capped") == 0) {
         if (argc < 9) {
@@ -1543,6 +1744,34 @@ inline void ParseArgs(int argc, char* argv[], Args& args) {
             }
             args.kmeans_capped_args.conf.num_cluster_comp_alg = NumClusterCompAlg::MAX;
             args.kmeans_capped_args.conf.max_num_clusters = max_num_clusters;
+        } else if (strcmp(argv[8], "max_sampled") == 0) {
+            if (argc != 12) {
+                PrintUsage(argc, argv);
+                FatalAssert(false, LOG_TAG_BASIC, "Invalid number of arguments for kmeans_capped with max_sampled!");
+                exit(EXIT_FAILURE);
+            }
+            uint32_t max_num_clusters = std::stoul(argv[9]);
+            if (max_num_clusters <= 1) {
+                PrintUsage(argc, argv);
+                FatalAssert(false, LOG_TAG_BASIC, "Max number of clusters must be greater than 1 for max_sampled algorithm!");
+                exit(EXIT_FAILURE);
+            }
+            uint32_t min_sample_size = std::stoul(argv[10]);
+            if (min_sample_size <= 1) {
+                PrintUsage(argc, argv);
+                FatalAssert(false, LOG_TAG_BASIC, "Min sample size must be greater than 1 for max_sampled algorithm!");
+                exit(EXIT_FAILURE);
+            }
+            uint32_t num_point_per_cluster = std::stoul(argv[11]);
+            if (num_point_per_cluster <= 1) {
+                PrintUsage(argc, argv);
+                FatalAssert(false, LOG_TAG_BASIC, "Number of points per cluster must be greater than 1 and less than num_points for max_sampled algorithm!");
+                exit(EXIT_FAILURE);
+            }
+            args.kmeans_capped_args.conf.num_cluster_comp_alg = NumClusterCompAlg::MAX_SAMPLED;
+            args.kmeans_capped_args.conf.max_num_clusters = max_num_clusters;
+            args.kmeans_capped_args.conf.min_sample_size = min_sample_size;
+            args.kmeans_capped_args.conf.num_points_per_cluster = num_point_per_cluster;
         } else {
             PrintUsage(argc, argv);
             FatalAssert(false, LOG_TAG_BASIC, "Invalid clustering algorithm for kmeans_capped!");
@@ -1599,6 +1828,34 @@ inline void ParseArgs(int argc, char* argv[], Args& args) {
             }
             args.divftree_kmeans_capped_args.conf.num_cluster_comp_alg = NumClusterCompAlg::MAX;
             args.divftree_kmeans_capped_args.conf.max_num_clusters = max_num_clusters;
+        } else if (strcmp(argv[10], "max_sampled") == 0) {
+            if (argc != 14) {
+                PrintUsage(argc, argv);
+                FatalAssert(false, LOG_TAG_BASIC, "Invalid number of arguments for kmeans_hierarchical with max_sampled!");
+                exit(EXIT_FAILURE);
+            }
+            uint32_t max_num_clusters = std::stoul(argv[11]);
+            if (max_num_clusters <= 1) {
+                PrintUsage(argc, argv);
+                FatalAssert(false, LOG_TAG_BASIC, "Max number of clusters must be greater than 1 for max_sampled algorithm!");
+                exit(EXIT_FAILURE);
+            }
+            uint32_t min_sample_size = std::stoul(argv[12]);
+            if (min_sample_size <= 1) {
+                PrintUsage(argc, argv);
+                FatalAssert(false, LOG_TAG_BASIC, "Min sample size must be greater than 1 for max_sampled algorithm!");
+                exit(EXIT_FAILURE);
+            }
+            uint32_t num_point_per_cluster = std::stoul(argv[13]);
+            if (num_point_per_cluster <= 1) {
+                PrintUsage(argc, argv);
+                FatalAssert(false, LOG_TAG_BASIC, "Number of points per cluster must be greater than 1 and less than num_points for max_sampled algorithm!");
+                exit(EXIT_FAILURE);
+            }
+            args.divftree_kmeans_capped_args.conf.num_cluster_comp_alg = NumClusterCompAlg::MAX_SAMPLED;
+            args.divftree_kmeans_capped_args.conf.max_num_clusters = max_num_clusters;
+            args.divftree_kmeans_capped_args.conf.min_sample_size = min_sample_size;
+            args.divftree_kmeans_capped_args.conf.num_points_per_cluster = num_point_per_cluster;
         } else {
             PrintUsage(argc, argv);
             FatalAssert(false, LOG_TAG_BASIC, "Invalid clustering algorithm for kmeans_hierarchical!");
@@ -1664,10 +1921,17 @@ inline void ParseArgs(int argc, char* argv[], Args& args) {
     }
 
     if (args.algorithm == AlgorithmType::KMEANS_SAMPLED) {
-        if (args.kmeans_sampled_args.sample_size >= num_unique_points) {
-            std::cerr << "Error: sample_size must be less than num_unique_points (" << num_unique_points << ").\n";
+        if (args.kmeans_sampled_args.min_sample_size >= num_unique_points) {
+            std::cerr << "Error: min_sample_size must be less than num_unique_points (" << num_unique_points << ").\n";
             fclose(args.input_fp);
-            FatalAssert(false, LOG_TAG_BASIC, "sample_size must be less than num_unique_points!");
+            FatalAssert(false, LOG_TAG_BASIC, "min_sample_size must be less than num_unique_points!");
+            exit(EXIT_FAILURE);
+        }
+
+        if (args.kmeans_sampled_args.num_point_per_cluster >= num_unique_points) {
+            std::cerr << "Error: num_point_per_cluster must be less than num_unique_points (" << num_unique_points << ").\n";
+            fclose(args.input_fp);
+            FatalAssert(false, LOG_TAG_BASIC, "num_point_per_cluster must be less than num_unique_points!");
             exit(EXIT_FAILURE);
         }
     }
@@ -1761,6 +2025,22 @@ inline void ParseArgs(int argc, char* argv[], Args& args) {
             exit(EXIT_FAILURE);
         }
     } else if (args.algorithm == AlgorithmType::KMEANS_CAPPED) {
+        if (args.kmeans_capped_args.conf.num_cluster_comp_alg == NumClusterCompAlg::MAX_SAMPLED) {
+            if (args.kmeans_capped_args.conf.min_sample_size >= args.num_points_to_use) {
+                std::cerr << "Error: min_sample_size must be less than num_points_to_use (" << args.num_points_to_use << ").\n";
+                fclose(args.input_fp);
+                fclose(args.output_fp);
+                FatalAssert(false, LOG_TAG_BASIC, "min_sample_size must be less than num_points_to_use!");
+                exit(EXIT_FAILURE);
+            }
+            if (args.kmeans_capped_args.conf.num_points_per_cluster >= args.num_points_to_use) {
+                std::cerr << "Error: num_points_per_cluster must be less than num_points_to_use (" << args.num_points_to_use << ").\n";
+                fclose(args.input_fp);
+                fclose(args.output_fp);
+                FatalAssert(false, LOG_TAG_BASIC, "num_points_per_cluster must be less than num_points_to_use!");
+                exit(EXIT_FAILURE);
+            }
+        }
         args.kmeans_capped_args.cluster_cap = std::stoul(argv[7]);
         if (args.kmeans_capped_args.cluster_cap < 2 || args.kmeans_capped_args.cluster_cap >= args.num_points_to_use) {
             std::cerr << "Error: cluster_cap must be greater than 1 and less than num_points_to_use (" << args.num_points_to_use << ").\n";
@@ -1786,6 +2066,23 @@ inline void ParseArgs(int argc, char* argv[], Args& args) {
             fclose(args.output_fp);
             FatalAssert(false, LOG_TAG_BASIC, "internal_cap must be greater than 1 and less than or equal to leaf_cap!");
             exit(EXIT_FAILURE);
+        }
+
+        if (args.divftree_kmeans_capped_args.conf.num_cluster_comp_alg == NumClusterCompAlg::MAX_SAMPLED) {
+            if (args.divftree_kmeans_capped_args.conf.min_sample_size >= args.num_points_to_use) {
+                std::cerr << "Error: min_sample_size must be less than num_points_to_use (" << args.num_points_to_use << ").\n";
+                fclose(args.input_fp);
+                fclose(args.output_fp);
+                FatalAssert(false, LOG_TAG_BASIC, "min_sample_size must be less than num_points_to_use!");
+                exit(EXIT_FAILURE);
+            }
+            if (args.divftree_kmeans_capped_args.conf.num_points_per_cluster >= args.num_points_to_use) {
+                std::cerr << "Error: num_points_per_cluster must be less than num_points_to_use (" << args.num_points_to_use << ").\n";
+                fclose(args.input_fp);
+                fclose(args.output_fp);
+                FatalAssert(false, LOG_TAG_BASIC, "num_points_per_cluster must be less than num_points_to_use!");
+                exit(EXIT_FAILURE);
+            }
         }
     }
 }
@@ -2035,7 +2332,8 @@ void build_ivf_index(DataSet<VectorData>& data, Args& args) {
         kmeans_simple(data, args.num_points_to_use, args.kmeans_args.num_clusters, args.max_iterations,
                       args.num_threads, cluster_manager);
     } else if (args.algorithm == AlgorithmType::KMEANS_SAMPLED) {
-        kmeans_sampled(data, args.num_points_to_use, args.kmeans_sampled_args.sample_size,
+        kmeans_sampled(data, args.num_points_to_use, args.kmeans_sampled_args.min_sample_size,
+                       args.kmeans_sampled_args.num_point_per_cluster,
                        args.kmeans_sampled_args.num_clusters, args.max_iterations,
                        args.num_threads, cluster_manager);
     } else {
