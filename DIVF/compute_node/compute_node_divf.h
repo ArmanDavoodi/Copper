@@ -85,8 +85,7 @@ public:
         std::vector<VectorID> cluster_ids;
         cluster_ids.reserve(max_nprobe);
         for (size_t c = 0; c < index_attr.index_meta.top_centroids.size(); c++) {
-            closest_centroids.Insert(std::make_pair(Distance(query, index_attr.index_meta.top_centroids[c].data,
-                                                             DIMENSION, DistanceType::L2),
+            closest_centroids.Insert(std::make_pair(L2Distance(query, index_attr.index_meta.top_centroids[c].data),
                                                     index_attr.index_meta.top_centroids[c].id));
             if (closest_centroids.Size() > nprobe) {
                 closest_centroids.PopBack();
@@ -228,7 +227,7 @@ protected:
             reinterpret_cast<const typename ClusterTraits<CT>::ElementType*>(task->cluster_partition_address);
 
         for (size_t i = 0; i < num_vectors; ++i) {
-            DTYPE dist = Distance(task->query_vector, data_ptr[i].data, DIMENSION, DistanceType::L2);
+            DTYPE dist = L2Distance(task->query_vector, data_ptr[i].data);
 
             temp_list.Insert(std::make_pair(dist, data_ptr[i].id));
             if (temp_list.Size() > task->top_k) {
@@ -251,6 +250,17 @@ protected:
         FatalAssert(num_tasks_completed <= num_total_processes, LOG_TAG_BASIC,
                     "More tasks completed than total sibling tasks in ProcessIVFSearchTask()");
         return RetStatus::Success();
+    }
+
+    template<typename V1, typename V2>
+    inline constexpr DTYPE L2Distance(const V1* __restrict__ a, const V2* __restrict__ b) {
+        DTYPE dist = 0;
+        #pragma GCC ivdep
+        for (int i = 0; i < DIMENSION; i++) {
+            DTYPE diff = static_cast<DTYPE>(a[i]) - static_cast<DTYPE>(b[i]);
+            dist += diff * diff;
+        }
+        return dist;
     }
 };
 

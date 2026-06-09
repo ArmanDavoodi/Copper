@@ -1098,6 +1098,7 @@ void kmeans_sampled_general(DataSet<DataSetInternal>& data, uint32_t num_points,
             ClusterData& cluster_data = *(cluster_manager.At(best_cluster, true).first);
             ClusterMetaData& cluster_meta_data = *(cluster_manager.At(best_cluster, true).second);
             ++(cluster_data.num_points); // update num_points for the assigned cluster
+            cluster_meta_data.subtree_size += data.DataWeight(idx, !weighted_kmeans); // update subtree size for the assigned cluster
         }
         return;
     }
@@ -1141,6 +1142,7 @@ void kmeans_sampled_general(DataSet<DataSetInternal>& data, uint32_t num_points,
             ClusterMetaData& cluster_meta_data = *(cluster_manager.At(best_cluster, false).second);
             cluster_meta_data.lock.Lock(divftree::LockMode::SX_EXCLUSIVE);
             ++(cluster_data.num_points); // update num_points for the assigned cluster
+            cluster_meta_data.subtree_size += data.DataWeight(idx, !weighted_kmeans); // update subtree size for the assigned cluster
             cluster_meta_data.lock.Unlock();
         }
 
