@@ -1010,12 +1010,11 @@ public:
         _cache_meta_container->UnpinEntry(&entry);
     }
 
-    RetStatus PrefetchClustersForSearch(const VectorID* cluster_ids, size_t num_clusters,
+    RetStatus PrefetchClustersForSearch(const std::vector<std::pair<DTYPE, VectorID>>& selected_clusters,
                                         IVFSearchTaskFactory* task_factory) {
         FatalAssert(this == instance, LOG_TAG_BUFFER,
                     "BufferMgr instance mismatch in BufferMgr::PrefetchClusters()");
-        CHECK_NOT_NULLPTR(cluster_ids, LOG_TAG_BUFFER);
-        FatalAssert(num_clusters > 0, LOG_TAG_BUFFER,
+        FatalAssert(selected_clusters.size() > 0, LOG_TAG_BUFFER,
                     "num_clusters must be greater than 0 in BufferMgr::PrefetchClusters()");
 
         RetStatus status = RetStatus::Success();
@@ -1024,13 +1023,13 @@ public:
         task_factory->num_sibling_tasks = 0;
 
         std::vector<size_t> current_indices;
-        current_indices.reserve(num_clusters);
-        uint8_t level = cluster_ids[0]._level;
-        bool is_leaf = cluster_ids[0].IsLeaf();
-        for (size_t i = 0; i < num_clusters; ++i) {
-            FatalAssert(cluster_ids[i]._level == level, LOG_TAG_BUFFER,
+        current_indices.reserve(selected_clusters.size());
+        uint8_t level = selected_clusters[0].second._level;
+        bool is_leaf = selected_clusters[0].second.IsLeaf();
+        for (size_t i = 0; i < selected_clusters.size(); ++i) {
+            FatalAssert(selected_clusters[i].second._level == level, LOG_TAG_BUFFER,
                         "All cluster IDs must be on the same level in BufferMgr::PrefetchClusters()");
-            auto it = _buffer_map.find(cluster_ids[i]);
+            auto it = _buffer_map.find(selected_clusters[i].second);
             FatalAssert(it != _buffer_map.end(), LOG_TAG_BUFFER,
                         "Cluster ID not found in BufferMgr::PrefetchClusters()");
             task_factory->num_sibling_tasks += it->second.num_pages;
@@ -1040,15 +1039,15 @@ public:
         std::vector<IVFSearchTask*> in_cache_tasks;
         in_cache_tasks.reserve(task_factory->num_sibling_tasks);
         std::vector<VectorID> to_load;
-        to_load.reserve(num_clusters);
+        to_load.reserve(selected_clusters.size());
         std::vector<size_t> remaining;
-        remaining.reserve(num_clusters);
+        remaining.reserve(selected_clusters.size());
         size_t num_pages_to_load = 0;
         while (!current_indices.empty()) {
             for (size_t i : current_indices) {
-                auto it = _buffer_map.find(cluster_ids[i]);
+                auto it = _buffer_map.find(selected_clusters[i].second);
                 BufferEntry& entry = it->second;
-                FatalAssert(entry.id == cluster_ids[i], LOG_TAG_BUFFER,
+                FatalAssert(entry.id == selected_clusters[i].second, LOG_TAG_BUFFER,
                             "BufferEntry ID does not match cluster ID in BufferMgr::PrefetchClusters()");
                 if (!_cache_meta_container->TryLockAndPinEntry(&entry)) {
                     remaining.push_back(i);
@@ -1075,7 +1074,7 @@ public:
                     entry.state = BufferEntryState::BUFFER_ENTRY_LOADING;
                     entry.pending.push_back(task_factory);
                     entry.lock.Unlock();
-                    to_load.push_back(cluster_ids[i]);
+                    to_load.push_back(selected_clusters[i].second);
                     num_pages_to_load += entry.num_pages;
                 } else {
                     FatalAssert(entry.pending.empty(), LOG_TAG_BUFFER,
@@ -1102,7 +1101,7 @@ public:
                             data_ptr = entry.pages[p];
                         }
                         IVFSearchTask* task = task_factory->CreateTask(
-                            cluster_ids[i],
+                            selected_clusters[i].second,
                             entry.page_num_elements[p],
                             data_ptr);
                         in_cache_tasks.push_back(task);
@@ -1421,7 +1420,7 @@ protected:
             leaf_pool_size = ALIGNED_SIZE(leaf_pool_size, leaf_page_size + CACHE_LINE_SIZE);
             internal_pool_size = ALIGNED_SIZE(internal_pool_size, internal_page_size + CACHE_LINE_SIZE);
             pool_size = leaf_pool_size + internal_pool_size;
-            
+
             DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BUFFER,
                     "Initializing BufferMgr with IVF_TREE index. leaf_page_size: %zu, internal_page_size: %zu, leaf_pool_size: %zu, internal_pool_size: %zu, pool_size: %zu, "
                     "leaf_weight: %zu, internal_weight: %zu, internal_reuse_bias: %zu, internal_demand: %zu, leaf_demand: %zu, internal_effective_demand: %zu, leaf_effective_demand: %zu, total_leaf_size: %zu, total_internal_size: %zu, leaf_to_total: %.2f %%, internal_to_total: %.2f %%, internal_total_cached: %.2f %%",

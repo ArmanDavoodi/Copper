@@ -14,7 +14,7 @@
 #include "utils/string.h"
 #include "utils/thread.h"
 #include "utils/synchronization.h"
-#include "utils/sorted_list.h"
+#include "utils/top_n.h"
 
 #include "debug.h"
 
@@ -975,8 +975,8 @@ struct IVFSearchTask {
     std::atomic<uint32_t>* num_tasks_completed;
     SXLock* neighbour_list_lock;
     union {
-        SortedList<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP>* top_vectors;
-        SortedList<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP>* top_centroids;
+        std::vector<std::pair<DTYPE, IVFVectorID>>* top_vectors;
+        std::vector<std::pair<DTYPE, VectorID>>* top_centroids;
     };
 };
 
@@ -1013,8 +1013,8 @@ struct IVFSearchTaskFactory {
     }
     )
     union {
-        SortedList<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP>* top_vectors;
-        SortedList<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP>* top_centroids;
+        std::vector<std::pair<DTYPE, IVFVectorID>>* top_vectors;
+        std::vector<std::pair<DTYPE, VectorID>>* top_centroids;
     };
 
     inline IVFSearchTask* CreateTask(VectorID cluster_id, uint32_t cluster_partition_num_elements,

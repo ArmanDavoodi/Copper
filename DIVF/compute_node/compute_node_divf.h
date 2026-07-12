@@ -8,6 +8,7 @@
 
 #include "utils/thread.h"
 #include "utils/sorted_list.h"
+#include "utils/top_n.h"
 #include "utils/concurrent_datastructures.h"
 #include "utils/vector_directory.h"
 
@@ -78,28 +79,36 @@ public:
             neighbours.clear();
         }
 
-        SortedList<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP> topk_list(L2DTYPEIDPairCMP(), std::move(neighbours));
-        SortedList<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP> closest_centroids(L2DTYPEIDPairCMP(), max_nprobe);
-        SortedList<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP> tmp_top_vectors(L2DTYPEIDPairCMP(), max_nprobe);
-        SortedList<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP> tmp_centroids(L2DTYPEIDPairCMP(), max_nprobe);
-        std::vector<VectorID> cluster_ids;
-        cluster_ids.reserve(max_nprobe);
+        // SortedList<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP> closest_centroids(L2DTYPEIDPairCMP(), max_nprobe);
+        // SortedList<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP> tmp_top_vectors(L2DTYPEIDPairCMP(), max_nprobe);
+        // SortedList<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP> tmp_centroids(L2DTYPEIDPairCMP(), max_nprobe);
+        std::vector<std::pair<DTYPE, VectorID>> closest_centroids;
+        std::vector<std::pair<DTYPE, VectorID>> new_closest_centroids;
+        closest_centroids.reserve(max_nprobe);
+        new_closest_centroids.reserve(max_nprobe);
+
+        TopN<std::pair<DTYPE, IVFVectorID>, L2DTYPEIDPairCMP> tmp_top_vectors(L2DTYPEIDPairCMP(), max_nprobe);
+        TopN<std::pair<DTYPE, VectorID>, L2DTYPEIDPairCMP> tmp_centroids(L2DTYPEIDPairCMP(), max_nprobe);
+        std::vector<std::pair<DTYPE, IVFVectorID>> tmp_top_vectors_extracted;
+        std::vector<std::pair<DTYPE, VectorID>> tmp_centroids_extracted;
+        tmp_top_vectors_extracted.reserve(max_nprobe);
+        tmp_centroids_extracted.reserve(max_nprobe);
+
         for (size_t c = 0; c < index_attr.index_meta.top_centroids.size(); c++) {
-            closest_centroids.Insert(std::make_pair(L2Distance(query, index_attr.index_meta.top_centroids[c].data),
-                                                    index_attr.index_meta.top_centroids[c].id));
-            if (closest_centroids.Size() > nprobe) {
-                closest_centroids.PopBack();
-            }
+            tmp_centroids.Insert(std::make_pair(L2Distance(query, index_attr.index_meta.top_centroids[c].data),
+                                                index_attr.index_meta.top_centroids[c].id));
         }
 
-        FatalAssert(closest_centroids.Size() == std::min((size_t)nprobe, index_attr.index_meta.top_centroids.size()),
+        FatalAssert(tmp_centroids.Size() == std::min((size_t)nprobe, index_attr.index_meta.top_centroids.size()),
                     LOG_TAG_BASIC,
                     "Size of closest centroids list should be equal to nprobe or num_centroids, whichever is smaller.");
-        if (closest_centroids.Size() == 0) {
+        if (tmp_centroids.Size() == 0) {
             DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_BASIC,
                     "No centroids found during ANNSearch(). This should not happen if the index is built correctly.");
             return RetStatus::Fail("No centroids found during ANNSearch()");
         }
+
+        tmp_centroids.Extract(closest_centroids);
 
         std::atomic<uint32_t> tasks_completed = 0;
         SXLock neighbour_list_lock;
@@ -107,7 +116,7 @@ public:
         CHECK_NOT_NULLPTR(bufferMgr, LOG_TAG_BASIC);
         RetStatus status = RetStatus::Success();
 
-        while (!closest_centroids.Empty()) {
+        while (!closest_centroids.empty()) {
             tasks_completed.store(0, std::memory_order_relaxed);
             is_leaf = closest_centroids[0].second.IsLeaf();
             uint8_t level = closest_centroids[0].second._level;
@@ -115,16 +124,18 @@ public:
                         "Closest centroids should be internal vertices, but found level %u",
                         level);
             nprobe = is_leaf ? k : (level == VectorID::LEAF_LEVEL + 1 ? leaf_nprobe : internal_nprobe);
-            cluster_ids.clear();
-            for (size_t i = 0; i < closest_centroids.Size(); ++i) {
-                FatalAssert((i == 0) || (closest_centroids[i].first >= closest_centroids[i - 1].first), LOG_TAG_BASIC,
-                            "SortedList is not sorted from most similar to least similar");
-                cluster_ids.push_back(closest_centroids[i].second);
-            }
-            closest_centroids.Clear();
-            tmp_centroids.Clear();
-            tmp_top_vectors.Clear();
-
+            SANITY_CHECK({
+                for (size_t i = 1; i < closest_centroids.size(); ++i) {
+                    FatalAssert(closest_centroids[i].second._level == level, LOG_TAG_BASIC,
+                                "All centroids in the closest_centroids list should be on the same level,"
+                                " but found levels %u and %u", closest_centroids[i - 1].second._level,
+                                closest_centroids[i].second._level);
+                    FatalAssert((closest_centroids[i].first >= closest_centroids[i - 1].first), LOG_TAG_BASIC,
+                                "Centroids in the closest_centroids list should be sorted by distance,"
+                                " but found distances %f and %f", closest_centroids[i - 1].first,
+                                closest_centroids[i].first);
+                }
+            });
 
             IVFSearchTaskFactory task_factory{
                 .query_vector = query,
@@ -137,12 +148,12 @@ public:
             };
 
             if (is_leaf) {
-                task_factory.top_vectors = &topk_list;
+                task_factory.top_vectors = &neighbours;
             } else {
-                task_factory.top_centroids = &closest_centroids;
+                task_factory.top_centroids = &new_closest_centroids;
             }
 
-            bufferMgr->PrefetchClustersForSearch(cluster_ids.data(), cluster_ids.size(), &task_factory);
+            bufferMgr->PrefetchClustersForSearch(closest_centroids, &task_factory);
             FatalAssert(status.IsOK(), LOG_TAG_BASIC,
                         "Failed to prefetch clusters in DIVFIndex::ANNSearch(): %s",
                         status.Msg());
@@ -167,9 +178,11 @@ public:
                                 "Received null task from search task queue in DIVFIndex::ANNSearch()");
                     RetStatus task_status = RetStatus::Success();
                     if (task->is_leaf) {
-                        task_status = ProcessIVFSearchTask<ClusterType::Leaf>(task, tmp_top_vectors);
+                        task_status =
+                            ProcessIVFSearchTask<ClusterType::Leaf>(task, tmp_top_vectors, tmp_top_vectors_extracted);
                     } else {
-                        task_status = ProcessIVFSearchTask<ClusterType::Internal>(task, tmp_centroids);
+                        task_status =
+                            ProcessIVFSearchTask<ClusterType::Internal>(task, tmp_centroids, tmp_centroids_extracted);
                     }
 
                     FatalAssert(task_status.IsOK(), LOG_TAG_BASIC,
@@ -186,11 +199,12 @@ public:
                 }
             }
 
+            std::swap(closest_centroids, new_closest_centroids);
+            new_closest_centroids.clear();
+
             threadSelf->UpdateSearchStats(task_factory.num_sibling_tasks, num_iterations,
                                           num_triggered_polls, num_empty_queue_polls);
         }
-
-        topk_list.Extract(neighbours);
 
         threadSelf->IncrementNumQueries();
         return RetStatus::Success();
@@ -213,12 +227,18 @@ protected:
     BlockingQueue<IVFSearchTask*> search_task_queue;
 
     template<ClusterType CT>
-    RetStatus ProcessIVFSearchTask(IVFSearchTask* task,
-                                   SortedList<std::pair<DTYPE, typename ClusterTraits<CT>::IDType>,
-                                   L2DTYPEIDPairCMP>& temp_list) {
+    RetStatus ProcessIVFSearchTask(
+            IVFSearchTask* task,
+            TopN<std::pair<DTYPE, typename ClusterTraits<CT>::IDType>, L2DTYPEIDPairCMP>& temp_list,
+            std::vector<std::pair<DTYPE, typename ClusterTraits<CT>::IDType>>& temp_list_extracted) {
+
         if (task == nullptr) {
             return RetStatus::Fail("Null task provided to ProcessIVFSearchTask()");
         }
+
+        FatalAssert(temp_list.Empty(), LOG_TAG_BASIC,
+                    "Temporary list should be empty at the start of ProcessIVFSearchTask()");
+        temp_list_extracted.clear();
 
         size_t num_vectors = task->cluster_partition_num_elements;
         FatalAssert((CT == ClusterType::Leaf) == (task->is_leaf), LOG_TAG_BASIC,
@@ -227,22 +247,21 @@ protected:
             reinterpret_cast<const typename ClusterTraits<CT>::ElementType*>(task->cluster_partition_address);
 
         for (size_t i = 0; i < num_vectors; ++i) {
-            DTYPE dist = L2Distance(task->query_vector, data_ptr[i].data);
-
-            temp_list.Insert(std::make_pair(dist, data_ptr[i].id));
-            if (temp_list.Size() > task->top_k) {
-                temp_list.PopBack();
-            }
+            temp_list.Insert(std::make_pair(L2Distance(task->query_vector, data_ptr[i].data), data_ptr[i].id));
         }
+
+        temp_list.Extract(temp_list_extracted);
 
         task->neighbour_list_lock->Lock(SX_EXCLUSIVE);
         if constexpr (CT == ClusterType::Leaf) {
-            task->top_vectors->MergeWith(temp_list, task->top_k, true);
+            TopN<std::pair<DTYPE, typename ClusterTraits<CT>::IDType>, L2DTYPEIDPairCMP>::MergeExtracted(
+                *task->top_vectors, temp_list_extracted, L2DTYPEIDPairCMP(), task->top_k);
         } else {
-            task->top_centroids->MergeWith(temp_list, task->top_k, true);
+            TopN<std::pair<DTYPE, typename ClusterTraits<CT>::IDType>, L2DTYPEIDPairCMP>::MergeExtracted(
+                *task->top_centroids, temp_list_extracted, L2DTYPEIDPairCMP(), task->top_k);
         }
         task->neighbour_list_lock->Unlock();
-        temp_list.Clear();
+
         size_t num_total_processes = task->num_sibling_tasks;
         size_t num_tasks_completed = task->num_tasks_completed->fetch_add(1) + 1;
         UNUSED_VARIABLE(num_total_processes);

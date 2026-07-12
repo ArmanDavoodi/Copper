@@ -428,8 +428,8 @@ public:
                         IBV_ACCESS_REMOTE_ATOMIC);
         if (mr == nullptr) {
             FatalAssert(false, LOG_TAG_RDMA,
-                        "Failed to register memory region for RDMA operations. errno=(%d)%s",
-                        errno, strerror(errno));
+                        "Failed to register memory region for RDMA operations. errno=(%d)%s, size = %zu",
+                        errno, strerror(errno), size);
             return RetStatus::Fail("Failed to register memory region for RDMA operations.");
         }
 
