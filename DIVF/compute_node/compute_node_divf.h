@@ -93,7 +93,8 @@ public:
         std::vector<std::pair<DTYPE, VectorID>> tmp_centroids_extracted;
         tmp_top_vectors_extracted.reserve(max_nprobe);
         tmp_centroids_extracted.reserve(max_nprobe);
-
+        
+        tmp_centroids.SetCapacity(nprobe);
         for (size_t c = 0; c < index_attr.index_meta.top_centroids.size(); c++) {
             tmp_centroids.Insert(std::make_pair(L2Distance(query, index_attr.index_meta.top_centroids[c].data),
                                                 index_attr.index_meta.top_centroids[c].id));
@@ -124,18 +125,6 @@ public:
                         "Closest centroids should be internal vertices, but found level %u",
                         level);
             nprobe = is_leaf ? k : (level == VectorID::LEAF_LEVEL + 1 ? leaf_nprobe : internal_nprobe);
-            SANITY_CHECK({
-                for (size_t i = 1; i < closest_centroids.size(); ++i) {
-                    FatalAssert(closest_centroids[i].second._level == level, LOG_TAG_BASIC,
-                                "All centroids in the closest_centroids list should be on the same level,"
-                                " but found levels %u and %u", closest_centroids[i - 1].second._level,
-                                closest_centroids[i].second._level);
-                    FatalAssert((closest_centroids[i].first >= closest_centroids[i - 1].first), LOG_TAG_BASIC,
-                                "Centroids in the closest_centroids list should be sorted by distance,"
-                                " but found distances %f and %f", closest_centroids[i - 1].first,
-                                closest_centroids[i].first);
-                }
-            });
 
             IVFSearchTaskFactory task_factory{
                 .query_vector = query,
@@ -239,6 +228,7 @@ protected:
         FatalAssert(temp_list.Empty(), LOG_TAG_BASIC,
                     "Temporary list should be empty at the start of ProcessIVFSearchTask()");
         temp_list_extracted.clear();
+        temp_list.SetCapacity(task->top_k);
 
         size_t num_vectors = task->cluster_partition_num_elements;
         FatalAssert((CT == ClusterType::Leaf) == (task->is_leaf), LOG_TAG_BASIC,

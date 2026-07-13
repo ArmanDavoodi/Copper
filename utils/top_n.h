@@ -9,7 +9,7 @@ namespace divftree {
 template<typename T, typename CMP>
 class TopN {
 protected:
-    const size_t capacity;
+    size_t capacity;
     CMP cmp;
     std::vector<T> data;
 
@@ -70,6 +70,18 @@ public:
         }
 
         dest = std::move(merged);
+    }
+
+    inline void SetCapacity(size_t cap) {
+        FatalAssert(cap > 0, LOG_TAG_BASIC, "TopN capacity must be greater than 0");
+        FatalAssert(data.empty(), LOG_TAG_BASIC, "TopN capacity can only be set when the data is empty");
+        if (cap == capacity) {
+            return;
+        }
+        if (cap > capacity) {
+            data.reserve(cap);
+        }
+        capacity = cap;
     }
 
     inline size_t Size() const {
