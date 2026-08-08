@@ -54,3 +54,6 @@
 .vscode/
 
 **/third_party/*
+
+# Cluster specific files
+**/talas-cluster-scripts/*

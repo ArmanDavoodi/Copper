@@ -793,8 +793,8 @@ public:
             BufferEntry* evicted_entry = nullptr;
             if ((num_hot < _num_buckets) && (buckets[bucket_idx].GetHotListSize() == 0)) {
                 if (_num_cooling_entries.load(std::memory_order_acquire) == 0) {
-                    DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_BUFFER,
-                            "No hot entries and no cooling entries available during eviction in CacheMetaContainerDetail::TriggerEviction()");
+                    // DIVFLOG(LOG_LEVEL_ERROR, LOG_TAG_BUFFER,
+                    //         "No hot entries and no cooling entries available during eviction in CacheMetaContainerDetail::TriggerEviction()");
                     buckets[bucket_idx].UnlockBucket();
                     break;
                 }
@@ -1568,6 +1568,12 @@ protected:
                 }
             }
         }
+
+        // wait for all CNs to connect and receive the index meta
+        bool signal = false;
+        rdma_mgr->ReceiveMessage(mnode_id, &signal, sizeof(signal));
+        FatalAssert(signal, LOG_TAG_BUFFER,
+                    "Failed to receive signal from memory node to proceed in BufferMgr::Init()");
     }
 
     ~BufferMgr() {

@@ -114,8 +114,11 @@ struct NodeIDHash {
 };
 
 namespace network_config {
-
+#ifdef DIVF_IS_MEMORY_NODE
+    inline constexpr char network_config_file_path[] = "configs/disaggregated/network_config_mem.conf";
+#else
     inline constexpr char network_config_file_path[] = "configs/disaggregated/network_config.conf";
+#endif
     inline uint8_t num_memory_nodes = 0;
     inline uint8_t num_compute_nodes = 0;
 

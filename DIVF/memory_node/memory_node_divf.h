@@ -13,6 +13,7 @@
 
 #include <sys/mman.h>
 #include <filesystem>
+#include <atomic>
 
 namespace divftree {
 
@@ -103,6 +104,18 @@ public:
             listener_thread->StartMemberFunction(&MN_DIVFIndex::ListenerThread, this, compute_nodes[cn_idx].node_id);
         }
 
+        while (num_connected_cns.load() < compute_nodes.size()) {
+            msleep(100);
+        }
+
+        DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_DIVFTREE, "All compute nodes connected. "
+                "MN_DIVFIndex is ready to serve requests.");
+        
+        const bool signal = true;
+        for (NodeInfo &cn_info : compute_nodes) {
+            rdma_mgr->SendMessage(cn_info.node_id, &signal, sizeof(bool));
+        }
+
         for (auto& thrd : listener_threads) {
             thrd->WaitForThreadToFinish();
             delete thrd;
@@ -127,6 +140,8 @@ protected:
 
     uint32_t* num_clusters = nullptr;
     uint32_t num_points = 0;
+
+    std::atomic<size_t> num_connected_cns{0};
 
     RetStatus LoadIndex(const std::string& index_path) {
         DIVFLOG(LOG_LEVEL_LOG, LOG_TAG_BASIC, "Reading the index from file...");
@@ -573,6 +588,7 @@ protected:
         CHECK_NOT_NULLPTR(self, LOG_TAG_DIVFTREE);
         self->InitDIVFThread();
         SendIndexInfoToNode(target_cn);
+        num_connected_cns.fetch_add(1);
         bool last_cn_disconnected = RDMA_Manager::ListenForMessages(target_cn);
         UNUSED_VARIABLE(last_cn_disconnected);
         self->DestroyDIVFThread();

@@ -160,14 +160,16 @@ void ParseConfigs(divftree::NodeID self_id) {
         throw std::runtime_error("k not provided!");
     }
 
-    vit = var_configs.find("num-client-threads");
-    if (vit != var_configs.end()) {
-        if (!parseUnsignedInt(vit->second, index_attr.num_user_threads) || (index_attr.num_user_threads < 1)) {
-            throw std::runtime_error("Invalid number of client threads!");
-        }
-    } else {
-        throw std::runtime_error("Number of client threads not provided!");
-    }
+    // vit = var_configs.find("num-client-threads");
+    // if (vit != var_configs.end()) {
+    //     if (!parseUnsignedInt(vit->second, index_attr.num_user_threads)) {
+    //         throw std::runtime_error("Invalid number of client threads!");
+    //     } else if (index_attr.num_user_threads == 0 || index_attr.num_user_threads > std::thread::hardware_concurrency()) {
+    //         index_attr.num_user_threads = std::thread::hardware_concurrency();
+    //     }
+    // } else {
+    //     throw std::runtime_error("Number of client threads not provided!");
+    // }
 
     vit = var_configs.find("warmup-time");
     if (vit != var_configs.end()) {

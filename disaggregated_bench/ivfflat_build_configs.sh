@@ -19,8 +19,8 @@ VAR_NUM_QUERY_THREADS=64
 # VAR_PAGE_SIZE=$((CONF_VAR_AVG_NUM_VEC_PER_CLUSTER * CONF_VAR_VECTOR_BYTES * 2)) # should be power of 2 -> will only be used for ivfflat.
 # VAR_POOL_SIZE=$((1024 * 1024 * 1024)) #1GB
 
-VAR_WARMUP_TIME_SEC=120 #only search
-VAR_RUN_TIME_SEC=60 #real test used for stat collection
+VAR_WARMUP_TIME_SEC=60 #only search
+VAR_RUN_TIME_SEC=120 #real test used for stat collection
 
 VAR_RUNTIME_THROUGHPUT_REPORT_SEC=5 #use 0 to disable
 VAR_SHOW_RUNTIME_REPORT_FOR_BUILD_AND_WARMUP=1 #1 to show throughput report during build and warmup phases

@@ -11,6 +11,7 @@
 #include <mutex>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <cmath>
 
 #include "debug.h"
 

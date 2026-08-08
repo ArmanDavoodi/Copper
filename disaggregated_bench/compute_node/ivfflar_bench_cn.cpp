@@ -2,6 +2,7 @@
 #include "disaggregated_bench/compute_node/ivfflat_config_reader.h"
 
 #include "bench/dataset.h"
+#include "utils/query_index_selector.h"
 
 #include <vector>
 #include <unordered_map>
@@ -19,6 +20,7 @@ inline double sum_search_distance = 0;
 inline double avg_search_distance = 0;
 inline uint64_t num_returned_neighbours = 0;
 inline uint64_t num_total_returned_neighbours = 0;
+inline double query_dist_stddev = -1; // less than 0 means uniform
 
 #ifdef RECALL_BENCH
 inline std::vector<uint64_t> num_true_positives_per_query;
@@ -36,6 +38,7 @@ inline std::atomic<bool> run_finished = false;
 inline std::atomic<uint32_t> run_done = 0;
 
 inline thread_local uint64_t worker_idx = UINT64_MAX;
+inline thread_local divftree::IndexSelector query_index_selector;
 inline std::vector<std::vector<size_t>> query_latency_lists;
 
 divftree::RetStatus Search(std::vector<std::pair<divftree::DTYPE, divftree::IVFVectorID>>& neighbours, size_t idx) {
@@ -118,8 +121,7 @@ divftree::RetStatus Search(std::vector<std::pair<divftree::DTYPE, divftree::IVFV
 }
 
 divftree::RetStatus Search(std::vector<std::pair<divftree::DTYPE, divftree::IVFVectorID>>& neighbours) {
-    size_t idx = divftree::threadSelf->UniformRange64(0, total_num_queries - 1);
-    return Search(neighbours, idx);
+    return Search(neighbours, query_index_selector.Select());
 }
 
 void FlushIncrement(uint64_t& local_cnt, std::atomic<uint64_t>& shared_cnt) {
@@ -135,6 +137,7 @@ void FlushIncrement(uint64_t& local_cnt, std::atomic<uint64_t>& shared_cnt) {
 void worker(divftree::Thread* self, uint64_t thread_idx) {
     self->InitDIVFThread(DIMENSION);
     worker_idx = thread_idx;
+    query_index_selector.Configure(total_num_queries, query_dist_stddev);
     std::vector<std::pair<divftree::DTYPE, divftree::IVFVectorID>> neighbours;
     divftree::RetStatus rs;
     uint32_t num_ready = warmup_ready.fetch_add(1);
@@ -397,12 +400,12 @@ inline void FlushStats(bool clear) {
 /* log-output-file-dir is not the file name but the directory path */
 void ReadArgs(int argc, char** argv) {
 #ifdef RECALL_BENCH
-    if (argc != 10) {
-        DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Usage: %s <self-node-idx> <index-file-path> <gt-file-path> <log-output-file-dir> <stat-file-path> <page-size-bytes> <pool-size-bytes> <internal_n_probes> <leaf_n_probes>", argv[0]);
+    if (argc != 12) {
+        DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Usage: %s <self-node-idx> <index-file-path> <gt-file-path> <log-output-file-dir> <stat-file-path> <page-size-bytes> <pool-size-bytes> <internal_n_probes> <leaf_n_probes> <num-threads> <query-dist-stddev>", argv[0]);
     }
 #else
-    if (argc != 9) {
-        DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Usage: %s <self-node-idx> <index-file-path> <log-output-file-dir> <stat-file-path> <page-size-bytes> <pool-size-bytes> <internal_n_probes> <leaf_n_probes>", argv[0]);
+    if (argc != 11) {
+        DIVFLOG(LOG_LEVEL_PANIC, LOG_TAG_BASIC, "Usage: %s <self-node-idx> <index-file-path> <log-output-file-dir> <stat-file-path> <page-size-bytes> <pool-size-bytes> <internal_n_probes> <leaf_n_probes> <num-threads> <query-dist-stddev>", argv[0]);
     }
 #endif
 
@@ -460,6 +463,18 @@ void ReadArgs(int argc, char** argv) {
 
     index_attr.index_meta.internal_nprobe = internal_n_probes;
     index_attr.index_meta.leaf_nprobe = leaf_n_probes;
+
+    index_attr.num_user_threads = std::stoul(argv[next_idx + 6]);
+    if (index_attr.num_user_threads == 0 || index_attr.num_user_threads > std::thread::hardware_concurrency()) {
+        index_attr.num_user_threads = std::thread::hardware_concurrency();
+    }
+
+    // query distribution
+    query_dist_stddev = std::stod(argv[next_idx + 7]);
+    if (query_dist_stddev < 0) {
+        DIVFLOG(LOG_LEVEL_WARNING, LOG_TAG_BASIC, "Query distribution stddev is less than 0! Using uniform distribution for query selection.");
+        query_dist_stddev = -1;
+    }
 
     FILE* file = fopen(index_file_path.c_str(), "rb");
     if (file == nullptr) {
